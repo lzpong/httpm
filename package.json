@@ -1,0 +1,30 @@
+{
+  "name": "httpm",
+  "version": "1.0.0",
+  "description": "基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库，兼容 Express API",
+  "main": "httpm.js",
+  "files": [
+    "httpm.js"
+  ],
+  "keywords": [
+    "http",
+    "server",
+    "express",
+    "middleware",
+    "router",
+    "websocket",
+    "sse",
+    "static",
+    "upload",
+    "zero-dependency"
+  ],
+  "author": "lzpong",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "repository": {},
+  "scripts": {
+    "test": "node test.js"
+  }
+}

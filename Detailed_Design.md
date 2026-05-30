@@ -309,6 +309,14 @@ class Request {
 
 `debug` < `info` < `notice` < `warn` < `error`
 
+文件：./log/YYYY/MM/name_DD.log
+
+日志记录示例：
+```
+[23:56:50] [ERROR ] test log
+```
+
+
 #### 核心设计
 
 1. 颜色区分：不同日志级别对应不同控制台字体颜色，提升可读性；
@@ -629,7 +637,7 @@ app.sse('/events', (sse, req) => {
   "version": "1.0.1",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
-  "engines": { "node": ">=10.0.0" },
+  "engines": { "node": ">=14.0.0" },
   "license": "MIT"
 }
 ```
