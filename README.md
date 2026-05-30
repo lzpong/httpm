@@ -18,7 +18,7 @@
 ## 安装
 
 ```bash
-npm install httpm
+npm install @lzpong/httpm
 ```
 
 或直接拷贝 `httpm.js` 到项目中：
@@ -30,7 +30,7 @@ const httpm = require('./httpm');
 ## 快速开始
 
 ```javascript
-const httpm = require('httpm');
+const httpm = require('@lzpong/httpm');
 const app = httpm({ rootPath: './public', svrPort: 3000 });
 
 // 全局中间件
@@ -275,7 +275,7 @@ app._logger.error('Something went wrong', err);
 ### 独立使用
 
 ```javascript
-const { Logger } = require('httpm');
+const { Logger } = require('@lzpong/httpm');
 
 const logger = new Logger({ level: 'debug', logDir: './logs', name: 'myapp' });
 logger.debug('Debug message');

@@ -1,10 +1,11 @@
 {
-  "name": "httpm",
-  "version": "1.0.0",
+  "name": "@lzpong/httpm",
+  "version": "1.0.1",
   "description": "基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库，兼容 Express API",
   "main": "httpm.js",
   "files": [
-    "httpm.js"
+    "httpm.js",
+    "README.md"
   ],
   "keywords": [
     "http",
@@ -16,14 +17,22 @@
     "sse",
     "static",
     "upload",
-    "zero-dependency"
+    "zero-dependency",
+    "single-file"
   ],
   "author": "lzpong",
   "license": "MIT",
   "engines": {
     "node": ">=14.0.0"
   },
-  "repository": {},
+  "repository": {
+    "type": "git",
+    "url": "git+https://gitee.com/lzpong/httpm.git"
+  },
+  "homepage": "https://gitee.com/lzpong/httpm#readme",
+  "bugs": {
+    "url": "https://gitee.com/lzpong/httpm/issues"
+  },
   "scripts": {
     "test": "node test.js"
   }
