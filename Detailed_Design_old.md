@@ -1,0 +1,722 @@
+# httpm 项目详细设计文档
+
+**文档类型**：软件开发详细设计文档
+
+**文档版本**：V1.0
+
+**定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
+
+
+## 1. 项目概述
+
+### 1.1 设计目标
+
+httpm 是基于 Node.js 原生模块开发的**单文件、零依赖** HTTP 服务库，完全兼容 Express 主流 API 风格，降低开发迁移与学习成本。
+
+核心设计原则：
+
+1.  **单文件架构**：所有代码、功能、类库全部整合至 `httpm.js` 单一文件，无需拆分依赖，便于分发、引入与二次修改。
+2.  **零第三方依赖**：仅使用 Node.js 内置原生模块（`http`、`https`、`fs`、`path`、`crypto`、`zlib`），不引入任何 npm 三方包。
+3.  **Express 兼容**：路由、中间件、请求 / 响应 API 对齐 Express 常用语法。
+4.  **功能一体化**：整合 HTTP/HTTPS/HTTP2、路由、静态服务、文件上传下载、WebSocket、SSE、日志等常用 Web 服务能力。
+
+### 1.2 核心特性
+
+表格
+
+| 功能模块             | 功能说明                                               |
+| ---------------- | -------------------------------------------------- |
+| HTTP/HTTPS/HTTP2 | 基于 Node 原生网络模块实现，同时支持明文 HTTP、加密 HTTPS 及 HTTP2 协议   |
+| 路由系统             | 支持静态路由、动态参数路由（/users/:id），动态路由自动解析路径参数             |
+| 中间件              | 标准 Express 线性中间件执行模型，支持应用级、路径级、错误处理中间件             |
+| 静态文件服务           | 支持 Range 断点续传、ETag/Last-Modified 缓存、Gzip 压缩、目录访问控制 |
+| 文件上传             | multipart/form-data 流式解析，内存零占用，支持大小限制、临时文件自动清理     |
+| 文件下载             | 支持断点续传，大文件自动展示传输进度                                 |
+| WebSocket        | 遵循 RFC 6455 标准，支持路径分组、全局广播、统一心跳保活机制                |
+| SSE              | 轻量化 Server-Sent Events 实现，简化长推送开发                  |
+| 日志系统             | 分级日志，支持彩色控制台输出 + 文件持久化存储                           |
+
+### 1.3 应用场景
+
+1.  轻量嵌入式 Web 服务、本地调试服务；
+2.  小型内网接口服务、静态资源服务器；
+3.  快速实现带长连接（WebSocket/SSE）的一体化服务；
+4.  学习、二次定制改造的轻量 Node Web 框架底座。
+
+* * *
+
+## 2\. 整体架构设计
+
+### 2.1 架构分层
+
+整体采用**分层内聚**设计，自上而下分为：对外导出接口层、核心业务类层、通用工具函数层，所有代码统一收纳在 `httpm.js` 中。
+
+plaintext
+
+```plaintext
+┌─────────────────────────────────────────────────────────┐
+│                        httpm.js                         │
+├─────────────────────────────────────────────────────────┤
+│ 【导出接口层】对外暴露类、方法、中间件、工具函数          │
+│ httpm() 入口函数 / 各类核心类 / 内置中间件 / 工具方法     │
+├─────────────────────────────────────────────────────────┤
+│ 【核心类层】业务核心逻辑实现                             │
+│ Application / Router / Request / Response               │
+│ SSE / WebSocket / WebSocketServer / Logger               │
+├─────────────────────────────────────────────────────────┤
+│ 【工具函数层】通用公共方法                               │
+│ 路径解析、参数解析、MIME、大小格式化、安全校验等         │
+└─────────────────────────────────────────────────────────┘
+
+```
+
+### 2.2 请求整体处理流程
+
+客户端发起 HTTP 请求后，全流程数据与逻辑流转如下：
+
+plaintext
+
+```plaintext
+客户端 HTTP 请求
+    │
+    ├─ 基础解析：URL 路径、Query 参数、Cookie 解析
+    ├─ 请求体 Body 解析（根据 Content-Type 区分类型）
+    │   ├─ application/json → JSON 反序列化
+    │   ├─ application/x-www-form-urlencoded → 表单参数解析
+    │   ├─ multipart/form-data → 流式解析，写入临时文件
+    │   └─ 其他类型 → 原始 Buffer 存储
+    │
+    ├─ 路由匹配（动态路由优先级高于静态兜底）
+    │   ├─ 路由匹配成功 → 顺序执行中间件链 → 执行路由处理器
+    │   │   ├─ 处理器返回 false → 进入默认静态文件处理逻辑
+    │   │   └─ 正常响应 → 结束请求链路
+    │   └─ 路由匹配失败 → 进入默认兜底处理
+    │
+    ├─ 默认兜底处理逻辑
+    │   ├─ GET/HEAD 请求 → 静态文件服务
+    │   ├─ OPTIONS 请求 → CORS 预检响应
+    │   └─ 其他请求方法 → 返回 404 / 405 状态码
+    │
+    └─ 统一响应输出（res.json / send / sendFile / download 等）
+
+```
+
+* * *
+
+## 3. 核心类详细设计
+
+### 3.1 Application 类
+
+#### 类职责
+
+项目主入口类，继承自 `Router`，统一管理服务配置、全局中间件、服务器生命周期，是整个服务的顶层入口。
+
+#### 继承关系
+
+`Application extends Router`
+
+#### 核心属性
+
+javascript
+
+运行
+
+```javascript
+class Application extends Router {
+  constructor(options = {}) {
+    super();
+    this.settings = {};          // 全局配置对象
+    this.middlewareStack = [];   // 全局中间件栈
+    this.server = null;          // 原生 HTTP/HTTPS/HTTP2 服务实例
+  }
+}
+
+```
+
+#### 核心方法
+
+表格
+
+| 方法名                         | 入参          | 功能描述               |
+| --------------------------- | ----------- | ------------------ |
+| app.set(name, value)        | 配置名、配置值     | 设置全局运行时配置          |
+| app.use([path], middleware) | 可选路径、中间件函数  | 注册全局 / 路径级中间件      |
+| app.METHOD(path, handler)   | 请求方法、路径、处理器 | 注册路由（继承 Router 能力） |
+| app.listen(port, callback)  | 端口、启动回调     | 启动网络服务，监听端口        |
+| app.close(callback)         | 关闭回调        | 停止服务，释放端口资源        |
+
+#### 特殊规则
+
+路由处理器支持**返回 false** 逻辑：当动态路由匹配成功，但业务逻辑判定需要走静态文件兜底时，返回 `false`，请求会继续进入默认静态文件处理流程。
+
+示例：
+
+javascript
+
+运行
+
+```javascript
+app.get('/api/users/:id', (req, res) => {
+  if (!用户存在) return false; // 跳转至静态文件服务
+  res.json(用户数据);
+});
+
+```
+
+### 3.2 Router 类
+
+#### 类职责
+
+负责路由注册、路由规则编译、请求路径匹配、路由参数提取，是整个路由系统的核心。
+
+#### 核心属性
+
+javascript
+
+运行
+
+```javascript
+class Router {
+  constructor() {
+    // 按 HTTP 方法分类存储路由规则
+    this.routes = { GET: [], POST: [], PUT: [], DELETE: [], PATCH: [], ALL: [] };
+    this.middlewareStack = []; // 路由级中间件栈
+  }
+}
+
+```
+
+#### 路由对象结构
+
+每一条注册的路由，编译后存储结构如下：
+
+javascript
+
+运行
+
+```javascript
+{
+  method: 'GET',                // HTTP 请求方法
+  path: '/users/:id',          // 原始注册路径
+  pattern: /^\/users\/([^/]+)$/,// 编译后的正则表达式（用于路径匹配）
+  params: ['id'],               // 路径参数名数组
+  handlers: [handler]          // 路由处理器数组
+}
+
+```
+
+#### 动态路由编译逻辑
+
+将带占位符 `:param` 的路径转换为正则表达式，并提取参数名：
+
+1.  遍历路径，匹配 `:参数名` 占位符；
+2.  收集所有参数名存入 `params` 数组；
+3.  将占位符替换为正则捕获组 `([^/]+)`；
+4.  生成完整正则对象用于路径匹配。
+
+### 3.3 Request 类
+
+#### 类职责
+
+封装 Node 原生 `IncomingMessage` 请求对象，提供简化、统一的请求属性与数据解析结果，向上层业务屏蔽原生 API 细节。
+
+#### 核心属性
+
+javascript
+
+运行
+
+```javascript
+class Request {
+  constructor(incomingMessage) {
+    this._req = incomingMessage; // 原生请求对象（内部使用）
+    this.query = {};             // URL 解析后的查询参数
+    this.params = {};            // 动态路由解析后的路径参数
+    this.body = null;            // 解析后的请求体数据
+    this.cookies = {};           // 解析后的 Cookie 对象
+    this.files = [];             // 上传文件数组（兼容旧版本）
+    this.path = '';              // 解码后的请求路径（不含 query）
+    this.formData = {            // 统一表单数据对象（推荐使用）
+      fields: {},                 // 合并 query + body（body 优先级更高）
+      files: []                  // 上传文件列表
+    };
+    this._tempFiles = [];        // 当前请求产生的临时文件列表（内部清理使用）
+  }
+}
+
+```
+
+#### 通用快捷属性
+
+封装原生请求头与连接信息，直接对外使用：
+
+-   `req.method`：HTTP 请求方法
+-   `req.url`：原始请求 URL
+-   `req.headers`：请求头对象
+-   `req.ip`：客户端 IP 地址
+-   `req.hostname`：请求域名
+-   `req.protocol`：当前协议（http /https）
+
+### 3.4 Response 类
+
+#### 类职责
+
+封装原生响应对象，提供一系列快捷响应方法，统一响应头、状态码、数据输出能力。
+
+#### 核心属性与方法
+
+表格
+
+| 成员                        | 说明                               |
+| ------------------------- | -------------------------------- |
+| statusCode                | 默认响应状态码，初始值 200                  |
+| setHeader(name, value)    | 设置响应头                            |
+| getHeader(name)           | 获取已设置的响应头                        |
+| status(code)              | 设置 HTTP 状态码，支持链式调用               |
+| json(data)                | 输出 JSON 格式响应，自动补充对应 Content-Type |
+| send(data)                | 通用输出，支持字符串、HTML、Buffer           |
+| sendFile(path, options)   | 发送本地文件，内置断点续传、缓存、Gzip 能力         |
+| download(path, filename)  | 触发浏览器文件下载，支持大文件进度展示              |
+| redirect(url, code)       | 重定向响应，默认 302 状态码                 |
+| sse()                     | 创建 SSE 推送实例                      |
+| cookie(name, value, opts) | 设置响应 Cookie                      |
+
+#### sendFile 核心逻辑
+
+1.  **进度展示**：文件大于 1MB 时，自动在控制台展示传输进度；
+2.  **Range 断点续传**：识别请求 `Range` 头，返回 206 分段响应；
+3.  **缓存校验**：通过 ETag、Last-Modified 校验，命中缓存返回 304；
+4.  **Gzip 压缩**：对文本类文件，根据客户端 `Accept-Encoding` 自动开启压缩。
+
+### 3.5 SSE 类
+
+#### 类职责
+
+实现 **Server-Sent Events** 服务端单向长推送协议，封装协议头、消息发送、连接管理能力。
+
+#### 核心设计
+
+1.  实例化时自动设置 SSE 标准响应头：`Content-Type: text/event-stream`、`Cache-Control: no-cache`、`Connection: keep-alive`；
+2.  内置连接状态标识 `connected`，标记连接是否正常；
+3.  支持标准 SSE 消息格式、自定义事件、重连时间配置。
+
+#### 核心方法
+
+-   `send(data)`：发送普通消息，自动兼容字符串 / JSON 对象；
+-   `event(name, data)`：发送自定义命名事件；
+-   `retry(ms)`：设置客户端重连间隔（毫秒）；
+-   `comment(text)`：发送注释消息（可作为心跳保活）；
+-   `close()`：主动关闭 SSE 连接。
+
+#### 使用规则
+
+注册 SSE 路由时，支持返回清理函数，连接断开后自动执行资源回收。
+
+### 3.6 WebSocket 与 WebSocketServer 类
+
+#### 3.6.1 WebSocket 类
+
+遵循 **RFC 6455** 标准实现 WebSocket 单连接管理。
+
+1.  核心属性：原生 socket、连接路径、唯一 ID、连接状态、心跳时间戳；
+2.  `send(data)` 方法：自动区分文本、JSON 对象、二进制 Buffer，匹配对应帧类型；
+3.  监听底层套接字事件，处理消息接收、连接断开。
+
+#### 3.6.2 WebSocketServer 类
+
+全局 WebSocket 服务管理类，统一管理所有长连接：
+
+1.  连接分组：按请求路径对连接分组，支持按路径广播消息；
+2.  统一心跳：全局唯一心跳定时器，有连接则启动，无连接则停止，减少资源占用；
+3.  广播能力：支持**按路径广播**、**全局广播**，支持排除指定连接；
+4.  连接管理：新增 / 销毁连接时自动维护连接列表。
+
+#### 心跳机制
+
+定时向所有连接发送 Ping 帧，检测客户端 Pong 回复，超时未响应则主动断开连接，清理无效套接字。
+
+### 3.7 Logger 日志类
+
+#### 类职责
+
+分级日志管理，同时支持**彩色控制台输出**与**本地文件持久化**。
+
+#### 日志级别（优先级从低到高）
+
+`debug` < `info` < `notice` < `warn` < `error`
+
+#### 核心设计
+
+1.  颜色区分：不同日志级别对应不同控制台字体颜色，提升可读性；
+2.  文件存储规则：按年月创建目录，日志文件按日期拆分；
+3.  `log(level, ...args)` 统一入口方法，分发至控制台与文件。
+
+* * *
+
+## 4. 中间件系统设计
+
+### 4.1 执行机制
+
+采用 **Express 标准线性执行模型**：
+
+1.  中间件按注册顺序串行执行；
+2.  必须调用 `next()` 方可进入下一个中间件 / 路由处理器；
+3.  支持前置处理、后置处理（`next()` 执行完成后逻辑）。
+
+标准中间件签名：
+
+javascript
+
+运行
+
+```javascript
+function middleware(req, res, next) {
+  // 前置逻辑
+  next();
+  // 后置逻辑（可选）
+}
+
+```
+
+### 4.2 中间件分类
+
+表格
+
+| 类型      | 注册方式                               | 生效范围           |
+| ------- | ---------------------------------- | -------------- |
+| 应用级中间件  | app.use(fn)                        | 全局所有请求         |
+| 路径级中间件  | app.use('/prefix', fn)             | 仅匹配指定路径前缀的请求   |
+| 错误处理中间件 | app.use((err, req, res, next)=>{}) | 全局异常捕获，固定为四个入参 |
+
+### 4.3 内置中间件实现
+
+#### 4.3.1 bodyParser
+
+负责解析各类请求体，整合表单、JSON、文件数据：
+
+1.  初始化 `req.formData`、临时文件列表；
+2.  根据 `Content-Type` 区分解析逻辑；
+3.  `multipart/form-data` 类型调用流式解析器处理上传文件；
+4.  监听响应结束事件，自动清理当前请求产生的临时文件。
+
+#### 4.3.2 cookieParser
+
+解析请求头中的 `Cookie` 字段，格式化后存入 `req.cookies`，供业务使用。
+
+* * *
+
+## 5. 配置管理设计
+
+### 5.1 配置加载优先级
+
+配置多层覆盖，优先级由低到高：
+
+`默认配置` → `配置文件(app.json)` → `代码初始化参数` → `运行时 app.set() 动态设置`
+
+### 5.2 默认配置项
+
+javascript
+
+运行
+
+```javascript
+const defaultConfig = {
+  // 基础服务
+  rootPath: process.cwd(),        // 静态文件根目录
+  tempDir: 'tempupdir',           // 文件上传临时目录
+  maxFileSize: 128 * 1024 * 1024, // 单文件最大限制 128MB
+  maxFieldSize: 1024 * 1024,      // 表单字段最大限制 1MB
+  svrPort: 80,                    // 服务默认端口
+  svrIP: null,                    // 监听地址（null 监听所有网卡）
+
+  // 功能开关
+  showDir: false,                 // 是否允许展示目录列表
+  enableCache: false,             // 是否开启文件缓存
+  enableGzip: false,              // 是否开启 Gzip 压缩
+  enableRange: true,              // 是否开启断点续传（默认启用）
+  cacheControl: 'public, max-age=3600',
+
+  // 超时配置
+  timeout: 120000,
+  keepAliveTimeout: 65000,
+
+  // 加密协议
+  https: null,                    // HTTPS 证书配置
+  http2: false,                   // 是否启用 HTTP2
+
+  // 日志配置
+  logLevel: 'info',
+  logDir: './log',
+
+  // 跨域配置
+  cors: { origin: '*', headers: 'Content-Type, Authorization', maxAge: '86400' },
+
+  // 内置中间件开关
+  useBodyParser: true,
+  useCookieParser: true,
+  bodyParserOptions: {},
+  cookieParserSecret: null,
+
+  // WebSocket 心跳
+  wsHeartbeatInterval: 30000,     // 心跳发送间隔(ms)
+  wsHeartbeatTimeout: 30000        // 心跳超时时间(ms)
+};
+
+```
+
+* * *
+
+## 6. 静态文件服务设计
+
+### 6.1 请求处理优先级
+
+仅对 `GET / HEAD` 方法生效，优先级顺序：
+
+`动态路由匹配` → `静态文件服务` → `目录访问` → `404`
+
+1.  路径合法校验通过后，查找对应本地文件；
+2.  文件存在：正常返回文件（附带缓存、压缩、断点续传）；
+3.  路径为目录：查找 `index.html`，或根据配置展示目录列表；
+4.  文件 / 目录均不存在：返回 404 响应。
+
+### 6.2 路径安全校验
+
+核心目标：**防御路径遍历攻击**，禁止通过 `../` 访问根目录以外文件。
+
+校验规则：
+
+1.  拼接请求路径与静态根目录，转为绝对路径；
+2.  判断路径是否跳出根目录（检测 `..` 片段）；
+3.  默认禁止访问系统隐藏文件（以 `.` 开头的文件 / 目录）。
+
+### 6.3 Range 断点续传
+
+1.  解析请求头 `Range`，提取客户端请求的字节范围；
+2.  校验范围合法性，超出文件大小则拒绝；
+3.  响应头返回 `206 Partial Content`，附带 `Content-Range`、`Content-Length`；
+4.  按字节范围读取文件流，分段返回数据。
+
+### 6.4 缓存机制
+
+采用 **ETag + Last-Modified** 双重缓存校验：
+
+1.  根据文件大小、最后修改时间生成 ETag 标识；
+2.  接收客户端 `If-None-Match` / `If-Modified-Since` 头进行比对；
+3.  缓存命中：返回 304 状态码，不返回文件内容。
+
+### 6.5 Gzip 压缩
+
+1.  仅对**文本类文件**开启压缩（html、css、js、json、txt 等）；
+2.  校验客户端请求头 `Accept-Encoding` 是否支持 gzip；
+3.  文件流经过 `zlib.Gzip` 压缩后输出，并添加 `Content-Encoding: gzip` 响应头。
+
+* * *
+
+## 7. 文件上传模块设计
+
+### 7.1 流式解析核心实现
+
+基于状态机实现 `multipart/form-data` **流式解析**：
+
+1.  边接收客户端数据流，边解析、边写入本地临时文件；
+2.  全程不将完整文件载入内存，支持超大文件并发上传；
+3.  内置文件大小、表单字段大小限制，超限直接终止解析。
+
+### 7.2 临时文件生命周期管理
+
+1.  解析到文件区块时，生成唯一临时文件名，写入临时目录；
+2.  文件信息存入 `req.formData.files`，供业务层读取；
+3.  **请求响应完成后**，自动删除当前请求产生的所有临时文件；
+4.  客户端主动断开连接时，同步清理已生成的不完整临时文件。
+
+### 7.3 上传进度展示
+
+规则：文件大小 **大于 1MB** 时自动开启控制台进度展示。
+
+展示内容：文件名进度条、已传 / 总大小、百分比、传输速度、耗时。
+
+* * *
+
+## 8. 通用工具函数设计
+
+所有工具函数为内部公共能力，同时对外导出供二次使用：
+
+1.  **`parseUrl`**：解析 URL，拆分路径与 Query 参数；
+2.  **`parseCookies`**：解析 Cookie 字符串为键值对象；
+3.  **`getMimeType`**：根据文件后缀匹配标准 MIME 类型；
+4.  **`fmtSize`**：字节单位格式化（B/KB/MB/GB）；
+5.  **`fmtTime`**：毫秒时间格式化（ms/s/m）；
+6.  **`isPathSafe`**：路径安全校验，防遍历攻击；
+7.  **`generateETag`**：根据文件信息生成缓存标识；
+8.  **`parseRange`**：解析 Range 请求头，提取字节分段范围。
+
+* * *
+
+## 9. 错误处理机制
+
+### 9.1 错误流转规则
+
+1.  **同步代码异常**：框架自动捕获，流转至错误处理中间件；
+2.  **异步代码异常**（async/await、回调）：必须手动调用 `next(err)` 传递异常；
+3.  异常一旦产生，终止正常业务链路，进入统一错误处理流程。
+
+### 9.2 错误处理中间件
+
+固定签名（四个入参），作为全局异常兜底：
+
+javascript
+
+运行
+
+```javascript
+app.use((err, req, res, next) => {
+  // 日志记录错误堆栈
+  // 统一返回错误响应
+});
+
+```
+
+* * *
+
+## 10. 对外导出接口
+
+`httpm.js` 统一导出所有对外可用类、函数、中间件，入口如下：
+
+javascript
+
+运行
+
+```javascript
+module.exports = Object.assign(httpm, {
+  // 核心类
+  Application, Router, Request, Response,
+  SSE, WebSocket, WebSocketServer, Logger,
+
+  // 工具方法
+  WebSocketHandShark,
+
+  // 内置中间件
+  bodyParser, cookieParser, static,
+
+  // 通用工具函数
+  parseUrl, parseQuery, parseCookies, getMimeType,
+  fmtSize, fmtTime, isPathSafe, generateETag, parseRange
+});
+
+```
+
+* * *
+
+## 11. 典型使用示例
+
+### 11.1 基础服务 + 路由 + 静态文件
+
+javascript
+
+运行
+
+```javascript
+const httpm = require('./httpm');
+const app = httpm({ rootPath: './public', showDir: true });
+
+// 全局中间件
+app.use((req, res, next) => {
+  console.log(req.method, req.path);
+  next();
+});
+
+// 动态路由
+app.get('/api/users/:id', (req, res) => {
+  const user = null;
+  if (!user) return false; // 走静态文件兜底
+  res.json(user);
+});
+
+app.listen(3000);
+
+```
+
+### 11.2 文件上传
+
+javascript
+
+运行
+
+```javascript
+app.post('/upload', (req, res) => {
+  const { fields, files } = req.formData;
+  // 业务处理文件
+  res.json({ success: true, fields });
+  // 响应结束后临时文件自动删除
+});
+
+```
+
+### 11.3 WebSocket 聊天室
+
+javascript
+
+运行
+
+```javascript
+app.ws('/chat', (ws, req) => {
+  ws.send({ type: 'welcome', id: ws.id });
+  ws.on('text', msg => {
+    app.wsServer.broadcast('/chat', msg, ws.id);
+  });
+});
+
+```
+
+### 11.4 SSE 长推送
+
+javascript
+
+运行
+
+```javascript
+app.sse('/events', (sse, req) => {
+  const timer = setInterval(() => {
+    sse.event('time', new Date().toISOString());
+  }, 1000);
+  return () => clearInterval(timer);
+});
+
+```
+
+* * *
+
+## 12. 补充设计规则与边界约束
+
+1.  **路由匹配优先级**：精准静态路由 > 动态参数路由 > ALL 通用路由 > 静态文件服务；
+2.  **API 兼容**：对齐 Express 常用语法，降低迁移成本；
+3.  **文件限制**：严格执行单文件、表单字段大小限制，防护超大请求；
+4.  **编码规则**：所有对外文本、HTML、JSON 默认使用 UTF-8 编码；
+5.  **WebSocket 约束**：当前版本仅支持单帧消息，暂不实现分片帧解析；
+6.  **临时文件**：所有上传临时文件仅生命周期内有效，请求结束强制清理。
+
+* * *
+
+## 13. 版本与包说明
+
+### package.json 配置
+
+json
+
+```json
+{
+  "name": "httpm",
+  "version": "1.0.1",
+  "main": "httpm.js",
+  "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
+  "engines": { "node": ">=10.0.0" },
+  "license": "MIT"
+}
+
+```
+
+### 运行要求
+
+-   运行环境：Node.js 10.0 及以上版本；
+-   依赖：纯原生模块，无第三方依赖；
+-   分发形式：单一 `httpm.js` 文件，可直接拷贝引入项目。
