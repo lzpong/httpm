@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.0
+**文档版本**：V1.1
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -185,6 +185,10 @@ class Router {
 3. 将占位符替换为正则捕获组 `([^/]+)`；
 4. 生成完整正则对象用于路径匹配。
 
+#### HEAD 请求匹配
+
+HEAD 请求自动匹配 GET 路由（Express 兼容行为），但仅发送响应头，不发送响应体。
+
 ### 3.3 Request 类
 
 #### 类职责
@@ -197,6 +201,8 @@ class Router {
 class Request {
   constructor(incomingMessage) {
     this._req = incomingMessage; // 原生请求对象（内部使用）
+    this._app = null;            // 所属 Application 实例（内部使用）
+    this._res = null;            // 关联的 Response 对象（内部使用）
     this.query = {};             // URL 解析后的查询参数
     this.params = {};            // 动态路由解析后的路径参数
     this.body = null;            // 解析后的请求体数据
@@ -223,6 +229,14 @@ class Request {
 - `req.hostname`： 请求域名
 - `req.protocol`： 当前协议（http /https）
 
+#### 请求体读取
+
+`_readBody(timeoutMs, maxSize)` 方法内置超时保护和流式大小检查：
+
+1. 默认超时 30 秒，超时后销毁请求流并抛出错误；
+2. 流式检查请求体大小，超过 `maxBodySize`（默认 128MB）时立即中断并返回 413；
+3. 错误对象使用 `error.cause` 附加上下文信息（实际大小、限制大小等）。
+
 ### 3.4 Response 类
 
 #### 类职责
@@ -234,6 +248,7 @@ class Request {
 | 成员 | 说明 |
 | --- | --- |
 | statusCode | 默认响应状态码，初始值 200 |
+| _isHead | 是否为 HEAD 请求（仅发送头部，不发送响应体） |
 | setHeader(name, value) | 设置响应头 |
 | getHeader(name) | 获取已设置的响应头 |
 | status(code) | 设置 HTTP 状态码，支持链式调用 |
@@ -241,7 +256,7 @@ class Request {
 | send(data) | 通用输出，支持字符串、HTML、Buffer |
 | sendFile(path, options) | 发送本地文件，内置断点续传、缓存、Gzip 能力 |
 | download(path, filename) | 触发浏览器文件下载，支持大文件进度展示 |
-| redirect(url, code) | 重定向响应，默认 302 状态码 |
+| redirect([code,] url) | 重定向响应，兼容 Express 签名：`redirect(url)` 默认 302，`redirect(status, url)` 指定状态码 |
 | sse() | 创建 SSE 推送实例 |
 | cookie(name, value, opts) | 设置响应 Cookie |
 
@@ -250,7 +265,8 @@ class Request {
 1. **进度展示**：文件大于 1MB 时，自动在控制台展示传输进度；
 2. **Range 断点续传**：识别请求 `Range` 头，返回 206 分段响应；
 3. **缓存校验**：通过 ETag、Last-Modified 校验，命中缓存返回 304；
-4. **Gzip 压缩**：对文本类文件，根据客户端 `Accept-Encoding` 自动开启压缩。
+4. **Gzip 压缩**：对文本类文件，根据客户端 `Accept-Encoding` 自动开启压缩；
+5. **HEAD 请求**：匹配 GET 路由但仅发送响应头，不发送响应体（Express 兼容行为）。
 
 ### 3.5 SSE 类
 
@@ -260,9 +276,10 @@ class Request {
 
 #### 核心设计
 
-1. 实例化时自动设置 SSE 标准响应头：`Content-Type: text/event-stream`、`Cache-Control: no-cache`、`Connection: keep-alive`；
+1. 实例化时自动设置 SSE 标准响应头：`Content-Type: text/event-stream`、`Cache-Control: no-cache`、`Connection: keep-alive`（仅在 headers 未发送时设置）；
 2. 内置连接状态标识 `connected`，标记连接是否正常；
-3. 支持标准 SSE 消息格式、自定义事件、重连时间配置。
+3. 监听 `close` 和 `aborted` 事件，兼容 HTTP/1.1 和 HTTP/2 连接断开检测；
+4. 支持标准 SSE 消息格式、自定义事件、重连时间配置。
 
 #### 核心方法
 
@@ -282,9 +299,14 @@ class Request {
 
 遵循 **RFC 6455** 标准实现 WebSocket 单连接管理。
 
-1. 核心属性：原生 socket、连接路径、唯一 ID、连接状态、心跳时间戳；
+1. 核心属性：原生 socket、连接路径、唯一 ID、连接状态（connected / _closing / _closed）、心跳时间戳；
 2. `send(data)` 方法：自动区分文本、JSON 对象、二进制 Buffer，匹配对应帧类型；
-3. 监听底层套接字事件，处理消息接收、连接断开。
+3. `close(code, reason)` 方法：先发送 Close 帧（此时 connected 仍为 true），再标记 connected=false、_closing=true，限时 2 秒等待对端 Close 帧，超时则强制销毁 socket；
+4. Close 帧状态码：对端发送无状态码的 Close 帧时，默认为 1005（RFC 6455 规定的"无状态码"语义码），非法状态码（0-999）自动修正为 1005；
+5. 关闭握手期间（_closing=true）：忽略非控制帧，仅处理 Ping/Pong/Close 帧；
+6. 帧负载长度超过 `Number.MAX_SAFE_INTEGER` 时视为超限帧，拒绝处理；
+7. 支持分片帧解析（continuation frame），多帧消息自动合并后触发事件；
+8. 监听底层套接字事件，处理消息接收、连接断开。
 
 #### 3.6.2 WebSocketServer 类
 
@@ -293,11 +315,23 @@ class Request {
 1. 连接分组：按请求路径对连接分组，支持按路径广播消息；
 2. 统一心跳：全局唯一心跳定时器，有连接则启动，无连接则停止，减少资源占用；
 3. 广播能力：支持**按路径广播**、**全局广播**，支持排除指定连接；
-4. 连接管理：新增 / 销毁连接时自动维护连接列表。
+4. 连接管理：新增 / 销毁连接时自动维护连接列表；
+5. Origin 校验：支持 `allowedOrigins` 配置，防止跨站 WebSocket 劫持（CSWSH）；
+6. 帧负载限制：支持 `maxPayload` 配置，防止恶意超大帧耗尽内存。
 
 #### 心跳机制
 
 定时向所有连接发送 Ping 帧，检测客户端 Pong 回复，超时未响应则主动断开连接，清理无效套接字。
+
+#### 动态参数路由
+
+`app.ws()` 支持动态参数路由，复用 Router 的路由编译逻辑：
+
+```javascript
+app.ws('/chat/:room', (ws, req) => {
+  console.log(req.params.room); // 动态参数自动解析
+});
+```
 
 ### 3.7 Logger 日志类
 
@@ -307,7 +341,7 @@ class Request {
 
 #### 日志级别（优先级从低到高）
 
-`debug` < `info` < `notice` < `warn` < `error`
+`debug` < `info` < `notice` < `warn` < `error` < `fatal`
 
 文件：./log/YYYY/MM/name_DD.log
 
@@ -368,6 +402,20 @@ function middleware(req, res, next) {
 
 解析请求头中的 `Cookie` 字段，格式化后存入 `req.cookies`，供业务使用。
 
+#### 4.3.3 static
+
+静态文件服务中间件，支持目录自动查找 `index.html`：
+
+```javascript
+app.use(httpm.static('public'));
+// 支持 options
+app.use(httpm.static('public', { allowAccessToAllFiles: true }));
+```
+
+1. 请求路径为目录时，自动查找 `index.html`；
+2. 支持 `allowAccessToAllFiles` 选项，允许访问隐藏文件；
+3. 路径安全校验防止目录遍历攻击。
+
 ---
 
 ## 5. 配置管理设计
@@ -387,11 +435,13 @@ const defaultConfig = {
   tempDir: 'tempupdir',           // 文件上传临时目录
   maxFileSize: 128 * 1024 * 1024, // 单文件最大限制 128MB
   maxFieldSize: 1024 * 1024,      // 表单字段最大限制 1MB
+  maxBodySize: 128 * 1024 * 1024, // 请求体最大限制 128MB
   svrPort: 80,                    // 服务默认端口
   svrIP: null,                    // 监听地址（null 监听所有网卡）
 
   // 功能开关
   showDir: false,                 // 是否允许展示目录列表
+  allowAccessToAllFiles: false,   // 是否允许访问隐藏文件（.env、.git 等）
   enableCache: false,             // 是否开启文件缓存
   enableGzip: false,              // 是否开启 Gzip 压缩
   enableRange: true,              // 是否开启断点续传（默认启用）
@@ -410,7 +460,7 @@ const defaultConfig = {
   logDir: './log',
 
   // 跨域配置
-  cors: { origin: '*', headers: 'Content-Type, Authorization', maxAge: '86400' },
+  cors: { origin: '*', headers: 'Content-Type, Authorization', maxAge: 86400 },
 
   // 内置中间件开关
   useBodyParser: true,
@@ -420,7 +470,9 @@ const defaultConfig = {
 
   // WebSocket 心跳
   wsHeartbeatInterval: 30000,     // 心跳发送间隔(ms)
-  wsHeartbeatTimeout: 30000        // 心跳超时时间(ms)
+  wsHeartbeatTimeout: 30000,      // 心跳超时时间(ms)
+  wsMaxPayload: 100 * 1024 * 1024,// WebSocket 最大帧负载大小（默认 100MB）
+  wsAllowedOrigins: null          // WebSocket 允许的 Origin 列表（null=不限制）
 };
 ```
 
@@ -461,7 +513,7 @@ const defaultConfig = {
 
 1. 根据文件大小、最后修改时间生成 ETag 标识；
 2. 接收客户端 `If-None-Match` / `If-Modified-Since` 头进行比对；
-3. 缓存命中：返回 304 状态码，不返回文件内容。
+3. 缓存命中：返回 304 状态码，不返回文件内容，不设置 Content-Length；
 
 ### 6.5 Gzip 压缩
 
@@ -479,7 +531,10 @@ const defaultConfig = {
 
 1. 边接收客户端数据流，边解析、边写入本地临时文件；
 2. 全程不将完整文件载入内存，支持超大文件并发上传；
-3. 内置文件大小、表单字段大小限制，超限直接终止解析。
+3. 内置文件大小、表单字段大小限制，超限直接终止解析；
+4. 写入流背压处理：当 `WriteStream.write()` 返回 false 时暂停请求读取，drain 后恢复，避免内存积压；
+5. 文件超限或解析出错时，使用 `stream.destroy()` 立即释放文件描述符，而非 `stream.close()`；
+6. 回看长度机制：保留分隔符长度 -1 的尾部字节，防止分隔符跨 chunk 截断导致解析失败。
 
 ### 7.2 临时文件生命周期管理
 
@@ -500,14 +555,16 @@ const defaultConfig = {
 
 所有工具函数为内部公共能力，同时对外导出供二次使用：
 
-1. **`parseUrl`**：解析 URL，拆分路径与 Query 参数；
-2. **`parseCookies`**：解析 Cookie 字符串为键值对象；
-3. **`getMimeType`**：根据文件后缀匹配标准 MIME 类型；
-4. **`fmtSize`**：字节单位格式化（B/KB/MB/GB）；
-5. **`fmtTime`**：毫秒时间格式化（ms/s/m）；
-6. **`isPathSafe`**：路径安全校验，防遍历攻击；
-7. **`generateETag`**：根据文件信息生成缓存标识；
-8. **`parseRange`**：解析 Range 请求头，提取字节分段范围。
+1. **`parseUrl`**：解析 URL，拆分路径与 Query 参数，自动去除 `#` 片段；
+2. **`_parseQueryString`**：解析查询字符串为键值对象，支持 `+` 转空格，内置 `decodeURIComponent` 异常降级；
+3. **`parseCookies`**：解析 Cookie 字符串为键值对象；
+4. **`getMimeType`**：根据文件后缀匹配标准 MIME 类型；
+5. **`fmtSize`**：字节单位格式化（B/KB/MB/GB/TB），智能小数位处理；
+6. **`fmtTime`**：毫秒时间格式化（ms/s/m）；
+7. **`isPathSafe`**：路径安全校验，防遍历攻击，支持 `allowAllFiles` 选项允许访问隐藏文件；
+8. **`generateETag`**：根据文件信息生成缓存标识；
+9. **`parseRange`**：解析 Range 请求头，提取字节分段范围；
+10. **`escapeHtml`**：HTML 实体转义，防止 XSS 攻击。
 
 ---
 
@@ -517,7 +574,8 @@ const defaultConfig = {
 
 1. **同步代码异常**：框架自动捕获，流转至错误处理中间件；
 2. **异步代码异常**（async/await、回调）：必须手动调用 `next(err)` 传递异常；
-3. 异常一旦产生，终止正常业务链路，进入统一错误处理流程。
+3. 异常一旦产生，终止正常业务链路，进入统一错误处理流程；
+4. **safeNext 防护**：每个中间件/路由处理器接收的 `next` 函数被 `safeNext` 包装，同一处理器多次调用 `next()` 时仅首次生效，防止重复响应。
 
 ### 9.2 错误处理中间件
 
@@ -621,8 +679,12 @@ app.sse('/events', (sse, req) => {
 2. **API 兼容**：对齐 Express 常用语法，降低迁移成本；
 3. **文件限制**：严格执行单文件、表单字段大小限制，防护超大请求；
 4. **编码规则**：所有对外文本、HTML、JSON 默认使用 UTF-8 编码；
-5. **WebSocket 约束**：当前版本仅支持单帧消息，暂不实现分片帧解析；
-6. **临时文件**：所有上传临时文件仅生命周期内有效，请求结束强制清理。
+5. **WebSocket 约束**：支持分片帧解析（continuation frame），帧负载长度超过 `Number.MAX_SAFE_INTEGER` 时拒绝处理；
+6. **临时文件**：所有上传临时文件仅生命周期内有效，请求结束强制清理；
+7. **安全防御**：所有 `decodeURIComponent` 调用均有 try-catch 降级处理，防止非法 URI 编码导致请求崩溃；
+8. **XSS 防护**：目录列表 HTML 输出使用 `escapeHtml` 转义，防止文件名注入脚本；
+9. **Cookie 签名**：签名基于原始值计算，编码后的值不参与签名验证，确保 `encodeURIComponent` 不影响签名一致性；
+10. **请求体大小限制**：`_readBody` 方法内置超时保护（默认 30 秒）和流式大小检查，超限时返回 413 状态码。
 
 ---
 
@@ -633,11 +695,11 @@ app.sse('/events', (sse, req) => {
 
 ```json
 {
-  "name": "httpm",
-  "version": "1.0.1",
+  "name": "@lzpong/httpm",
+  "version": "1.1.0",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
-  "engines": { "node": ">=10.0.0" },
+  "engines": { "node": ">=18.0.0" },
   "license": "MIT"
 }
 ```

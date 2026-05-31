@@ -8,7 +8,7 @@
 - **零第三方依赖** — 仅使用 Node.js 内置模块（`http`、`https`、`fs`、`path`、`crypto`、`zlib`）
 - **Express 兼容** — 路由、中间件、请求/响应 API 对齐 Express 语法
 - **静态文件服务** — Range 断点续传、ETag/Last-Modified 缓存、Gzip 压缩
-- **WebSocket** — 路径分组、心跳保活、广播、文本/二进制子事件
+- **WebSocket** — 路径分组、心跳保活、广播、文本/二进制子事件、分片帧支持、动态参数路由
 - **SSE** — 服务端推送事件，支持 event/data/retry/comment
 - **流式文件上传** — multipart/form-data 解析，内存零占用，临时文件自动清理
 - **日志系统** — 彩色控制台输出 + 文件持久化，按级别过滤
@@ -133,8 +133,7 @@ app.use((err, req, res, next) => {
 | `res.send(data)` | 发送响应（自动识别类型） |
 | `res.sendFile(path, opts)` | 发送文件 |
 | `res.download(path, name)` | 下载文件 |
-| `res.redirect(url)` | 重定向（默认 302） |
-| `res.redirect(code, url)` | 重定向（指定状态码） |
+| `res.redirect([code,] url)` | 重定向，兼容 Express 签名：`redirect(url)` 默认 302，`redirect(status, url)` 指定状态码 |
 | `res.cookie(name, value, opts)` | 设置 Cookie |
 | `res.clearCookie(name, opts)` | 清除 Cookie |
 | `res.set(name, value)` / `res.setHeader()` | 设置响应头 |
@@ -164,6 +163,8 @@ const app = httpm({ rootPath: './public', showDir: true, enableGzip: true, enabl
 
 ```javascript
 app.use(httpm.static('./public'));
+// 允许访问隐藏文件
+app.use(httpm.static('./public', { allowAccessToAllFiles: true }));
 ```
 
 | 配置项 | 默认值 | 说明 |
@@ -209,8 +210,8 @@ app.ws('/chat', (ws, req) => {
     // 处理二进制数据
   });
 
-  ws.on('close', () => {
-    console.log('Client disconnected');
+  ws.on('close', (code, reason) => {
+    console.log('Client disconnected', code, reason);
   });
 });
 ```
@@ -232,7 +233,7 @@ wss.getConnections();                              // 获取所有连接
 | `data` | 接收消息（`{ type: 'text'/'binary', data }`） |
 | `text` | 接收文本消息 |
 | `binary` | 接收二进制消息 |
-| `close` | 连接关闭 |
+| `close` | 连接关闭，回调参数 `(code, reason)` |
 | `error` | 连接错误 |
 
 ### data 事件使用
@@ -334,9 +335,11 @@ const app = httpm({ svrPort: 3000 }); // svrPort=3000, enableGzip=true(来自app
 | `tempDir` | `'tempupdir'` | 上传临时文件目录 |
 | `maxFileSize` | `134217728` | 单文件大小限制（128MB） |
 | `maxFieldSize` | `1048576` | 表单字段大小限制（1MB） |
+| `maxBodySize` | `134217728` | 请求体大小限制（128MB） |
 | `svrPort` | `80` | 服务端口 |
 | `svrIP` | `null` | 绑定 IP（null=所有接口） |
 | `showDir` | `false` | 显示目录列表 |
+| `allowAccessToAllFiles` | `false` | 允许访问隐藏文件（.env、.git 等） |
 | `enableCache` | `false` | 启用缓存 |
 | `enableGzip` | `false` | 启用 Gzip 压缩 |
 | `enableRange` | `true` | 启用断点续传 |
@@ -352,6 +355,8 @@ const app = httpm({ svrPort: 3000 }); // svrPort=3000, enableGzip=true(来自app
 | `useCookieParser` | `true` | 自动解析 Cookie |
 | `bodyParserOptions` | `{}` | bodyParser 选项 |
 | `cookieParserSecret` | `null` | Cookie 签名密钥 |
+| `wsMaxPayload` | `104857600` | WebSocket 最大帧负载（100MB） |
+| `wsAllowedOrigins` | `null` | WebSocket 允许的 Origin 列表 |
 
 ## HTTPS / HTTP2
 
@@ -404,12 +409,13 @@ httpm.fmtTime
 httpm.isPathSafe
 httpm.generateETag
 httpm.parseRange
+httpm.escapeHtml
 httpm.WebSocketHandShark
 ```
 
 ## 运行要求
 
-- Node.js >= 14.0.0
+- Node.js >= 18.0.0
 - 零第三方依赖
 
 ## 测试
