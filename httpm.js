@@ -2,11 +2,11 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.0.0
+ * @version     1.0.3
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
- * @requires    node >= 14.0.0
+ * @requires    node >= 18.0.0
  * @module      httpm
  * @author      lzpong
  * @link        https://gitee.com/lzpong/httpm
@@ -41,24 +41,44 @@ const zlib = require('zlib');
  * 解析 URL，拆分路径与 Query 参数
  */
 function parseUrl(urlStr) {
+  const hashIdx = urlStr.indexOf('#');
+  if (hashIdx !== -1) {
+    urlStr = urlStr.substring(0, hashIdx);
+  }
   const qIdx = urlStr.indexOf('?');
   if (qIdx === -1) {
     return { pathname: urlStr, query: {} };
   }
-  const pathname = urlStr.substring(0, qIdx);
-  const qs = urlStr.substring(qIdx + 1);
+  return { pathname: urlStr.substring(0, qIdx), query: _parseQueryString(urlStr.substring(qIdx + 1)) };
+}
+
+/**
+ * 解析查询字符串为键值对象
+ */
+function _parseQueryString(qs, plusAsSpace = false) {
   const query = {};
-  if (qs) {
-    qs.split('&').forEach(pair => {
-      const eIdx = pair.indexOf('=');
-      if (eIdx === -1) {
-        query[decodeURIComponent(pair)] = '';
-      } else {
-        query[decodeURIComponent(pair.substring(0, eIdx))] = decodeURIComponent(pair.substring(eIdx + 1));
+  if (!qs) return query;
+  qs.split('&').forEach(pair => {
+    const eIdx = pair.indexOf('=');
+    if (eIdx === -1) {
+      try {
+        query[decodeURIComponent(plusAsSpace ? pair.replace(/\+/g, ' ') : pair)] = '';
+      } catch (e) {
+        // 非法 URI 编码，保留原始值
+        query[plusAsSpace ? pair.replace(/\+/g, ' ') : pair] = '';
       }
-    });
-  }
-  return { pathname, query };
+    } else {
+      const key = pair.substring(0, eIdx);
+      const val = pair.substring(eIdx + 1);
+      try {
+        query[decodeURIComponent(plusAsSpace ? key.replace(/\+/g, ' ') : key)] = decodeURIComponent(plusAsSpace ? val.replace(/\+/g, ' ') : val);
+      } catch (e) {
+        // 非法 URI 编码，保留原始值
+        query[plusAsSpace ? key.replace(/\+/g, ' ') : key] = plusAsSpace ? val.replace(/\+/g, ' ') : val;
+      }
+    }
+  });
+  return query;
 }
 
 /**
@@ -75,6 +95,13 @@ function parseCookies(cookieStr) {
     cookies[key] = val;
   });
   return cookies;
+}
+
+/**
+ * HTML 实体转义，防止 XSS
+ */
+function escapeHtml(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 /**
@@ -146,10 +173,14 @@ function getMimeType(ext) {
  * 字节单位格式化（B/KB/MB/GB）
  */
 function fmtSize(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) return '0B';
   if (bytes === 0) return '0B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
   const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  return (bytes / Math.pow(1024, i)).toFixed(2) + units[i];
+  const value = bytes / (1024 ** i);
+  // 小于 10 时保留 2 位小数，否则保留 1 位，整数不显示小数
+  const formatted = value < 10 ? value.toFixed(2) : (value === Math.floor(value) ? value.toString() : value.toFixed(1));
+  return formatted + units[i];
 }
 
 /**
@@ -164,19 +195,19 @@ function fmtTime(ms) {
 /**
  * 路径安全校验，防遍历攻击
  */
-function isPathSafe(requestPath, rootDir) {
-  // 去掉前导斜杠，防止 path.resolve 将其视为绝对路径
+function isPathSafe(requestPath, rootDir, allowAllFiles = false) {
   const normalized = requestPath.replace(/^\/+/, '');
   const resolved = path.resolve(rootDir, normalized);
   const root = path.resolve(rootDir);
-  // 确保解析后的路径在根目录内
   if (!resolved.startsWith(root + path.sep) && resolved !== root) {
     return false;
   }
-  // 禁止访问隐藏文件/目录（以 . 开头）
-  const parts = normalized.split(/[/\\]/);
-  for (const part of parts) {
-    if (part.startsWith('.')) return false;
+  // allowAllFiles=true 时允许访问所有文件（包括 .env、.git 等隐藏文件）
+  if (!allowAllFiles) {
+    const parts = normalized.split(/[/\\]/);
+    for (const part of parts) {
+      if (part.startsWith('.')) return false;
+    }
   }
   return true;
 }
@@ -240,13 +271,14 @@ class Logger {
     this.name = options.name || '';
     this.level = options.level || 'info';
     this.logDir = options.logDir || './log';
-    this._levels = { debug: 0, info: 1, notice: 2, warn: 3, error: 4 };
+    this._levels = { debug: 0, info: 1, notice: 2, warn: 3, error: 4, fatal: 5 };
     this._colors = {
       debug: '\x1b[1;30m',   // 灰色
       info: '\x1b[1;37m',    // 白色
       notice: '\x1b[1;35m',  // 品红
       warn: '\x1b[1;33m',    // 黄色
-      error: '\x1b[1;31m'    // 红色
+      error: '\x1b[1;31m',   // 红色
+      fatal: '\x1b[1;31;1m'  // 红色加粗
     };
     this._reset = '\x1b[0m';
     this._stream = null;
@@ -276,16 +308,18 @@ class Logger {
     if (this._stream && this._streamDate === streamKey) {
       return this._stream;
     }
-    // 关闭旧流
+    // 关闭旧流（等待写入完成后再销毁，避免跨日切换时丢失日志）
+    // this._stream 已置 null，新日志将写入新流，旧流异步刷盘不会与新流冲突
     if (this._stream) {
-      this._stream.end();
+      const oldStream = this._stream;
+      oldStream.end(() => {
+        oldStream.destroy();
+      });
       this._stream = null;
     }
-    // 创建日志目录: ./log/YYYY/MM/
+    // 创建日志目录: ./log/YYYY/MM/（recursive: true 自动处理已存在的情况）
     const dir = path.join(this.logDir, year, month);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
+    fs.mkdirSync(dir, { recursive: true });
     // 文件名: name_DD.log 或 DD.log
     const prefix = this.name ? this.name + '_' : '';
     const filePath = path.join(dir, `${prefix}${day}.log`);
@@ -321,6 +355,7 @@ class Logger {
   notice(...args) { this.log('notice', ...args); }
   warn(...args) { this.log('warn', ...args); }
   error(...args) { this.log('error', ...args); }
+  fatal(...args) { this.log('fatal', ...args); }
 }
 
 // ============================================================
@@ -363,10 +398,6 @@ class Router {
     if (this.routes[key]) {
       this.routes[key].push(route);
     }
-    // 同时注册到 ALL
-    if (key !== 'ALL') {
-      // ALL 路由单独处理，不在此处添加
-    }
     return this;
   }
 
@@ -395,18 +426,30 @@ class Router {
     const results = [];
     const m = method.toUpperCase();
 
+    // HEAD 请求同时匹配 GET 路由（Express 兼容行为）
+    const methods = [m];
+    if (m === 'HEAD') methods.push('GET');
+
     // 检查 ALL 路由
     const allRoutes = this.routes['ALL'] || [];
     // 检查对应方法路由
-    const methodRoutes = this.routes[m] || [];
-    const candidates = [...allRoutes, ...methodRoutes];
+    let methodRoutes = [...allRoutes];
+    for (const meth of methods) {
+      const routes = this.routes[meth] || [];
+      methodRoutes = methodRoutes.concat(routes);
+    }
 
-    for (const route of candidates) {
+    for (const route of methodRoutes) {
       const match = route.pattern.exec(pathname);
       if (match) {
         const params = {};
         route.params.forEach((name, i) => {
-          params[name] = decodeURIComponent(match[i + 1]);
+          try {
+            params[name] = decodeURIComponent(match[i + 1]);
+          } catch (e) {
+            // 非法 URI 编码，保留原始值
+            params[name] = match[i + 1];
+          }
         });
         results.push({ route, params, handlers: route.handlers });
       }
@@ -434,7 +477,12 @@ class Router {
             const match = mw.pattern.exec(pathname);
             if (match) {
               mw.params.forEach((name, i) => {
-                params[name] = decodeURIComponent(match[i + 1]);
+                try {
+                  params[name] = decodeURIComponent(match[i + 1]);
+                } catch (e) {
+                  // 非法 URI 编码，保留原始值
+                  params[name] = match[i + 1];
+                }
               });
             }
           }
@@ -463,6 +511,8 @@ class Router {
 class Request {
   constructor(incomingMessage) {
     this._req = incomingMessage;
+    this._app = null;
+    this._res = null;
     this.query = {};
     this.params = {};
     this.body = null;
@@ -494,22 +544,47 @@ class Request {
   }
 
   /**
-   * 读取请求体原始数据
+   * 读取请求体原始数据（带超时保护和大小限制）
    */
-  _readBody() {
+  _readBody(timeoutMs = 30000, maxSize = null) {
     return new Promise((resolve, reject) => {
       if (this._bodyParsed) {
         resolve(this._rawBody);
         return;
       }
       const chunks = [];
-      this._req.on('data', chunk => chunks.push(chunk));
+      let totalSize = 0;
+      const limit = maxSize || (this._app?.settings?.maxBodySize) || 128 * 1024 * 1024;
+      let timedOut = false;
+      // 超时定时器
+      const timer = setTimeout(() => {
+        timedOut = true;
+        this._req.destroy();
+        reject(new Error('Request body read timeout', { cause: { timeoutMs } }));
+      }, timeoutMs);
+      this._req.on('data', chunk => {
+        totalSize += chunk.length;
+        // 流式大小检查，超限时立即中断
+        if (totalSize > limit) {
+          clearTimeout(timer);
+          this._req.destroy();
+          const err = new Error(`Request body exceeds maximum size of ${fmtSize(limit)}`, { cause: { actual: totalSize, maxSize: limit } });
+          err.status = 413;
+          reject(err);
+          return;
+        }
+        chunks.push(chunk);
+      });
       this._req.on('end', () => {
+        clearTimeout(timer);
         this._rawBody = Buffer.concat(chunks);
         this._bodyParsed = true;
         resolve(this._rawBody);
       });
-      this._req.on('error', reject);
+      this._req.on('error', (err) => {
+        clearTimeout(timer);
+        if (!timedOut) reject(err);
+      });
     });
   }
 }
@@ -524,6 +599,7 @@ class Response {
     this._app = app;
     this.statusCode = 200;
     this._headersSent = false;
+    this._isHead = false;
     this._sse = null;
   }
 
@@ -602,7 +678,12 @@ class Response {
     if (this._res.finished) return;
     this._res.statusCode = this.statusCode;
     this._headersSent = true;
-    this._res.end(data);
+    // HEAD 请求只发送头部，不发送响应体
+    if (this._isHead) {
+      this._res.end();
+    } else {
+      this._res.end(data);
+    }
   }
 
   /**
@@ -635,7 +716,10 @@ class Response {
         const ifNoneMatch = this._req?.headers?.['if-none-match'];
         const ifModifiedSince = this._req?.headers?.['if-modified-since'];
         if (ifNoneMatch === etag || (ifModifiedSince && new Date(ifModifiedSince) >= stat.mtime)) {
-          this.status(304)._send('');
+          this.status(304);
+          this.removeHeader('Content-Length');
+          this._res.statusCode = 304;
+          this._res.end();
           return;
         }
       }
@@ -648,7 +732,7 @@ class Response {
           this.status(206);
           this.setHeader('Content-Range', `bytes ${range.start}-${range.end}/${range.total}`);
           this.setHeader('Content-Length', range.end - range.start + 1);
-          this._streamFile(fullPath, range.start, range.end, stat.size);
+          this._streamFile(fullPath, range.start, range.end);
           return;
         }
       }
@@ -658,50 +742,57 @@ class Response {
       // Gzip 压缩（仅文本类文件）
       const acceptEncoding = this._req?.headers?.['accept-encoding'] || '';
       if (this._app.settings.enableGzip && isTextMime(mime) && acceptEncoding.includes('gzip')) {
+        // HEAD 请求不传输内容
+        if (this._isHead) {
+          this._send('');
+          return;
+        }
         this.removeHeader('Content-Length');
         this.setHeader('Content-Encoding', 'gzip');
-        this._res.statusCode = this.statusCode;
+        this.status(this.statusCode);
         this._headersSent = true;
         const raw = fs.createReadStream(fullPath);
         const gzip = zlib.createGzip();
+        // 流错误处理：文件读取或压缩出错时返回 500
+        const onError = (err) => {
+          raw.destroy();
+          gzip.destroy();
+          if (!this._res.finished) {
+            this._res.statusCode = 500;
+            this._res.end('Internal Server Error');
+          }
+        };
+        raw.on('error', onError);
+        gzip.on('error', onError);
         raw.pipe(gzip).pipe(this._res);
         return;
       }
 
-      this._streamFile(fullPath, 0, stat.size - 1, stat.size);
+      this._streamFile(fullPath, 0, stat.size - 1);
     });
   }
 
   /**
    * 流式发送文件
    */
-  _streamFile(fullPath, start, end, total) {
+  _streamFile(fullPath, start, end) {
     if (this._res.finished) return;
     this._res.statusCode = this.statusCode;
     this._headersSent = true;
-    const stream = fs.createReadStream(fullPath, { start, end });
-    // 大文件进度展示（>1MB）
-    if (total > 1024 * 1024) {
-      const name = path.basename(fullPath);
-      const totalSize = end - start + 1;
-      let sent = 0;
-      const startTime = Date.now();
-      let lastLine = '';
-      stream.on('data', (chunk) => {
-        sent += chunk.length;
-        const pct = ((sent / totalSize) * 100).toFixed(1);
-        const elapsed = Date.now() - startTime;
-        const speed = elapsed > 0 ? sent / (elapsed / 1000) : 0;
-        const line = `\r[${name}] ${fmtSize(sent)}/${fmtSize(totalSize)} ${pct}% ${fmtSize(speed)}/s ${fmtTime(elapsed)}`;
-        if (line !== lastLine) {
-          process.stdout.write(line);
-          lastLine = line;
-        }
-      });
-      stream.on('end', () => {
-        if (sent > 0) process.stdout.write('\n');
-      });
+    // HEAD 请求只发送头部，不传输文件内容
+    if (this._isHead) {
+      this._res.end();
+      return;
     }
+    const stream = fs.createReadStream(fullPath, { start, end });
+    // 流错误处理：文件读取出错时返回 500
+    stream.on('error', (err) => {
+      stream.destroy();
+      if (!this._res.finished) {
+        this._res.statusCode = 500;
+        this._res.end('Internal Server Error');
+      }
+    });
     stream.pipe(this._res);
   }
 
@@ -715,11 +806,18 @@ class Response {
   }
 
   /**
-   * 重定向响应
+   * 重定向响应（兼容 Express: redirect(status, url) 或 redirect(url)）
    */
-  redirect(url, code = 302) {
-    this.status(code);
-    this.setHeader('Location', url);
+  redirect(...args) {
+    if (typeof args[0] === 'number') {
+      // redirect(status, url)
+      this.status(args[0]);
+      this.setHeader('Location', args[1]);
+    } else {
+      // redirect(url) 默认 302
+      this.status(302);
+      this.setHeader('Location', args[0]);
+    }
     this.setHeader('Content-Length', 0);
     this._send('');
   }
@@ -737,16 +835,16 @@ class Response {
    * 设置响应 Cookie
    */
   cookie(name, value, opts = {}) {
-    let cookieValue = value;
-    // 签名 Cookie：s:value.signature
+    let encodedValue = encodeURIComponent(value);
+    // 签名 Cookie：s:value.signature（s: 前缀不参与编码）
     if (opts.signed) {
       const secret = this._app && this._app.settings && this._app.settings.cookieParserSecret;
       if (secret) {
         const sig = crypto.createHmac('sha256', secret).update(value).digest('base64').replace(/=+$/, '');
-        cookieValue = 's:' + value + '.' + sig;
+        encodedValue = 's:' + encodedValue + '.' + sig;
       }
     }
-    let str = `${encodeURIComponent(name)}=${encodeURIComponent(cookieValue)}`;
+    let str = `${encodeURIComponent(name)}=${encodedValue}`;
     if (opts.maxAge !== undefined) str += `; Max-Age=${opts.maxAge}`;
     if (opts.domain) str += `; Domain=${opts.domain}`;
     if (opts.path) str += `; Path=${opts.path}`;
@@ -778,18 +876,23 @@ class SSE {
     this._res = res;
     this.connected = true;
 
-    // 设置 SSE 标准响应头
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      'Access-Control-Allow-Origin': '*'
-    });
+    // 设置 SSE 标准响应头（仅在 headers 未发送时）
+    if (!res.headersSent) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*'
+      });
+    }
 
-    // 监听连接关闭
-    res.on('close', () => {
+    // 监听连接关闭（兼容 HTTP/1.1 和 HTTP/2）
+    const onClose = () => {
       this.connected = false;
-    });
+    };
+    res.on('close', onClose);
+    // HTTP/1.1 兼容：aborted 事件在请求被客户端中断时触发
+    res.on('aborted', onClose);
   }
 
   /**
@@ -844,14 +947,41 @@ class SSE {
 // WebSocket 类
 // ============================================================
 
+/**
+ * 通用事件触发函数（WebSocket 和 WebSocketServer 共用）
+ */
+function _emitEvent(handlers, event, args) {
+  const list = handlers[event];
+  if (list) {
+    list.forEach(h => {
+      try { h(...args); } catch (e) { console.error(`[httpm] Event handler error on "${event}":`, e); }
+    });
+  }
+}
+
 class WebSocket {
-  constructor(socket, pathStr) {
+  constructor(socket, pathStr, options = {}) {
     this.socket = socket;
     this.path = pathStr;
     this.id = uid();
     this.connected = true;
     this._lastHeartbeat = Date.now();
     this._handlers = {};
+    // 最大帧负载大小（默认 100MB，防止恶意超大帧耗尽内存）
+    this._maxPayload = options.maxPayload || 100 * 1024 * 1024;
+    // 写入背压标记
+    this._writeBacklogged = false;
+    // 帧解析状态：缓存不完整帧数据
+    this._frameBuffer = Buffer.alloc(0);
+    // 分片帧状态
+    this._fragmented = false;
+    this._fragmentOpcode = 0;
+    this._fragmentPayloads = [];
+    // 防止 close 事件重复触发
+    this._closed = false;
+    // 关闭握手状态
+    this._closing = false;
+    this._closeTimer = null;
 
     // 监听底层 Pong 帧
     socket.on('pong', () => {
@@ -861,28 +991,43 @@ class WebSocket {
     // 监听连接关闭
     socket.on('close', () => {
       this.connected = false;
-      this._emit('close');
+      this._emitClose();
     });
 
     // 监听数据帧
     socket.on('data', (data) => {
-      this._handleFrame(data);
+      this._frameBuffer = Buffer.concat([this._frameBuffer, data]);
+      this._parseFrames();
     });
 
-    socket.on('error', () => {
+    // 监听底层错误，传递错误对象
+    socket.on('error', (err) => {
       this.connected = false;
-      this._emit('error');
+      this._emit('error', err);
     });
   }
 
   /**
-   * 解析 WebSocket 帧
+   * 循环解析帧缓冲区，处理多帧/半帧
    */
-  _handleFrame(data) {
-    if (data.length < 2) return;
+  _parseFrames() {
+    while (this._frameBuffer.length >= 2) {
+      const result = this._decodeFrame(this._frameBuffer);
+      if (result === null) break; // 数据不完整，等待更多数据
+      this._frameBuffer = this._frameBuffer.slice(result.bytesConsumed);
+      this._processFrame(result.opcode, result.payload, result.fin, result.oversize);
+    }
+  }
 
-    const firstByte = data[0];
-    const secondByte = data[1];
+  /**
+   * 从缓冲区解码一个帧，返回 { opcode, payload, fin, bytesConsumed } 或 null（数据不完整）
+   */
+  _decodeFrame(buf) {
+    if (buf.length < 2) return null;
+
+    const firstByte = buf[0];
+    const secondByte = buf[1];
+    const fin = (firstByte & 0x80) !== 0;
     const opcode = firstByte & 0x0F;
     const isMasked = (secondByte & 0x80) !== 0;
     let payloadLength = secondByte & 0x7F;
@@ -890,51 +1035,131 @@ class WebSocket {
 
     // 解析长度
     if (payloadLength === 126) {
-      payloadLength = data.readUInt16BE(offset);
+      if (buf.length < 4) return null;
+      payloadLength = buf.readUInt16BE(offset);
       offset += 2;
     } else if (payloadLength === 127) {
-      payloadLength = Number(data.readBigUInt64BE(offset));
+      if (buf.length < 10) return null;
+      const bigLen = buf.readBigUInt64BE(offset);
+      // 超过 Number.MAX_SAFE_INTEGER 时精度丢失，直接视为超限
+      if (bigLen > BigInt(Number.MAX_SAFE_INTEGER)) {
+        return { opcode: 0xFF, payload: Buffer.alloc(0), fin: true, bytesConsumed: buf.length, oversize: true };
+      }
+      payloadLength = Number(bigLen);
       offset += 8;
     }
 
     // 解析掩码
     let mask = null;
     if (isMasked) {
-      mask = data.slice(offset, offset + 4);
+      if (buf.length < offset + 4) return null;
+      mask = buf.slice(offset, offset + 4);
       offset += 4;
     }
 
+    // 检查负载数据是否完整
+    if (buf.length < offset + payloadLength) return null;
+
+    // 最大负载限制检查，超限时返回错误标记
+    if (payloadLength > this._maxPayload) {
+      return { opcode: 0xFF, payload: Buffer.alloc(0), fin: true, bytesConsumed: offset + payloadLength, oversize: true };
+    }
+
     // 提取负载
-    let payload = data.slice(offset, offset + payloadLength);
+    let payload = buf.slice(offset, offset + payloadLength);
     if (isMasked && mask) {
       for (let i = 0; i < payload.length; i++) {
         payload[i] ^= mask[i % 4];
       }
     }
 
-    switch (opcode) {
-      case 0x01: { // 文本帧
-        const text = payload.toString('utf8');
-        this._emit('message', text);
-        this._emit('text', text);
-        break;
+    return { opcode, payload, fin, bytesConsumed: offset + payloadLength };
+  }
+
+  /**
+   * 处理解码后的帧，支持分片帧（continuation frame, opcode=0x00）
+   */
+  _processFrame(opcode, payload, fin, oversize) {
+    // 超限帧：直接关闭连接
+    if (oversize) {
+      this.close(1009, 'Frame payload too large');
+      return;
+    }
+    // 关闭握手期间忽略数据帧
+    if (this._closing && opcode !== 0x08 && opcode !== 0x09 && opcode !== 0x0A) {
+      return;
+    }
+    // 控制帧（close/ping/pong）不分片，立即处理
+    if (opcode === 0x08) {
+      // 解析 Close 帧状态码和原因（RFC 6455 Section 5.5.1）
+      let code = 1005;
+      let reason = '';
+      if (payload.length >= 2) {
+        code = payload.readUInt16BE(0);
+        // RFC 6455 Section 7.4: 状态码 0-999 为非法，1005 表示无状态码
+        if (code < 1000) code = 1005;
+        reason = payload.length > 2 ? payload.slice(2).toString('utf8') : '';
       }
-      case 0x02: { // 二进制帧
-        this._emit('message', payload);
-        this._emit('binary', payload);
-        break;
+      // 如果正在关闭握手中，对端已回复 Close 帧，完成握手
+      if (this._closing) {
+        clearTimeout(this._closeTimer);
+        this._closeTimer = null;
+        try { this.socket.end(); } catch (e) { /* 忽略 */ }
+        this._emitClose(code, reason);
+        return;
       }
-      case 0x08: // 关闭帧
-        this._sendCloseFrame();
-        this.connected = false;
-        this._emit('close');
-        break;
-      case 0x09: // Ping 帧
-        this._sendPong(payload);
-        break;
-      case 0x0A: // Pong 帧
-        this._lastHeartbeat = Date.now();
-        break;
+      // 非关闭握手状态：回复 Close 帧后关闭
+      this._sendCloseFrame(code);
+      this.connected = false;
+      this._emitClose(code, reason);
+      return;
+    }
+    if (opcode === 0x09) {
+      this._sendPong(payload);
+      return;
+    }
+    if (opcode === 0x0A) {
+      this._lastHeartbeat = Date.now();
+      return;
+    }
+
+    // 数据帧：处理分片
+    if (opcode === 0x00) {
+      // 分片续帧：必须有前导帧
+      if (!this._fragmented) return;
+      this._fragmentPayloads.push(payload);
+      if (fin) {
+        // 分片结束，合并并触发事件
+        const fullPayload = Buffer.concat(this._fragmentPayloads);
+        this._emitData(this._fragmentOpcode, fullPayload);
+        this._fragmented = false;
+        this._fragmentPayloads = [];
+      }
+    } else {
+      // 新消息帧（opcode=0x01/0x02）
+      if (fin) {
+        // 非分片：直接触发
+        this._emitData(opcode, payload);
+      } else {
+        // 分片开始
+        this._fragmented = true;
+        this._fragmentOpcode = opcode;
+        this._fragmentPayloads = [payload];
+      }
+    }
+  }
+
+  /**
+   * 根据操作码触发数据事件
+   */
+  _emitData(opcode, payload) {
+    if (opcode === 0x01) {
+      const text = payload.toString('utf8');
+      this._emit('data', { type: 'text', data: text });
+      this._emit('text', text);
+    } else if (opcode === 0x02) {
+      this._emit('data', { type: 'binary', data: payload });
+      this._emit('binary', payload);
     }
   }
 
@@ -980,7 +1205,11 @@ class WebSocket {
     frames.push(payload);
     const frame = Buffer.concat(frames);
     try {
-      this.socket.write(frame);
+      const canWrite = this.socket.write(frame);
+      // 写入缓冲区满时记录警告（WebSocket 不像 HTTP 可暂停请求流，只能记录）
+      if (!canWrite) {
+        this._writeBacklogged = true;
+      }
     } catch (e) {
       this.connected = false;
     }
@@ -1003,22 +1232,57 @@ class WebSocket {
   /**
    * 发送关闭帧
    */
-  _sendCloseFrame() {
+  _sendCloseFrame(code, reason) {
     try {
-      this._sendFrame(0x08, Buffer.alloc(0));
+      let payload = Buffer.alloc(0);
+      // RFC 6455: Close 帧可携带状态码（2字节）+ 可选原因（UTF-8）
+      if (code !== undefined && code !== null) {
+        const reasonBuf = reason ? Buffer.from(reason, 'utf8') : Buffer.alloc(0);
+        payload = Buffer.alloc(2 + reasonBuf.length);
+        payload.writeUInt16BE(code, 0);
+        reasonBuf.copy(payload, 2);
+      }
+      this._sendFrame(0x08, payload);
     } catch (e) {
       // 忽略关闭帧发送错误
     }
   }
 
   /**
-   * 关闭连接
+   * 关闭连接（限时等待对端 Close 帧完成握手）
+   * @param {number} [code] 关闭状态码（RFC 6455 Section 7.4）
+   * @param {string} [reason] 关闭原因
    */
-  close() {
-    this._sendCloseFrame();
+  close(code, reason) {
+    if (this._closed) return;
+    // 重要：必须先发送 Close 帧再设 connected=false
+    // _sendFrame 内部检查 this.connected，若先断开则 Close 帧无法发出
+    this._sendCloseFrame(code, reason);
+    // 标记为关闭中，拒绝后续数据帧发送和 _sendFrame 写入
     this.connected = false;
-    try { this.socket.end(); } catch (e) { /* 忽略 */ }
-    this._emit('close');
+    this._closing = true;
+    // 限时等待对端 Close 帧（2秒超时）
+    this._closeTimer = setTimeout(() => {
+      this._closeTimer = null;
+      // 先标记已关闭，防止 socket.destroy 触发 close 事件时重复 _emitClose
+      this._closed = true;
+      try { this.socket.destroy(); } catch (e) { /* 忽略 */ }
+      this._emitClose(code, reason);
+    }, 2000);
+  }
+
+  /**
+   * 安全触发 close 事件（防止重复触发）
+   */
+  _emitClose(code, reason) {
+    if (this._closed) return;
+    this._closed = true;
+    // 清理关闭握手定时器
+    if (this._closeTimer) {
+      clearTimeout(this._closeTimer);
+      this._closeTimer = null;
+    }
+    this._emit('close', code, reason);
   }
 
   /**
@@ -1034,12 +1298,7 @@ class WebSocket {
    * 触发事件
    */
   _emit(event, ...args) {
-    const handlers = this._handlers[event];
-    if (handlers) {
-      handlers.forEach(h => {
-        try { h(...args); } catch (e) { /* 忽略 */ }
-      });
-    }
+    _emitEvent(this._handlers, event, args);
   }
 }
 
@@ -1062,6 +1321,8 @@ class WebSocketServer {
     this.groups = new Map();      // path -> Set<WebSocket>
     this._heartbeatInterval = options.heartbeatInterval || 30000;
     this._heartbeatTimeout = options.heartbeatTimeout || 30000;
+    this._maxPayload = options.maxPayload || 100 * 1024 * 1024;
+    this._allowedOrigins = options.allowedOrigins || null;
     this._timer = null;
     this._handlers = {};
   }
@@ -1079,9 +1340,17 @@ class WebSocketServer {
       return null;
     }
 
-    const accept = crypto.createHash('sha1')
-      .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
-      .digest('base64');
+    // Origin 校验（防止跨站 WebSocket 劫持 CSWSH）
+    if (this._allowedOrigins) {
+      const origin = req.headers['origin'];
+      if (!origin || !this._allowedOrigins.includes(origin)) {
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+        socket.destroy();
+        return null;
+      }
+    }
+
+    const accept = WebSocketHandShark(key);
 
     // 发送握手响应
     const responseHeaders = [
@@ -1093,7 +1362,7 @@ class WebSocketServer {
     socket.write(responseHeaders.join('\r\n') + '\r\n\r\n');
 
     // 创建 WebSocket 实例
-    const ws = new WebSocket(socket, pathname);
+    const ws = new WebSocket(socket, pathname, { maxPayload: this._maxPayload });
     this.connections.set(ws.id, ws);
 
     // 按路径分组
@@ -1141,18 +1410,23 @@ class WebSocketServer {
     if (this._timer) return;
     this._timer = setInterval(() => {
       const now = Date.now();
+      // 先收集需移除的连接，遍历结束后统一移除，避免迭代中修改 Map
+      const toRemove = [];
       for (const ws of this.connections.values()) {
         if (!ws.connected) {
-          this._removeConnection(ws);
+          toRemove.push(ws);
           continue;
         }
         // 检查心跳超时
         if (now - ws._lastHeartbeat > this._heartbeatInterval + this._heartbeatTimeout) {
           ws.close();
-          this._removeConnection(ws);
+          toRemove.push(ws);
           continue;
         }
         ws._sendPing();
+      }
+      for (const ws of toRemove) {
+        this._removeConnection(ws);
       }
     }, this._heartbeatInterval);
   }
@@ -1214,12 +1488,7 @@ class WebSocketServer {
    * 触发事件
    */
   _emit(event, ...args) {
-    const handlers = this._handlers[event];
-    if (handlers) {
-      handlers.forEach(h => {
-        try { h(...args); } catch (e) { /* 忽略 */ }
-      });
-    }
+    _emitEvent(this._handlers, event, args);
   }
 }
 
@@ -1257,6 +1526,10 @@ function bodyParser(options = {}) {
       const boundary = _extractBoundary(contentType);
       if (boundary) {
         _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next);
+        // 仅 multipart 需要临时文件清理
+        res._res.on('finish', () => {
+          _cleanupTempFiles(req._tempFiles);
+        });
       } else {
         next();
       }
@@ -1267,11 +1540,6 @@ function bodyParser(options = {}) {
         next();
       }).catch(next);
     }
-
-    // 监听响应完成，自动清理临时文件
-    res._res.on('finish', () => {
-      _cleanupTempFiles(req._tempFiles);
-    });
   };
 }
 
@@ -1281,7 +1549,7 @@ function bodyParser(options = {}) {
 function _parseJSON(req, maxSize, next) {
   req._readBody().then(buf => {
     if (buf.length > maxSize) {
-      const err = new Error(`Body exceeds maximum size of ${fmtSize(maxSize)}`);
+      const err = new Error(`Body exceeds maximum size of ${fmtSize(maxSize)}`, { cause: { actual: buf.length, maxSize } });
       err.status = 413;
       next(err);
       return;
@@ -1305,21 +1573,12 @@ function _parseJSON(req, maxSize, next) {
 function _parseUrlencoded(req, maxSize, next) {
   req._readBody().then(buf => {
     if (buf.length > maxSize) {
-      const err = new Error(`Body exceeds maximum size of ${fmtSize(maxSize)}`);
+      const err = new Error(`Body exceeds maximum size of ${fmtSize(maxSize)}`, { cause: { actual: buf.length, maxSize } });
       err.status = 413;
       next(err);
       return;
     }
-    const str = buf.toString('utf8');
-    const parsed = {};
-    str.split('&').forEach(pair => {
-      const eIdx = pair.indexOf('=');
-      if (eIdx === -1) {
-        parsed[decodeURIComponent(pair)] = '';
-      } else {
-        parsed[decodeURIComponent(pair.substring(0, eIdx))] = decodeURIComponent(pair.substring(eIdx + 1));
-      }
-    });
+    const parsed = _parseQueryString(buf.toString('utf8'), true);
     req.body = parsed;
     Object.assign(req.formData.fields, parsed);
     next();
@@ -1342,6 +1601,8 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
   const tempDir = req._app?.settings?.tempDir || 'tempupdir';
   const delimiter = Buffer.from('--' + boundary);
   const endDelimiter = Buffer.from('--' + boundary + '--');
+  // 回看长度：分隔符最大可能被截断的字节数
+  const lookBehind = delimiter.length - 1;
   let state = 'INIT'; // INIT, HEADERS, BODY_FIELD, BODY_FILE
   let partHeadersBuf = Buffer.alloc(0);
   let currentField = { name: '', value: '' };
@@ -1350,6 +1611,7 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
   let fileSize = 0;
   let buffer = Buffer.alloc(0);
   let cleanupOnError = false;
+  let paused = false;
 
   // 确保临时目录存在
   if (!fs.existsSync(tempDir)) {
@@ -1361,7 +1623,13 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
       if (state === 'INIT') {
         // 查找第一个分隔符
         const idx = buffer.indexOf(delimiter);
-        if (idx === -1) break;
+        if (idx === -1) {
+          // 保留尾部回看字节，防止分隔符跨 chunk 截断
+          if (buffer.length > lookBehind) {
+            buffer = buffer.slice(buffer.length - lookBehind);
+          }
+          break;
+        }
         buffer = buffer.slice(idx + delimiter.length);
         // 跳过 \r\n
         if (buffer.length >= 2 && buffer[0] === 0x0D && buffer[1] === 0x0A) {
@@ -1411,23 +1679,25 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
         const idx = buffer.indexOf(delimiter);
         if (idx === -1) {
           // 还没结束，缓存数据（但检查大小限制）
-          const chunk = buffer.toString('utf8');
+          // 保留尾部回看字节，防止分隔符跨 chunk 截断
+          const safeLen = Math.max(0, buffer.length - lookBehind);
+          const chunk = buffer.toString('utf8', 0, safeLen);
           fieldSize += chunk.length;
           if (fieldSize > maxFieldSize) {
-            const err = new Error(`Field exceeds maximum size of ${fmtSize(maxFieldSize)}`);
+            const err = new Error(`Field exceeds maximum size of ${fmtSize(maxFieldSize)}`, { cause: { actual: fieldSize, maxSize: maxFieldSize } });
             err.status = 413;
             next(err);
             return;
           }
           currentField.value += chunk;
-          buffer = Buffer.alloc(0);
+          buffer = buffer.slice(safeLen);
           break;
         }
         // 字段结束
         const chunk = buffer.toString('utf8', 0, idx);
         fieldSize += chunk.length;
         if (fieldSize > maxFieldSize) {
-          const err = new Error(`Field exceeds maximum size of ${fmtSize(maxFieldSize)}`);
+          const err = new Error(`Field exceeds maximum size of ${fmtSize(maxFieldSize)}`, { cause: { actual: fieldSize, maxSize: maxFieldSize } });
           err.status = 413;
           next(err);
           return;
@@ -1450,30 +1720,41 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
         const idx = buffer.indexOf(delimiter);
         if (idx === -1) {
           // 还没结束，写入临时文件
+          // 保留尾部回看字节，防止分隔符跨 chunk 截断
+          const safeLen = Math.max(0, buffer.length - lookBehind);
+          const writeData = buffer.slice(0, safeLen);
           if (!currentFile.stream) {
             currentFile.stream = fs.createWriteStream(currentFile.path);
+            // 背压处理：写入流满时暂停请求读取，drain 后恢复
+            currentFile.stream.on('drain', () => {
+              if (paused) {
+                paused = false;
+                req._req.resume();
+              }
+            });
           }
-          currentFile.stream.write(buffer);
-          fileSize += buffer.length;
+          const canWrite = currentFile.stream.write(writeData);
+          // 写入流缓冲区满时暂停请求读取，避免内存积压
+          if (!canWrite) {
+            paused = true;
+            req._req.pause();
+          }
+          fileSize += writeData.length;
           currentFile.size = fileSize;
           if (fileSize > maxFileSize) {
-            if (currentFile.stream) currentFile.stream.close();
-            const err = new Error(`File exceeds maximum size of ${fmtSize(maxFileSize)}`);
+            if (currentFile.stream) currentFile.stream.destroy();
+            const err = new Error(`File exceeds maximum size of ${fmtSize(maxFileSize)}`, { cause: { actual: fileSize, maxSize: maxFileSize, filename: currentFile.filename } });
             err.status = 413;
             next(err);
             return;
           }
-          // 进度展示（>1MB）
-          if (fileSize > 1024 * 1024) {
-            _showUploadProgress(currentFile.filename, fileSize, maxFileSize);
-          }
-          buffer = Buffer.alloc(0);
+          buffer = buffer.slice(safeLen);
           break;
         }
         // 文件结束
         const fileData = buffer.slice(0, idx);
         // 去掉文件数据前的 \r\n
-        const trimmedData = fileData.length >= 2 && fileData[fileData.length - 2] === 0x0D && fileData[fileData.length - 1] === 0x0A
+        const trimmedData = fileData.length >= 2 && fileData.at(-2) === 0x0D && fileData.at(-1) === 0x0A
           ? fileData.slice(0, -2)
           : fileData;
 
@@ -1481,6 +1762,7 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
           currentFile.stream = fs.createWriteStream(currentFile.path);
         }
         currentFile.stream.write(trimmedData);
+        // 结束写入并等待刷盘完成
         currentFile.stream.end();
         fileSize += trimmedData.length;
         currentFile.size = fileSize;
@@ -1498,6 +1780,7 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
         req.files.push(fileInfo);
         req._tempFiles.push(currentFile.path);
 
+        // 清理上传进度条目
         cleanupOnError = false;
         buffer = buffer.slice(idx + delimiter.length);
         // 跳过 \r\n
@@ -1526,24 +1809,11 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
   req._req.on('error', (err) => {
     // 客户端断开，清理临时文件
     if (cleanupOnError && currentFile.stream) {
-      currentFile.stream.close();
+      currentFile.stream.destroy();
     }
     _cleanupTempFiles(req._tempFiles);
     next(err);
   });
-}
-
-/**
- * 上传进度展示
- */
-let _lastProgressLine = '';
-function _showUploadProgress(filename, current, total) {
-  const pct = ((current / total) * 100).toFixed(1);
-  const line = `[${filename}] ${fmtSize(current)}/${fmtSize(total)} ${pct}%`;
-  if (line !== _lastProgressLine) {
-    process.stdout.write('\r' + line);
-    _lastProgressLine = line;
-  }
 }
 
 /**
@@ -1571,15 +1841,22 @@ function cookieParser(secret) {
       req.signedCookies = {};
       for (const [key, val] of Object.entries(req.cookies)) {
         if (val.startsWith('s:')) {
-          // 签名 Cookie 格式: s:value.signature
+          // 签名 Cookie 格式: s:encodedValue.signature
           const unsigned = val.slice(2);
           const dotIdx = unsigned.lastIndexOf('.');
           if (dotIdx !== -1) {
-            const value = unsigned.slice(0, dotIdx);
+            const encodedValue = unsigned.slice(0, dotIdx);
             const sig = unsigned.slice(dotIdx + 1);
-            const expected = crypto.createHmac('sha256', secret).update(value).digest('base64').replace(/=+$/, '');
+            // 签名是对原始值计算的，需先解码
+            let rawValue;
+            try {
+              rawValue = decodeURIComponent(encodedValue);
+            } catch (e) {
+              continue;
+            }
+            const expected = crypto.createHmac('sha256', secret).update(rawValue).digest('base64').replace(/=+$/, '');
             if (sig === expected) {
-              req.signedCookies[key] = value;
+              req.signedCookies[key] = rawValue;
             }
           }
         }
@@ -1651,7 +1928,7 @@ class Application extends Router {
     if (this.settings.http2) {
       // HTTP2 模式
       if (!this.settings.https || !this.settings.https.key || !this.settings.https.cert) {
-        throw new Error('HTTP2 requires HTTPS configuration (key and cert)');
+        throw new Error('HTTP2 requires HTTPS configuration (key and cert)', { cause: { https: !!this.settings.https, hasKey: !!(this.settings.https && this.settings.https.key), hasCert: !!(this.settings.https && this.settings.https.cert) } });
       }
       const opts = {
         key: fs.readFileSync(this.settings.https.key),
@@ -1685,7 +1962,9 @@ class Application extends Router {
     // 初始化 WebSocket 服务
     this._wss = new WebSocketServer({
       heartbeatInterval: this.settings.wsHeartbeatInterval,
-      heartbeatTimeout: this.settings.wsHeartbeatTimeout
+      heartbeatTimeout: this.settings.wsHeartbeatTimeout,
+      maxPayload: this.settings.wsMaxPayload,
+      allowedOrigins: this.settings.wsAllowedOrigins
     });
 
     // 监听 WebSocket 升级请求
@@ -1734,11 +2013,20 @@ class Application extends Router {
 
     // 基础解析
     const parsed = parseUrl(incomingMessage.url);
-    req.path = decodeURIComponent(parsed.pathname);
+    try {
+      req.path = decodeURIComponent(parsed.pathname);
+    } catch (e) {
+      // 非法 URI 编码，返回 400
+      res.status(400).send('Bad Request: Invalid URI encoding');
+      return;
+    }
     req.query = parsed.query;
+    // Cookie 由 cookieParser 中间件统一解析，此处不再重复处理
 
-    // 解析 Cookie（中间件会再次处理，此处先做基础解析）
-    req.cookies = parseCookies(incomingMessage.headers['cookie'] || '');
+    // HEAD 请求标记：执行路由处理器但丢弃响应体
+    if (req.method === 'HEAD') {
+      res._isHead = true;
+    }
 
     // 构建中间件 + 路由处理器执行链
     this._dispatch(req, res);
@@ -1786,10 +2074,17 @@ class Application extends Router {
 
       const item = stack[idx++];
       const handler = item.handler;
+      // 防止同一 handler 多次调用 next()
+      let handlerCalledNext = false;
+      const safeNext = (e) => {
+        if (handlerCalledNext && !e) return;
+        handlerCalledNext = true;
+        next(e);
+      };
 
       try {
         // 路由处理器返回 false → 进入静态文件兜底
-        const result = handler(req, res, next);
+        const result = handler(req, res, safeNext);
         if (result === false) {
           this._serveStatic(req, res);
           return;
@@ -1874,7 +2169,7 @@ class Application extends Router {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', cors.headers || 'Content-Type, Authorization');
-    res.setHeader('Access-Control-Max-Age', cors.maxAge || '86400');
+    res.setHeader('Access-Control-Max-Age', parseInt(cors.maxAge, 10) || 86400);
     if (cors.credentials) {
       res.setHeader('Access-Control-Allow-Credentials', 'true');
     }
@@ -1890,7 +2185,7 @@ class Application extends Router {
     let requestPath = req.path.replace(/^\/+/, '');
 
     // 路径安全校验
-    if (!isPathSafe(requestPath, rootPath)) {
+    if (!isPathSafe(requestPath, rootPath, this.settings.allowAccessToAllFiles)) {
       res.status(403).send('Forbidden');
       return;
     }
@@ -1928,18 +2223,23 @@ class Application extends Router {
    * 目录列表展示
    */
   _serveDirectory(req, res, dirPath, requestPath) {
-    fs.readdir(dirPath, (err, files) => {
+    // 使用 withFileTypes 避免对每个文件做 statSync 调用
+    fs.readdir(dirPath, { withFileTypes: true }, (err, entries) => {
       if (err) {
         res.status(500).send('Internal Server Error');
         return;
       }
 
-      const items = files.map(f => {
+      const items = entries.map(entry => {
         try {
-          const stat = fs.statSync(path.join(dirPath, f));
+          // 目录只需名称和类型，文件需要额外 stat 获取大小和修改时间
+          if (entry.isDirectory()) {
+            return { name: entry.name, isDirectory: true, size: 0, modified: '' };
+          }
+          const stat = fs.statSync(path.join(dirPath, entry.name));
           return {
-            name: f,
-            isDirectory: stat.isDirectory(),
+            name: entry.name,
+            isDirectory: false,
             size: stat.size,
             modified: stat.mtime.toISOString()
           };
@@ -1966,14 +2266,15 @@ class Application extends Router {
    * 渲染目录列表 HTML
    */
   _renderDirectoryHTML(requestPath, items) {
-    const parentPath = path.dirname(requestPath);
-    let html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Directory: ${requestPath}</title>`;
+    // requestPath 已去掉前导 /，空字符串表示根目录
+    const parentPath = requestPath ? path.dirname(requestPath) : '/';
+    let html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Directory: ${escapeHtml(requestPath)}</title>`;
     html += `<style>body{font-family:-apple-system,sans-serif;margin:20px;background:#f5f5f5}h1{font-size:18px;color:#333}table{width:100%;border-collapse:collapse;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.1)}th{text-align:left;padding:10px 12px;background:#f8f8f8;border-bottom:2px solid #ddd;font-size:13px;color:#666}td{padding:8px 12px;border-bottom:1px solid #eee;font-size:13px}a{color:#0066cc;text-decoration:none}a:hover{text-decoration:underline}.dir{font-weight:bold}.size{color:#999}</style>`;
-    html += `</head><body><h1>Directory: ${requestPath}</h1><table><tr><th>Name</th><th>Size</th><th>Modified</th></tr>`;
+    html += `</head><body><h1>Directory: ${escapeHtml(requestPath)}</h1><table><tr><th>Name</th><th>Size</th><th>Modified</th></tr>`;
 
-    // 父目录链接
-    if (requestPath !== '/') {
-      html += `<tr><td><a href="${parentPath}" class="dir">../</a></td><td class="size">-</td><td>-</td></tr>`;
+    // 父目录链接（根目录时不显示）
+    if (requestPath && requestPath !== '/') {
+      html += `<tr><td><a href="${escapeHtml(parentPath)}" class="dir">../</a></td><td class="size">-</td><td>-</td></tr>`;
     }
 
     for (const item of items) {
@@ -1981,7 +2282,7 @@ class Application extends Router {
       const name = item.isDirectory ? item.name + '/' : item.name;
       const size = item.isDirectory ? '-' : fmtSize(item.size);
       const cls = item.isDirectory ? 'dir' : '';
-      html += `<tr><td><a href="${href}" class="${cls}">${name}</a></td><td class="size">${size}</td><td class="size">${item.modified}</td></tr>`;
+      html += `<tr><td><a href="${escapeHtml(href)}" class="${cls}">${escapeHtml(name)}</a></td><td class="size">${size}</td><td class="size">${item.modified}</td></tr>`;
     }
 
     html += `</table></body></html>`;
@@ -1995,11 +2296,35 @@ class Application extends Router {
     const ws = this._wss.handleUpgrade(req, socket, head);
     if (!ws) return;
 
-    // 匹配 app.ws() 注册的处理器
+    // 匹配 app.ws() 注册的处理器（支持动态参数路径）
     if (this._wsHandlers) {
       const pathname = parseUrl(req.url).pathname;
       for (const entry of this._wsHandlers) {
-        if (pathname === entry.path || pathname.startsWith(entry.path + '/')) {
+        let matched = false;
+        let params = {};
+        if (entry.pattern) {
+          // 动态路径：正则匹配
+          const m = entry.pattern.exec(pathname);
+          if (m) {
+            matched = true;
+            entry.params.forEach((name, i) => {
+              try {
+                params[name] = decodeURIComponent(m[i + 1]);
+              } catch (e) {
+                // 非法 URI 编码，保留原始值
+                params[name] = m[i + 1];
+              }
+            });
+          }
+        } else {
+          // 静态路径：精确或前缀匹配
+          matched = pathname === entry.path || pathname.startsWith(entry.path + '/');
+        }
+        if (matched) {
+          // 将动态参数挂载到 req 上
+          if (Object.keys(params).length > 0) {
+            req.params = params;
+          }
           const cleanup = entry.handler(ws, req);
           if (typeof cleanup === 'function') {
             ws.on('close', cleanup);
@@ -2026,9 +2351,9 @@ class Application extends Router {
       const sseInstance = res.sse();
       const cleanup = handler(sseInstance, req);
       // 连接关闭时执行清理
-      res._res.on('close', () => {
-        if (typeof cleanup === 'function') cleanup();
-      });
+      if (typeof cleanup === 'function') {
+        res._res.on('close', cleanup);
+      }
     });
   }
 
@@ -2038,7 +2363,9 @@ class Application extends Router {
    */
   ws(pathStr, handler) {
     if (!this._wsHandlers) this._wsHandlers = [];
-    this._wsHandlers.push({ path: pathStr, handler });
+    // 支持动态参数路径，复用 Router 的路径编译逻辑
+    const { pattern, params } = this._compilePath(pathStr);
+    this._wsHandlers.push({ path: pathStr, pattern, params, handler });
   }
 }
 
@@ -2077,10 +2404,12 @@ const defaultConfig = {
   tempDir: 'tempupdir',
   maxFileSize: 128 * 1024 * 1024,
   maxFieldSize: 1024 * 1024,
+  maxBodySize: 128 * 1024 * 1024,
   svrPort: 80,
   svrIP: null,
 
   showDir: false,
+  allowAccessToAllFiles: false,
   enableCache: false,
   enableGzip: false,
   enableRange: true,
@@ -2095,7 +2424,7 @@ const defaultConfig = {
   logLevel: 'info',
   logDir: './log',
 
-  cors: { origin: '*', headers: 'Content-Type, Authorization', maxAge: '86400' },
+  cors: { origin: '*', headers: 'Content-Type, Authorization', maxAge: 86400 },
 
   useBodyParser: true,
   useCookieParser: true,
@@ -2103,7 +2432,9 @@ const defaultConfig = {
   cookieParserSecret: null,
 
   wsHeartbeatInterval: 30000,
-  wsHeartbeatTimeout: 30000
+  wsHeartbeatTimeout: 30000,
+  wsMaxPayload: 100 * 1024 * 1024,
+  wsAllowedOrigins: null
 };
 
 // ============================================================
@@ -2135,19 +2466,29 @@ httpm.cookieParser = cookieParser;
  * static 中间件：Express 兼容的静态文件服务
  * 用法: app.use(httpm.static('public'))
  */
-function staticMiddleware(rootPath) {
+function staticMiddleware(rootPath, options = {}) {
   return function staticHandler(req, res, next) {
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       return next();
     }
     const root = path.resolve(rootPath || process.cwd());
+    const allowAll = options.allowAccessToAllFiles || false;
     let requestPath = req.path.replace(/^\/+/, '');
-    if (!isPathSafe(requestPath, root)) {
+    if (!isPathSafe(requestPath, root, allowAll)) {
       return next();
     }
     const fullPath = path.join(root, requestPath);
     fs.stat(fullPath, (err, stat) => {
-      if (err || !stat.isFile()) {
+      if (err) {
+        return next();
+      }
+      if (stat.isDirectory()) {
+        // 目录：尝试 index.html
+        const indexPath = path.join(fullPath, 'index.html');
+        if (fs.existsSync(indexPath)) {
+          res.sendFile(path.relative(root, indexPath), { root });
+          return;
+        }
         return next();
       }
       res.sendFile(requestPath, { root });
@@ -2168,20 +2509,10 @@ httpm.parseRange = parseRange;
 httpm.WebSocketHandShark = WebSocketHandShark;
 
 /**
- * parseQuery：独立导出的 Query 解析函数
+ * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）
  */
 function parseQuery(qs) {
-  const query = {};
-  if (!qs) return query;
-  qs.split('&').forEach(pair => {
-    const eIdx = pair.indexOf('=');
-    if (eIdx === -1) {
-      query[decodeURIComponent(pair)] = '';
-    } else {
-      query[decodeURIComponent(pair.substring(0, eIdx))] = decodeURIComponent(pair.substring(eIdx + 1));
-    }
-  });
-  return query;
+  return _parseQueryString(qs);
 }
 httpm.parseQuery = parseQuery;
 

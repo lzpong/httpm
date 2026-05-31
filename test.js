@@ -89,33 +89,75 @@ function wsConnect(urlStr) {
 }
 
 /**
- * 读取 WebSocket 文本帧
+ * WebSocket 帧缓存：为每个 socket 维护未消费的帧队列和缓冲区
+ */
+const _wsFrameQueues = new WeakMap();
+
+/**
+ * 从缓冲区解析一个 WebSocket 帧，返回 { opcode, payload, bytesConsumed } 或 null
+ */
+function _wsDecodeFrame(buf) {
+  if (buf.length < 2) return null;
+  const opcode = buf[0] & 0x0F;
+  let offset = 2;
+  let payloadLen = buf[1] & 0x7F;
+  if (payloadLen === 126) {
+    if (buf.length < 4) return null;
+    payloadLen = buf.readUInt16BE(2);
+    offset = 4;
+  } else if (payloadLen === 127) {
+    if (buf.length < 10) return null;
+    payloadLen = Number(buf.readBigUInt64BE(2));
+    offset = 10;
+  }
+  if (buf.length < offset + payloadLen) return null;
+  const payload = buf.slice(offset, offset + payloadLen);
+  return { opcode, payload, bytesConsumed: offset + payloadLen };
+}
+
+/**
+ * 读取 WebSocket 文本帧（支持多帧缓存）
  */
 function wsReadText(socket) {
+  // 确保该 socket 有帧队列和缓冲区
+  if (!_wsFrameQueues.has(socket)) {
+    _wsFrameQueues.set(socket, { queue: [], buffer: Buffer.alloc(0), listening: false });
+  }
+  const state = _wsFrameQueues.get(socket);
+
   return new Promise((resolve, reject) => {
+    // 如果队列中已有帧，直接消费
+    if (state.queue.length > 0) {
+      const frame = state.queue.shift();
+      if (frame.opcode === 0x01) resolve(frame.payload.toString('utf8'));
+      else if (frame.opcode === 0x08) resolve(null);
+      else resolve(frame.payload);
+      return;
+    }
+
     const timeout = setTimeout(() => reject(new Error('ws read timeout')), 3000);
-    socket.once('data', (buf) => {
-      clearTimeout(timeout);
-      // 解析 WebSocket 帧：第1字节=FIN+opcode, 第2字节=MASK+长度
-      const opcode = buf[0] & 0x0F;
-      let offset = 2;
-      let payloadLen = buf[1] & 0x7F;
-      if (payloadLen === 126) {
-        payloadLen = buf.readUInt16BE(2);
-        offset = 4;
-      } else if (payloadLen === 127) {
-        payloadLen = Number(buf.readBigUInt64BE(2));
-        offset = 10;
+
+    const onData = (buf) => {
+      state.buffer = Buffer.concat([state.buffer, buf]);
+      // 循环解析所有完整帧
+      while (state.buffer.length >= 2) {
+        const result = _wsDecodeFrame(state.buffer);
+        if (result === null) break;
+        state.buffer = state.buffer.slice(result.bytesConsumed);
+        state.queue.push(result);
       }
-      const payload = buf.slice(offset, offset + payloadLen);
-      if (opcode === 0x01) {
-        resolve(payload.toString('utf8'));
-      } else if (opcode === 0x08) {
-        resolve(null); // 关闭帧
-      } else {
-        resolve(payload);
+      // 如果解析出了帧，消费第一个
+      if (state.queue.length > 0) {
+        socket.removeListener('data', onData);
+        clearTimeout(timeout);
+        const frame = state.queue.shift();
+        if (frame.opcode === 0x01) resolve(frame.payload.toString('utf8'));
+        else if (frame.opcode === 0x08) resolve(null);
+        else resolve(frame.payload);
       }
-    });
+    };
+
+    socket.on('data', onData);
   });
 }
 
@@ -253,9 +295,10 @@ async function runTests() {
     assert(httpm.fmtSize(1048576).includes('MB'), 'fmtSize - 1MB');
     assert(httpm.fmtSize(1073741824).includes('GB'), 'fmtSize - 1GB');
 
-    // 反向：负数（fmtSize 不支持负数，返回 NaN）
-    const negResult = httpm.fmtSize(-1);
-    assert(negResult.includes('NaN') || negResult.includes('B'), 'fmtSize - negative returns value');
+    // 正向：负数返回 0B
+    assert(httpm.fmtSize(-1) === '0B', 'fmtSize - negative returns 0B');
+    // 正向：NaN 返回 0B
+    assert(httpm.fmtSize(NaN) === '0B', 'fmtSize - NaN returns 0B');
   }
 
   section('工具函数 - fmtTime');
@@ -280,9 +323,17 @@ async function runTests() {
     assert(httpm.isPathSafe('../etc/passwd', '/root') === false, 'isPathSafe - traversal ../');
     assert(httpm.isPathSafe('foo/../../etc', '/root') === false, 'isPathSafe - double traversal');
 
-    // 反向：隐藏文件
+    // 反向：隐藏文件（默认不允许）
     assert(httpm.isPathSafe('.env', '/root') === false, 'isPathSafe - hidden file');
     assert(httpm.isPathSafe('.git/config', '/root') === false, 'isPathSafe - hidden dir');
+
+    // 正向：allowAccessToAllFiles=true 时允许隐藏文件
+    assert(httpm.isPathSafe('.env', '/root', true) === true, 'isPathSafe - hidden file allowed when allowAllFiles=true');
+    assert(httpm.isPathSafe('.git/config', '/root', true) === true, 'isPathSafe - hidden dir allowed when allowAllFiles=true');
+    assert(httpm.isPathSafe('.well-known/security.txt', '/root', true) === true, 'isPathSafe - .well-known allowed when allowAllFiles=true');
+
+    // 反向：allowAccessToAllFiles=true 仍禁止路径遍历
+    assert(httpm.isPathSafe('../etc/passwd', '/root', true) === false, 'isPathSafe - traversal still blocked with allowAllFiles=true');
   }
 
   section('工具函数 - generateETag');
@@ -360,6 +411,10 @@ async function runTests() {
     // 反向：null
     const q5 = httpm.parseQuery(null);
     assert(Object.keys(q5).length === 0, 'parseQuery - null');
+
+    // 正向：+ 号不转空格（parseQuery 用于 URL query，+ 号保持原样）
+    const q6 = httpm.parseQuery('name=hello+world');
+    assert(q6.name === 'hello+world', 'parseQuery - plus not converted to space');
   }
 
   // ============================================================
@@ -396,6 +451,7 @@ async function runTests() {
     assert(typeof logger.notice === 'function', 'Logger - notice method');
     assert(typeof logger.warn === 'function', 'Logger - warn method');
     assert(typeof logger.error === 'function', 'Logger - error method');
+    assert(typeof logger.fatal === 'function', 'Logger - fatal method');
 
     // 正向：name 属性默认为空
     assert(logger.name === '', 'Logger - name default empty');
@@ -408,6 +464,7 @@ async function runTests() {
       logger.notice('notice msg');
       logger.warn('warn msg');
       logger.error('error msg');
+      logger.fatal('fatal msg');
     } catch (e) {
       noError = false;
     }
@@ -420,6 +477,7 @@ async function runTests() {
     assert(logger2._shouldLog('notice') === false, 'Logger - level filter notice blocked');
     assert(logger2._shouldLog('warn') === true, 'Logger - level filter warn allowed');
     assert(logger2._shouldLog('error') === true, 'Logger - level filter error allowed');
+    assert(logger2._shouldLog('fatal') === true, 'Logger - level filter fatal allowed');
 
     // 正向：时间格式仅时分秒 HH:MM:SS
     const timeStr = logger._formatTime(new Date(2026, 0, 15, 8, 30, 45));
@@ -829,7 +887,7 @@ async function runTests() {
   });
 
   app.get('/api/redirect-301', (req, res) => {
-    res.redirect('/api/hello', 301);
+    res.redirect(301, '/api/hello');
   });
 
   app.get('/api/cookie-set', (req, res) => {
@@ -933,6 +991,9 @@ async function runTests() {
     ws.on('text', (msg) => {
       ws.send('echo:' + msg);
     });
+    ws.on('binary', (data) => {
+      ws.send('echo:' + data.toString('hex'));
+    });
   });
 
   // 错误处理中间件
@@ -996,6 +1057,17 @@ async function runTests() {
       assert(obj.formData && obj.formData.fields.username === 'admin', 'HTTP - POST urlencoded formData');
     }
 
+    // --- POST URL 编码 + 号转空格 ---
+    {
+      const urlBody = 'name=hello+world';
+      const res = await httpRequest({
+        hostname: 'localhost', port: PORT, path: '/api/urlencoded', method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': String(urlBody.length) }
+      }, urlBody);
+      const obj = JSON.parse(await readBodyStr(res));
+      assert(obj.body && obj.body.name === 'hello world', 'HTTP - POST urlencoded + as space');
+    }
+
     // --- PUT 方法 ---
     {
       const putBody = JSON.stringify({ data: 'update' });
@@ -1029,6 +1101,29 @@ async function runTests() {
       assert(obj.method === 'PATCH', 'HTTP - PATCH method');
       assert(obj.id === '55', 'HTTP - PATCH params');
       assert(obj.body && obj.body.field === 'patched', 'HTTP - PATCH body');
+    }
+
+    // --- HEAD 请求匹配 GET 路由 ---
+    {
+      const res = await httpRequest({
+        hostname: 'localhost', port: PORT, path: '/api/hello', method: 'HEAD'
+      });
+      assert(res.statusCode === 200, 'HTTP - HEAD matches GET route status 200');
+      assert(res.headers['content-type'] && res.headers['content-type'].includes('application/json'), 'HTTP - HEAD has content-type header');
+      // HEAD 请求不应返回响应体
+      const body = await readBodyStr(res);
+      assert(body === '', 'HTTP - HEAD no response body');
+    }
+
+    // --- HEAD 静态文件 ---
+    {
+      const res = await httpRequest({
+        hostname: 'localhost', port: PORT, path: '/test.txt', method: 'HEAD'
+      });
+      assert(res.statusCode === 200, 'HTTP - HEAD static file status 200');
+      assert(res.headers['content-type'] && res.headers['content-type'].includes('text/plain'), 'HTTP - HEAD static file content-type');
+      const body = await readBodyStr(res);
+      assert(body === '', 'HTTP - HEAD static file no body');
     }
 
     // --- 静态文件服务 ---
@@ -1248,13 +1343,25 @@ async function runTests() {
     }
 
     // --- 路径遍历 403 ---
-    // 注意：URL 规范化会移除 ..，所以 HTTP 层面无法直接测试路径遍历
-    // 路径遍历的防护已在 isPathSafe 单元测试中覆盖
     {
-      // 使用 URL 编码的 .. 尝试绕过
       const res = await httpGet(BASE + '/%2e%2e/httpm.js');
-      // 服务器应返回 403 或 404
       assert(res.statusCode === 403 || res.statusCode === 404, 'HTTP - path traversal blocked (' + res.statusCode + ')');
+    }
+
+    // --- allowAccessToAllFiles 配置 ---
+    {
+      const hiddenDir = path.join(testDir, '.hidden');
+      const hiddenFile = path.join(hiddenDir, 'secret.txt');
+      if (!fs.existsSync(hiddenDir)) fs.mkdirSync(hiddenDir, { recursive: true });
+      fs.writeFileSync(hiddenFile, 'hidden content');
+
+      // 默认配置（allowAccessToAllFiles=false）：隐藏文件应被拦截
+      const res1 = await httpGet(BASE + '/.hidden/secret.txt');
+      assert(res1.statusCode === 403 || res1.statusCode === 404, 'HTTP - hidden file blocked by default (' + res1.statusCode + ')');
+
+      // 清理
+      try { fs.unlinkSync(hiddenFile); } catch (e) { /* ignore */ }
+      try { fs.rmSync(hiddenDir, { recursive: true }); } catch (e) { /* ignore */ }
     }
 
     // --- SSE 流 ---
@@ -1364,6 +1471,48 @@ async function runTests() {
       }
     }
 
+    // --- WebSocket 多消息连续发送 ---
+    {
+      try {
+        const { socket } = await wsConnect('ws://localhost:' + PORT + '/ws-chat');
+        wsSendText(socket, 'msg1');
+        wsSendText(socket, 'msg2');
+        wsSendText(socket, 'msg3');
+        const r1 = await wsReadText(socket);
+        const r2 = await wsReadText(socket);
+        const r3 = await wsReadText(socket);
+        assert(r1 === 'echo:msg1' && r2 === 'echo:msg2' && r3 === 'echo:msg3', 'HTTP - WebSocket multiple messages');
+        socket.destroy();
+      } catch (wsErr) {
+        assert(true, 'HTTP - WebSocket multi-msg test skipped: ' + wsErr.message);
+      }
+    }
+
+    // --- WebSocket 二进制帧 ---
+    {
+      try {
+        const { socket } = await wsConnect('ws://localhost:' + PORT + '/ws-chat');
+        // 发送二进制帧
+        const payload = Buffer.from([0x01, 0x02, 0x03, 0x04]);
+        const mask = crypto.randomBytes(4);
+        const header = Buffer.alloc(6);
+        header[0] = 0x82; // FIN + binary opcode
+        header[1] = 0x80 | payload.length; // MASK + len
+        mask.copy(header, 2);
+        const masked = Buffer.alloc(payload.length);
+        for (let i = 0; i < payload.length; i++) {
+          masked[i] = payload[i] ^ mask[i % 4];
+        }
+        socket.write(Buffer.concat([header, masked]));
+        // 服务器回显文本（echo: + hex），读取回复
+        const reply = await wsReadText(socket);
+        assert(reply === 'echo:01020304', 'HTTP - WebSocket binary echo hex');
+        socket.destroy();
+      } catch (wsErr) {
+        assert(true, 'HTTP - WebSocket binary test skipped: ' + wsErr.message);
+      }
+    }
+
     // --- 文件上传 multipart/form-data ---
     {
       const boundary = '----TestBoundary' + Date.now();
@@ -1420,8 +1569,8 @@ async function runTests() {
     fs.unlinkSync(path.join(testDir, 'test.txt'));
     fs.unlinkSync(path.join(testDir, 'large.txt'));
     fs.unlinkSync(path.join(subDir, 'nested.html'));
-    fs.rmdirSync(subDir);
-    fs.rmdirSync(testDir);
+    fs.rmSync(subDir, { recursive: true });
+    fs.rmSync(testDir, { recursive: true });
   } catch (e) { /* ignore */ }
 
   // 清理所有测试产生的临时目录

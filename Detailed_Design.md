@@ -637,7 +637,7 @@ app.sse('/events', (sse, req) => {
   "version": "1.0.1",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
-  "engines": { "node": ">=14.0.0" },
+  "engines": { "node": ">=10.0.0" },
   "license": "MIT"
 }
 ```

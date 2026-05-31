@@ -160,7 +160,7 @@ req.cookies.token; // 'abc123'（签名验证通过）
 const app = httpm({ rootPath: './public', showDir: true, enableGzip: true, enableCache: true });
 ```
 
-或使用内置中间件：
+或使用内置中间件（支持目录自动查找 index.html）：
 
 ```javascript
 app.use(httpm.static('./public'));
@@ -229,11 +229,20 @@ wss.getConnections();                              // 获取所有连接
 
 | 事件 | 说明 |
 |------|------|
-| `message` | 接收消息（文本或二进制） |
+| `data` | 接收消息（`{ type: 'text'/'binary', data }`） |
 | `text` | 接收文本消息 |
 | `binary` | 接收二进制消息 |
 | `close` | 连接关闭 |
 | `error` | 连接错误 |
+
+### data 事件使用
+
+```javascript
+ws.on('data', (msg) => {
+  console.log(msg.type);   // 'text' 或 'binary'
+  console.log(msg.data);   // 消息内容
+});
+```
 
 ## SSE (Server-Sent Events)
 
