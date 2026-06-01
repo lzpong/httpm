@@ -130,6 +130,9 @@ class Application extends Router {
 | app.METHOD(path, handler) | 请求方法、路径、处理器 | 注册路由（继承 Router 能力） |
 | app.listen(port, callback) | 端口、启动回调 | 启动网络服务，监听端口 |
 | app.close(callback) | 关闭回调 | 停止服务，释放端口资源 |
+| app.ws(path, handler) | 路径、处理器 | 注册 WebSocket 路由，handler 签名 `(ws, req) => cleanupFn\|void` |
+| app.sse(path, handler) | 路径、处理器 | 注册 SSE 路由，handler 签名 `(sse, req) => cleanupFn\|void` |
+| app.wss | — | WebSocketServer 实例（只读属性） |
 
 #### 特殊规则
 
@@ -263,12 +266,13 @@ class Request {
 | --- | --- |
 | statusCode | 默认响应状态码，初始值 200 |
 | _isHead | 是否为 HEAD 请求（仅发送头部，不发送响应体） |
-| set(name, value) | 设置响应头（Express 兼容），支持单键和对象批量设置 |
-| get(name) | 获取已设置的响应头（Express 兼容），不区分大小写 |
+| set(name, value) | 设置响应头（Express 兼容），支持单键和对象批量设置；底层方法 setHeader 功能相同 |
+| get(name) | 获取已设置的响应头（Express 兼容），不区分大小写；底层方法 getHeader 功能相同 |
 | type(contentType) | 设置 Content-Type（Express 兼容），支持简写（html→text/html） |
 | on(event, listener) | 代理原生 ServerResponse 事件监听（Express 兼容） |
-| setHeader(name, value) | 设置响应头 |
-| getHeader(name) | 获取已设置的响应头 |
+| setHeader(name, value) | 设置响应头（底层方法，同 set） |
+| getHeader(name) | 获取已设置的响应头（底层方法，同 get） |
+| removeHeader(name) | 移除已设置的响应头 |
 | status(code) | 设置 HTTP 状态码，支持链式调用 |
 | json(data) | 输出 JSON 格式响应，自动补充对应 Content-Type |
 | send(data) | 通用输出，支持字符串、HTML、Buffer、对象；`null` 序列化为 `"null"`（Express 兼容），`undefined` 返回空响应 |

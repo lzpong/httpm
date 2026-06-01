@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.2.1
+ * @version     1.2.2
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -1045,8 +1045,6 @@ class WebSocket {
     this._handlers = {};
     // 最大帧负载大小（默认 100MB，防止恶意超大帧耗尽内存）
     this._maxPayload = options.maxPayload || 100 * 1024 * 1024;
-    // 写入背压标记
-    this._writeBacklogged = false;
     // 帧解析状态：缓存不完整帧数据
     this._frameBuffer = Buffer.alloc(0);
     // 分片帧状态
@@ -1090,7 +1088,7 @@ class WebSocket {
     while (this._frameBuffer.length >= 2) {
       const result = this._decodeFrame(this._frameBuffer);
       if (result === null) break; // 数据不完整，等待更多数据
-      this._frameBuffer = this._frameBuffer.slice(result.bytesConsumed);
+      this._frameBuffer = this._frameBuffer.subarray(result.bytesConsumed);
       this._processFrame(result.opcode, result.payload, result.fin, result.oversize);
     }
   }
@@ -1129,7 +1127,7 @@ class WebSocket {
     let mask = null;
     if (isMasked) {
       if (buf.length < offset + 4) return null;
-      mask = buf.slice(offset, offset + 4);
+      mask = buf.subarray(offset, offset + 4);
       offset += 4;
     }
 
@@ -1142,7 +1140,7 @@ class WebSocket {
     }
 
     // 提取负载
-    let payload = buf.slice(offset, offset + payloadLength);
+    let payload = buf.subarray(offset, offset + payloadLength);
     if (isMasked && mask) {
       for (let i = 0; i < payload.length; i++) {
         payload[i] ^= mask[i % 4];
@@ -1174,7 +1172,7 @@ class WebSocket {
         code = payload.readUInt16BE(0);
         // RFC 6455 Section 7.4: 状态码 0-999 为非法，1005 表示无状态码
         if (code < 1000) code = 1005;
-        reason = payload.length > 2 ? payload.slice(2).toString('utf8') : '';
+        reason = payload.length > 2 ? payload.subarray(2).toString('utf8') : '';
       }
       // 如果正在关闭握手中，对端已回复 Close 帧，完成握手
       if (this._closing) {
@@ -1282,11 +1280,7 @@ class WebSocket {
     frames.push(payload);
     const frame = Buffer.concat(frames);
     try {
-      const canWrite = this.socket.write(frame);
-      // 写入缓冲区满时记录警告（WebSocket 不像 HTTP 可暂停请求流，只能记录）
-      if (!canWrite) {
-        this._writeBacklogged = true;
-      }
+      this.socket.write(frame);
     } catch (e) {
       this.connected = false;
       // 发送失败时触发 error 事件，便于用户感知和处理
@@ -1705,14 +1699,14 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
         if (idx === -1) {
           // 保留尾部回看字节，防止分隔符跨 chunk 截断
           if (buffer.length > lookBehind) {
-            buffer = buffer.slice(buffer.length - lookBehind);
+            buffer = buffer.subarray(buffer.length - lookBehind);
           }
           break;
         }
-        buffer = buffer.slice(idx + delimiter.length);
+        buffer = buffer.subarray(idx + delimiter.length);
         // 跳过 \r\n
         if (buffer.length >= 2 && buffer[0] === 0x0D && buffer[1] === 0x0A) {
-          buffer = buffer.slice(2);
+          buffer = buffer.subarray(2);
         }
         state = 'HEADERS';
         partHeadersBuf = Buffer.alloc(0);
@@ -1725,8 +1719,8 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
           buffer = Buffer.alloc(0);
           break;
         }
-        partHeadersBuf = Buffer.concat([partHeadersBuf, buffer.slice(0, headerEnd)]);
-        buffer = buffer.slice(headerEnd + 4);
+        partHeadersBuf = Buffer.concat([partHeadersBuf, buffer.subarray(0, headerEnd)]);
+        buffer = buffer.subarray(headerEnd + 4);
         const partHeaders = partHeadersBuf.toString('utf8');
 
         // 解析 Content-Disposition
@@ -1761,7 +1755,7 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
           // 保留尾部回看字节，防止分隔符跨 chunk 截断
           const safeLen = Math.max(0, buffer.length - lookBehind);
           const chunk = buffer.toString('utf8', 0, safeLen);
-          fieldSize += chunk.length;
+          fieldSize += safeLen;
           if (fieldSize > maxFieldSize) {
             const err = new Error(`Field exceeds maximum size of ${fmtSize(maxFieldSize)}`, { cause: { actual: fieldSize, maxSize: maxFieldSize } });
             err.status = 413;
@@ -1769,12 +1763,12 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
             return;
           }
           currentField.value += chunk;
-          buffer = buffer.slice(safeLen);
+          buffer = buffer.subarray(safeLen);
           break;
         }
         // 字段结束
         const chunk = buffer.toString('utf8', 0, idx);
-        fieldSize += chunk.length;
+        fieldSize += idx;
         if (fieldSize > maxFieldSize) {
           const err = new Error(`Field exceeds maximum size of ${fmtSize(maxFieldSize)}`, { cause: { actual: fieldSize, maxSize: maxFieldSize } });
           err.status = 413;
@@ -1787,10 +1781,10 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
           currentField.value = currentField.value.slice(0, -2);
         }
         req.formData.fields[currentField.name] = currentField.value;
-        buffer = buffer.slice(idx + delimiter.length);
+        buffer = buffer.subarray(idx + delimiter.length);
         // 跳过 \r\n
         if (buffer.length >= 2 && buffer[0] === 0x0D && buffer[1] === 0x0A) {
-          buffer = buffer.slice(2);
+          buffer = buffer.subarray(2);
         }
         state = 'HEADERS';
         partHeadersBuf = Buffer.alloc(0);
@@ -1801,7 +1795,7 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
           // 还没结束，写入临时文件
           // 保留尾部回看字节，防止分隔符跨 chunk 截断
           const safeLen = Math.max(0, buffer.length - lookBehind);
-          const writeData = buffer.slice(0, safeLen);
+          const writeData = buffer.subarray(0, safeLen);
           if (!currentFile.stream) {
             currentFile.stream = fs.createWriteStream(currentFile.path);
             // 背压处理：写入流满时暂停请求读取，drain 后恢复
@@ -1827,14 +1821,14 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
             next(err);
             return;
           }
-          buffer = buffer.slice(safeLen);
+          buffer = buffer.subarray(safeLen);
           break;
         }
         // 文件结束
-        const fileData = buffer.slice(0, idx);
+        const fileData = buffer.subarray(0, idx);
         // 去掉文件数据前的 \r\n
         const trimmedData = fileData.length >= 2 && fileData.at(-2) === 0x0D && fileData.at(-1) === 0x0A
-          ? fileData.slice(0, -2)
+          ? fileData.subarray(0, -2)
           : fileData;
 
         if (!currentFile.stream) {
@@ -1862,10 +1856,10 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
 
         // 清理上传进度条目
         cleanupOnError = false;
-        buffer = buffer.slice(idx + delimiter.length);
+        buffer = buffer.subarray(idx + delimiter.length);
         // 跳过 \r\n
         if (buffer.length >= 2 && buffer[0] === 0x0D && buffer[1] === 0x0A) {
-          buffer = buffer.slice(2);
+          buffer = buffer.subarray(2);
         }
         state = 'HEADERS';
         partHeadersBuf = Buffer.alloc(0);
@@ -2349,35 +2343,37 @@ class Application extends Router {
         return;
       }
 
-      const items = entries.map(entry => {
-        try {
-          // 目录只需名称和类型，文件需要额外 stat 获取大小和修改时间
-          if (entry.isDirectory()) {
-            return { name: entry.name, isDirectory: true, size: 0, modified: '' };
-          }
-          const stat = fs.statSync(path.join(dirPath, entry.name));
-          return {
+      // 异步获取文件信息，避免同步阻塞事件循环
+      const tasks = entries.map(entry => {
+        if (entry.isDirectory()) {
+          return Promise.resolve({ name: entry.name, isDirectory: true, size: 0, modified: '' });
+        }
+        return fs.promises.stat(path.join(dirPath, entry.name))
+          .then(stat => ({
             name: entry.name,
             isDirectory: false,
             size: stat.size,
             modified: stat.mtime.toISOString()
-          };
-        } catch (e) {
-          return null;
-        }
-      }).filter(Boolean);
-
-      // 排序：目录在前
-      items.sort((a, b) => {
-        if (a.isDirectory && !b.isDirectory) return -1;
-        if (!a.isDirectory && b.isDirectory) return 1;
-        return a.name.localeCompare(b.name);
+          }))
+          .catch(() => null);
       });
 
-      // 生成 HTML 目录列表
-      const html = this._renderDirectoryHTML(requestPath, items);
-      res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.send(html);
+      Promise.all(tasks).then(results => {
+        const items = results.filter(Boolean);
+        // 排序：目录在前
+        items.sort((a, b) => {
+          if (a.isDirectory && !b.isDirectory) return -1;
+          if (!a.isDirectory && b.isDirectory) return 1;
+          return a.name.localeCompare(b.name);
+        });
+
+        // 生成 HTML 目录列表
+        const html = this._renderDirectoryHTML(requestPath, items);
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.send(html);
+      }).catch(() => {
+        res.status(500).send('Internal Server Error');
+      });
     });
   }
 
@@ -2414,6 +2410,11 @@ class Application extends Router {
    * 处理 WebSocket 升级请求
    */
   _handleUpgrade(req, socket, head) {
+    // 防御性检查：_wss 在 listen() 中初始化，正常流程不会为 null
+    if (!this._wss) {
+      socket.destroy();
+      return;
+    }
     const ws = this._wss.handleUpgrade(req, socket, head);
     if (!ws) return;
 

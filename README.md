@@ -139,8 +139,9 @@ app.use((err, req, res, next) => {
 | `res.redirect([code,] url)` | 重定向，兼容 Express 签名：`redirect(url)` 默认 302，`redirect(status, url)` 指定状态码 |
 | `res.cookie(name, value, opts)` | 设置 Cookie |
 | `res.clearCookie(name, opts)` | 清除 Cookie |
-| `res.set(name, value)` / `res.setHeader()` | 设置响应头（set 支持对象批量） |
-| `res.get(name)` / `res.getHeader()` | 获取响应头 |
+| `res.set(name, value)` / `res.setHeader()` | 设置响应头（set 支持对象批量；setHeader 为底层方法，功能相同） |
+| `res.get(name)` / `res.getHeader()` | 获取响应头（get 为 Express 兼容方法，功能相同） |
+| `res.removeHeader(name)` | 移除已设置的响应头 |
 | `res.type(type)` | 设置 Content-Type（支持简写：html→text/html） |
 | `res.on(event, fn)` | 监听响应事件（finish/close 等） |
 | `res.sse()` | 创建 SSE 实例 |
