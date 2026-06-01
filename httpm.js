@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.2.0
+ * @version     1.2.1
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -2191,6 +2191,8 @@ class Application extends Router {
    * 错误处理：查找错误处理中间件（4 个参数）
    */
   _handleError(err, req, res, stack, startIdx) {
+    // 无错误时直接返回（错误处理中间件调用 next() 无参数表示错误已处理）
+    if (!err) return;
     // 从当前栈中查找错误处理中间件
     for (let i = startIdx; i < stack.length; i++) {
       const handler = stack[i].handler;
@@ -2384,23 +2386,20 @@ class Application extends Router {
    */
   _renderDirectoryHTML(requestPath, items) {
     // requestPath 已去掉前导 /，空字符串表示根目录
-    // path.dirname('subdir') 返回 '.'，应映射为根目录 ''
-    let parentPath = requestPath ? path.dirname(requestPath) : '/';
-    if (parentPath === '.') parentPath = '';
     // 根目录时显示 '/'，否则显示请求路径
     const displayPath = requestPath || '/';
     let html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Directory: ${escapeHtml(displayPath)}</title>`;
     html += `<style>body{font-family:-apple-system,sans-serif;margin:20px;background:#f5f5f5}h1{font-size:18px;color:#333}table{width:100%;border-collapse:collapse;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.1)}th{text-align:left;padding:10px 12px;background:#f8f8f8;border-bottom:2px solid #ddd;font-size:13px;color:#666}td{padding:8px 12px;border-bottom:1px solid #eee;font-size:13px}a{color:#0066cc;text-decoration:none}a:hover{text-decoration:underline}.dir{font-weight:bold}.size{color:#999}</style>`;
     html += `</head><body><h1>Directory: ${escapeHtml(displayPath)}</h1><table><tr><th>Name</th><th>Size</th><th>Modified</th></tr>`;
 
-    // 父目录链接（根目录时不显示）
+    // 父目录链接：使用相对路径 .. 返回上一级（根目录时不显示）
     if (requestPath && requestPath !== '/') {
-      html += `<tr><td><a href="${escapeHtml(parentPath)}" class="dir">../</a></td><td class="size">-</td><td>-</td></tr>`;
+      html += `<tr><td><a href=".." class="dir">../</a></td><td class="size">-</td><td>-</td></tr>`;
     }
 
     for (const item of items) {
-      // 使用 '/' 拼接路径，防止 Windows 上 path.join 产生反斜杠导致 href 失效
-      const href = requestPath ? requestPath + '/' + item.name : item.name;
+      // 仅使用文件名作为相对 href，页面 URL 本身已包含目录路径
+      const href = item.name;
       const name = item.isDirectory ? item.name + '/' : item.name;
       const size = item.isDirectory ? '-' : fmtSize(item.size);
       const cls = item.isDirectory ? 'dir' : '';

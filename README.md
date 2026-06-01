@@ -224,6 +224,7 @@ app.ws('/chat/:room', (ws, req) => {
 ```javascript
 app.wss.broadcast('/chat', 'Hello everyone');       // 按路径分组广播
 app.wss.broadcast('/chat', 'Hello', ws);            // 排除指定连接（传 ws 对象）
+app.wss.broadcastAll('Hello everyone');              // 全局广播
 app.wss.getConnections();                            // 获取所有连接
 ```
 
@@ -236,6 +237,13 @@ app.wss.getConnections();                            // 获取所有连接
 | `binary` | 接收二进制消息 |
 | `close` | 连接关闭，回调参数 `(code, reason)` |
 | `error` | 连接错误 |
+
+### WebSocket 方法
+
+| 方法 | 说明 |
+|------|------|
+| `ws.send(data)` | 发送消息（自动区分文本/JSON/二进制） |
+| `ws.close(code, reason)` | 关闭连接，可选状态码和原因 |
 
 ### data 事件使用
 
@@ -379,6 +387,15 @@ const app = httpm({
     key: fs.readFileSync('server.key'),
     cert: fs.readFileSync('server.crt')
   }
+});
+```
+
+## 关闭服务
+
+```javascript
+// 关闭 HTTP/HTTPS 服务器并断开所有 WebSocket 连接
+app.close(() => {
+  console.log('Server closed');
 });
 ```
 
