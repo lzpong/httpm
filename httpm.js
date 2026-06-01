@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.0.3
+ * @version     1.2.0
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -301,7 +301,6 @@ class Logger {
     const year = now.getFullYear().toString();
     const month = (now.getMonth() + 1).toString().padStart(2, '0');
     const day = now.getDate().toString().padStart(2, '0');
-    const dateStr = `${day}`;
 
     // 同一天复用同一个流
     const streamKey = `${year}-${month}-${day}`;
@@ -544,6 +543,20 @@ class Request {
   }
 
   /**
+   * 获取请求头（Express 兼容），不区分大小写
+   * req.get('Content-Type') / req.get('content-type')
+   */
+  get(name) {
+    if (!name) return undefined;
+    const lower = name.toLowerCase();
+    // 特殊别名
+    if (lower === 'referrer' || lower === 'referer') {
+      return this._req.headers['referer'] || this._req.headers['referrer'];
+    }
+    return this._req.headers[lower];
+  }
+
+  /**
    * 读取请求体原始数据（带超时保护和大小限制）
    */
   _readBody(timeoutMs = 30000, maxSize = null) {
@@ -622,6 +635,59 @@ class Response {
   }
 
   /**
+   * 设置响应头（Express 兼容），支持单键和对象批量设置
+   * res.set('Content-Type', 'text/html')
+   * res.set({ 'Content-Type': 'text/html', 'X-Custom': 'value' })
+   */
+  set(name, value) {
+    if (typeof name === 'object') {
+      for (const key of Object.keys(name)) {
+        this._res.setHeader(key, name[key]);
+      }
+    } else {
+      this._res.setHeader(name, value);
+    }
+    return this;
+  }
+
+  /**
+   * 设置 Content-Type（Express 兼容），支持简写
+   * res.type('html') → text/html
+   * res.type('.html') → text/html
+   * res.type('text/html') → text/html
+   */
+  type(contentType) {
+    // 已是完整 MIME 类型，直接设置
+    if (contentType.includes('/')) {
+      this.setHeader('Content-Type', contentType);
+      return this;
+    }
+    // 简写或带点号扩展名，通过 getMimeType 解析
+    const ext = contentType.startsWith('.') ? contentType : '.' + contentType;
+    const mime = getMimeType(ext);
+    this.setHeader('Content-Type', mime);
+    return this;
+  }
+
+  /**
+   * 代理原生 ServerResponse 事件监听（Express 兼容）
+   * res.on('finish', fn) / res.on('close', fn)
+   */
+  on(event, listener) {
+    this._res.on(event, listener);
+    return this;
+  }
+
+  /**
+   * 获取响应头（Express 兼容），不区分大小写
+   * res.get('Content-Type')
+   */
+  get(name) {
+    if (!name) return undefined;
+    return this._res.getHeader(name);
+  }
+
+  /**
    * 设置 HTTP 状态码，支持链式调用
    */
   status(code) {
@@ -643,9 +709,16 @@ class Response {
    * 通用输出，支持字符串、HTML、Buffer、对象
    */
   send(data) {
-    if (data === undefined || data === null) {
+    // Express 兼容：null 序列化为 "null"，undefined 返回空响应
+    if (data === undefined) {
       this.setHeader('Content-Length', 0);
       this._send('');
+      return;
+    }
+    if (data === null) {
+      this.setHeader('Content-Type', 'text/html; charset=utf-8');
+      this.setHeader('Content-Length', 4);
+      this._send('null');
       return;
     }
     if (Buffer.isBuffer(data)) {
@@ -890,6 +963,7 @@ class SSE {
     const onClose = () => {
       this.connected = false;
     };
+    this._onClose = onClose;
     res.on('close', onClose);
     // HTTP/1.1 兼容：aborted 事件在请求被客户端中断时触发
     res.on('aborted', onClose);
@@ -934,11 +1008,13 @@ class SSE {
   }
 
   /**
-   * 主动关闭 SSE 连接
+   * 主动关闭 SSE 连接，移除监听器防止内存泄漏
    */
   close() {
     if (!this.connected) return;
     this.connected = false;
+    this._res.removeListener('close', this._onClose);
+    this._res.removeListener('aborted', this._onClose);
     this._res.end();
   }
 }
@@ -1109,7 +1185,8 @@ class WebSocket {
         return;
       }
       // 非关闭握手状态：回复 Close 帧后关闭
-      this._sendCloseFrame(code);
+      // RFC 6455 Section 7.4.1: 1005/1006 状态码不得在 Close 帧中发送
+      this._sendCloseFrame(code === 1005 || code === 1006 ? undefined : code);
       this.connected = false;
       this._emitClose(code, reason);
       return;
@@ -1212,6 +1289,8 @@ class WebSocket {
       }
     } catch (e) {
       this.connected = false;
+      // 发送失败时触发 error 事件，便于用户感知和处理
+      this._emit('error', e);
     }
   }
 
@@ -1309,7 +1388,7 @@ class WebSocket {
 /**
  * WebSocket 握手辅助函数：计算 Sec-WebSocket-Accept 值
  */
-function WebSocketHandShark(key) {
+function WebSocketHandShak(key) {
   return crypto.createHash('sha1')
     .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
     .digest('base64');
@@ -1350,7 +1429,7 @@ class WebSocketServer {
       }
     }
 
-    const accept = WebSocketHandShark(key);
+    const accept = WebSocketHandShak(key);
 
     // 发送握手响应
     const responseHeaders = [
@@ -1444,7 +1523,7 @@ class WebSocketServer {
   /**
    * 按路径广播消息
    */
-  broadcastTo(pathStr, data, exclude = null) {
+  broadcast(pathStr, data, exclude = null) {
     const group = this.groups.get(pathStr);
     if (!group) return;
     for (const ws of group) {
@@ -1457,7 +1536,7 @@ class WebSocketServer {
   /**
    * 全局广播消息
    */
-  broadcast(data, exclude = null) {
+  broadcastAll(data, exclude = null) {
     for (const ws of this.connections.values()) {
       if (ws.connected && ws !== exclude) {
         ws.send(data);
@@ -1526,8 +1605,8 @@ function bodyParser(options = {}) {
       const boundary = _extractBoundary(contentType);
       if (boundary) {
         _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next);
-        // 仅 multipart 需要临时文件清理
-        res._res.on('finish', () => {
+        // 仅 multipart 需要临时文件清理（使用 res.on 保持封装一致性）
+        res.on('finish', () => {
           _cleanupTempFiles(req._tempFiles);
         });
       } else {
@@ -1762,7 +1841,8 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
           currentFile.stream = fs.createWriteStream(currentFile.path);
         }
         currentFile.stream.write(trimmedData);
-        // 结束写入并等待刷盘完成
+        // 结束写入（注意：stream.end 为异步操作，极端情况如磁盘满时可能写入不完整，
+        // 但 fileInfo 仍会被记录。若需严格保证写入完整性，需改为异步流程）
         currentFile.stream.end();
         fileSize += trimmedData.length;
         currentFile.size = fileSize;
@@ -2130,7 +2210,7 @@ class Application extends Router {
     const status = err.status || 500;
     const msg = err.message || 'Internal Server Error';
     this._logger.error(`[${status}] ${req.method} ${req.path} - ${msg}`);
-    if (!res.headersSent && !res._res.headersSent) {
+    if (!res.headersSent) {
       res.status(status).json({ error: msg, status });
     }
   }
@@ -2148,8 +2228,9 @@ class Application extends Router {
       // CORS 预检响应
       this._handleCORS(req, res);
     } else if (method === 'POST' || method === 'PUT' || method === 'DELETE' || method === 'PATCH') {
-      // 已知方法但无匹配路由，返回 405 Method Not Allowed
-      res.status(405).json({ error: 'Method Not Allowed', status: 405 });
+      // 已知方法但无匹配路由，返回 405 Method Not Allowed（RFC 7231 要求必须包含 Allow 头）
+      const allowed = this._getAllowedMethods(req.path);
+      res.set('Allow', allowed.join(', ')).status(405).json({ error: 'Method Not Allowed', status: 405 });
     } else {
       // 其他未知方法返回 404
       res.status(404).json({ error: 'Not Found', status: 404 });
@@ -2157,7 +2238,7 @@ class Application extends Router {
   }
 
   /**
-   * CORS 预检响应
+   * CORS 预检响应（动态查询该路径支持的 HTTP 方法）
    */
   _handleCORS(req, res) {
     const cors = this.settings.cors;
@@ -2165,15 +2246,51 @@ class Application extends Router {
       res.status(204)._send('');
       return;
     }
+    // 动态查找该路径匹配的所有 HTTP 方法
+    const allowedMethods = this._getAllowedMethods(req.path);
     const origin = typeof cors.origin === 'string' ? cors.origin : '*';
     res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+    // 动态设置允许的方法列表，而非硬编码
+    res.setHeader('Access-Control-Allow-Methods', allowedMethods.join(', '));
     res.setHeader('Access-Control-Allow-Headers', cors.headers || 'Content-Type, Authorization');
     res.setHeader('Access-Control-Max-Age', parseInt(cors.maxAge, 10) || 86400);
+    // Allow 头告知客户端该路径实际支持的方法
+    res.setHeader('Allow', allowedMethods.join(', '));
     if (cors.credentials) {
       res.setHeader('Access-Control-Allow-Credentials', 'true');
     }
     res.status(204)._send('');
+  }
+
+  /**
+   * 查询指定路径支持的所有 HTTP 方法（含隐式 HEAD）
+   * 用于 OPTIONS Allow 头和 405 Method Not Allowed 响应
+   */
+  _getAllowedMethods(pathname) {
+    const methods = new Set();
+    // 遍历所有已注册方法的路由，查找匹配该路径的方法
+    for (const method of ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']) {
+      const routes = this.routes[method] || [];
+      for (const route of routes) {
+        if (route.pattern.exec(pathname)) {
+          methods.add(method);
+          break;
+        }
+      }
+    }
+    // 检查 ALL 中间件路由
+    const allRoutes = this.routes['ALL'] || [];
+    for (const route of allRoutes) {
+      if (route.pattern.exec(pathname)) {
+        ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'].forEach(m => methods.add(m));
+        break;
+      }
+    }
+    // GET 路由隐式支持 HEAD
+    if (methods.has('GET')) methods.add('HEAD');
+    // OPTIONS 始终可用（CORS 预检）
+    methods.add('OPTIONS');
+    return [...methods].sort();
   }
 
   /**
@@ -2267,10 +2384,14 @@ class Application extends Router {
    */
   _renderDirectoryHTML(requestPath, items) {
     // requestPath 已去掉前导 /，空字符串表示根目录
-    const parentPath = requestPath ? path.dirname(requestPath) : '/';
-    let html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Directory: ${escapeHtml(requestPath)}</title>`;
+    // path.dirname('subdir') 返回 '.'，应映射为根目录 ''
+    let parentPath = requestPath ? path.dirname(requestPath) : '/';
+    if (parentPath === '.') parentPath = '';
+    // 根目录时显示 '/'，否则显示请求路径
+    const displayPath = requestPath || '/';
+    let html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Directory: ${escapeHtml(displayPath)}</title>`;
     html += `<style>body{font-family:-apple-system,sans-serif;margin:20px;background:#f5f5f5}h1{font-size:18px;color:#333}table{width:100%;border-collapse:collapse;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.1)}th{text-align:left;padding:10px 12px;background:#f8f8f8;border-bottom:2px solid #ddd;font-size:13px;color:#666}td{padding:8px 12px;border-bottom:1px solid #eee;font-size:13px}a{color:#0066cc;text-decoration:none}a:hover{text-decoration:underline}.dir{font-weight:bold}.size{color:#999}</style>`;
-    html += `</head><body><h1>Directory: ${escapeHtml(requestPath)}</h1><table><tr><th>Name</th><th>Size</th><th>Modified</th></tr>`;
+    html += `</head><body><h1>Directory: ${escapeHtml(displayPath)}</h1><table><tr><th>Name</th><th>Size</th><th>Modified</th></tr>`;
 
     // 父目录链接（根目录时不显示）
     if (requestPath && requestPath !== '/') {
@@ -2278,7 +2399,8 @@ class Application extends Router {
     }
 
     for (const item of items) {
-      const href = path.join(requestPath, item.name);
+      // 使用 '/' 拼接路径，防止 Windows 上 path.join 产生反斜杠导致 href 失效
+      const href = requestPath ? requestPath + '/' + item.name : item.name;
       const name = item.isDirectory ? item.name + '/' : item.name;
       const size = item.isDirectory ? '-' : fmtSize(item.size);
       const cls = item.isDirectory ? 'dir' : '';
@@ -2297,28 +2419,23 @@ class Application extends Router {
     if (!ws) return;
 
     // 匹配 app.ws() 注册的处理器（支持动态参数路径）
+    // _compilePath 始终返回 pattern，静态和动态路径均通过正则精确匹配
     if (this._wsHandlers) {
       const pathname = parseUrl(req.url).pathname;
       for (const entry of this._wsHandlers) {
         let matched = false;
         let params = {};
-        if (entry.pattern) {
-          // 动态路径：正则匹配
-          const m = entry.pattern.exec(pathname);
-          if (m) {
-            matched = true;
-            entry.params.forEach((name, i) => {
-              try {
-                params[name] = decodeURIComponent(m[i + 1]);
-              } catch (e) {
-                // 非法 URI 编码，保留原始值
-                params[name] = m[i + 1];
-              }
-            });
-          }
-        } else {
-          // 静态路径：精确或前缀匹配
-          matched = pathname === entry.path || pathname.startsWith(entry.path + '/');
+        const m = entry.pattern.exec(pathname);
+        if (m) {
+          matched = true;
+          entry.params.forEach((name, i) => {
+            try {
+              params[name] = decodeURIComponent(m[i + 1]);
+            } catch (e) {
+              // 非法 URI 编码，保留原始值
+              params[name] = m[i + 1];
+            }
+          });
         }
         if (matched) {
           // 将动态参数挂载到 req 上
@@ -2506,7 +2623,8 @@ httpm.fmtTime = fmtTime;
 httpm.isPathSafe = isPathSafe;
 httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
-httpm.WebSocketHandShark = WebSocketHandShark;
+httpm.WebSocketHandShak = WebSocketHandShak;
+httpm.escapeHtml = escapeHtml;
 
 /**
  * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）

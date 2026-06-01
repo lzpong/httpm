@@ -418,22 +418,22 @@ async function runTests() {
   }
 
   // ============================================================
-  // 1c. WebSocketHandShark 工具函数 - 正向测试
+  // 1c. WebSocketHandShak 工具函数 - 正向测试
   // ============================================================
-  section('WebSocketHandShark');
+  section('WebSocketHandShak');
 
   {
     // 正向：已知 key 的 accept 值
-    const accept = httpm.WebSocketHandShark('dGhlIHNhbXBsZSBub25jZQ==');
-    assert(accept === 's3pPLMBiTxaQ9kYGzzhZRbK+xOo=', 'WebSocketHandShark - RFC 6455 example');
+    const accept = httpm.WebSocketHandShak('dGhlIHNhbXBsZSBub25jZQ==');
+    assert(accept === 's3pPLMBiTxaQ9kYGzzhZRbK+xOo=', 'WebSocketHandShak - RFC 6455 example');
 
     // 正向：函数存在性
-    assert(typeof httpm.WebSocketHandShark === 'function', 'WebSocketHandShark - is function');
+    assert(typeof httpm.WebSocketHandShak === 'function', 'WebSocketHandShak - is function');
 
     // 正向：返回字符串
-    const accept2 = httpm.WebSocketHandShark('testkey123');
-    assert(typeof accept2 === 'string', 'WebSocketHandShark - returns string');
-    assert(accept2.length > 0, 'WebSocketHandShark - non-empty result');
+    const accept2 = httpm.WebSocketHandShak('testkey123');
+    assert(typeof accept2 === 'string', 'WebSocketHandShak - returns string');
+    assert(accept2.length > 0, 'WebSocketHandShak - non-empty result');
   }
 
   // ============================================================
@@ -664,7 +664,7 @@ async function runTests() {
     const wss = new httpm.WebSocketServer();
     assert(typeof wss.handleUpgrade === 'function', 'WSS - handleUpgrade method');
     assert(typeof wss.broadcast === 'function', 'WSS - broadcast method');
-    assert(typeof wss.broadcastTo === 'function', 'WSS - broadcastTo method');
+    assert(typeof wss.broadcastAll === 'function', 'WSS - broadcastAll method');
     assert(typeof wss.getConnections === 'function', 'WSS - getConnections method');
     assert(typeof wss.on === 'function', 'WSS - on method');
     assert(wss.connections instanceof Map, 'WSS - connections is Map');

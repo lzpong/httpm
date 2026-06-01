@@ -66,6 +66,9 @@ app.all('/any', (req, res) => res.json({ method: req.method }));
 
 路由匹配优先级：精准静态路由 > 动态参数路由 > ALL 通用路由 > 静态文件服务。
 
+- **HEAD 请求**：自动匹配 GET 路由，仅返回响应头（Express 兼容）
+- **OPTIONS 请求**：自动返回 `Allow` 头和 CORS 预检响应，动态查询该路径支持的方法
+
 路由处理器返回 `false` 时，请求进入静态文件兜底：
 
 ```javascript
@@ -119,10 +122,10 @@ app.use((err, req, res, next) => {
 | `req.body` | 请求体（JSON/URL-encoded 自动解析） |
 | `req.formData` | 表单数据（multipart 解析后） |
 | `req.cookies` | Cookie 对象 |
+| `req.get(name)` | 获取请求头（不区分大小写） |
 | `req.headers` | 请求头对象 |
 | `req.ip` | 客户端 IP |
 | `req.protocol` | 协议（http/https） |
-| `req.get(name)` | 获取请求头 |
 
 ## 响应对象 (res)
 
@@ -130,15 +133,16 @@ app.use((err, req, res, next) => {
 |------|------|
 | `res.status(code)` | 设置状态码，链式调用 |
 | `res.json(obj)` | 发送 JSON 响应 |
-| `res.send(data)` | 发送响应（自动识别类型） |
+| `res.send(data)` | 发送响应（自动识别类型；`null`→`"null"`，`undefined`→空响应） |
 | `res.sendFile(path, opts)` | 发送文件 |
 | `res.download(path, name)` | 下载文件 |
 | `res.redirect([code,] url)` | 重定向，兼容 Express 签名：`redirect(url)` 默认 302，`redirect(status, url)` 指定状态码 |
 | `res.cookie(name, value, opts)` | 设置 Cookie |
 | `res.clearCookie(name, opts)` | 清除 Cookie |
-| `res.set(name, value)` / `res.setHeader()` | 设置响应头 |
+| `res.set(name, value)` / `res.setHeader()` | 设置响应头（set 支持对象批量） |
 | `res.get(name)` / `res.getHeader()` | 获取响应头 |
-| `res.type(type)` | 设置 Content-Type |
+| `res.type(type)` | 设置 Content-Type（支持简写：html→text/html） |
+| `res.on(event, fn)` | 监听响应事件（finish/close 等） |
 | `res.sse()` | 创建 SSE 实例 |
 
 ### Cookie 签名
@@ -199,31 +203,28 @@ app.post('/upload', (req, res) => {
 ### 简化注册
 
 ```javascript
+// 静态路径
 app.ws('/chat', (ws, req) => {
   ws.send('Welcome!');
 
   ws.on('text', msg => {
-    app.wsServer.broadcast('/chat', msg, ws.id);
+    app.wss.broadcast('/chat', msg, ws);
   });
+});
 
-  ws.on('binary', data => {
-    // 处理二进制数据
-  });
-
-  ws.on('close', (code, reason) => {
-    console.log('Client disconnected', code, reason);
-  });
+// 动态参数路径
+app.ws('/chat/:room', (ws, req) => {
+  console.log('Room:', req.params.room);
+  ws.send(`Welcome to room ${req.params.room}!`);
 });
 ```
 
 ### WebSocketServer API
 
 ```javascript
-const wss = app.wsServer;
-
-wss.broadcast('/chat', 'Hello everyone');         // 按路径分组广播
-wss.broadcast('/chat', 'Hello', excludeWsId);     // 排除指定连接
-wss.getConnections();                              // 获取所有连接
+app.wss.broadcast('/chat', 'Hello everyone');       // 按路径分组广播
+app.wss.broadcast('/chat', 'Hello', ws);            // 排除指定连接（传 ws 对象）
+app.wss.getConnections();                            // 获取所有连接
 ```
 
 ### WebSocket 事件
@@ -357,6 +358,8 @@ const app = httpm({ svrPort: 3000 }); // svrPort=3000, enableGzip=true(来自app
 | `cookieParserSecret` | `null` | Cookie 签名密钥 |
 | `wsMaxPayload` | `104857600` | WebSocket 最大帧负载（100MB） |
 | `wsAllowedOrigins` | `null` | WebSocket 允许的 Origin 列表 |
+| `wsHeartbeatInterval` | `30000` | WebSocket 心跳检测间隔（毫秒） |
+| `wsHeartbeatTimeout` | `30000` | WebSocket 心跳超时时间（毫秒） |
 
 ## HTTPS / HTTP2
 
@@ -410,7 +413,7 @@ httpm.isPathSafe
 httpm.generateETag
 httpm.parseRange
 httpm.escapeHtml
-httpm.WebSocketHandShark
+httpm.WebSocketHandShak
 ```
 
 ## 运行要求

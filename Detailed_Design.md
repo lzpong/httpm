@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.1
+**文档版本**：V1.2.0
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -30,7 +30,7 @@ httpm 是基于 Node.js 原生模块开发的**单文件、零依赖** HTTP 服�
 | 中间件 | 标准 Express 线性中间件执行模型，支持应用级、路径级、错误处理中间件 |
 | 静态文件服务 | 支持 Range 断点续传、ETag/Last-Modified 缓存、Gzip 压缩、目录访问控制 |
 | 文件上传 | multipart/form-data 流式解析，内存零占用，支持大小限制、临时文件自动清理 |
-| 文件下载 | 支持断点续传，大文件自动展示传输进度（>1MB） |
+| 文件下载 | 支持 Range 断点续传、ETag/Last-Modified 缓存 |
 | WebSocket | 遵循 RFC 6455 标准，支持路径分组、全局广播、统一心跳保活机制 |
 | SSE | 轻量化 Server-Sent Events 实现，简化长推送开发 |
 | 日志系统 | 分级日志，支持彩色控制台输出 + 文件持久化存储 |
@@ -156,7 +156,7 @@ app.get('/api/users/:id', (req, res) => {
 class Router {
   constructor() {
     // 按 HTTP 方法分类存储路由规则
-    this.routes = { GET: [], POST: [], PUT: [], DELETE: [], PATCH: [], ALL: [] };
+    this.routes = { GET: [], POST: [], PUT: [], DELETE: [], PATCH: [], HEAD: [], OPTIONS: [], ALL: [] };
     this.middlewareStack = []; // 路由级中间件栈
   }
 }
@@ -188,6 +188,19 @@ class Router {
 #### HEAD 请求匹配
 
 HEAD 请求自动匹配 GET 路由（Express 兼容行为），但仅发送响应头，不发送响应体。
+
+**机制**：HEAD 请求不会在 `routes` 表中注册独立路由，而是在 `Router.match()` 匹配时隐式查找 GET 路由。当 `req.method === 'HEAD'` 时，`match()` 同时查找 `routes['HEAD']` 和 `routes['GET']`。
+
+#### OPTIONS 请求处理
+
+OPTIONS 请求有两种语义，httpm 分别处理：
+
+1. **CORS 预检**：浏览器跨域请求前自动发送的 OPTIONS 请求，由 `_handleCORS` 方法统一处理，返回 204 + CORS 头；
+2. **路由能力查询**：`_handleCORS` 会动态查询该路径匹配的所有 HTTP 方法，在响应中返回 `Allow` 头和 `Access-Control-Allow-Methods` 头，告知客户端该路径实际支持的方法列表。
+
+`_getAllowedMethods(pathname)` 方法遍历所有已注册路由，查找匹配该路径的方法，并自动补充隐式规则：
+- GET 路由隐式支持 HEAD；
+- OPTIONS 始终可用（CORS 预检）。
 
 ### 3.3 Request 类
 
@@ -224,6 +237,7 @@ class Request {
 
 - `req.method`：   HTTP 请求方法
 - `req.url`：	   原始请求 URL
+- `req.get(name)`：  获取请求头（不区分大小写，Express 兼容）
 - `req.headers`：  请求头对象
 - `req.ip`：	   客户端 IP 地址
 - `req.hostname`： 请求域名
@@ -249,24 +263,27 @@ class Request {
 | --- | --- |
 | statusCode | 默认响应状态码，初始值 200 |
 | _isHead | 是否为 HEAD 请求（仅发送头部，不发送响应体） |
+| set(name, value) | 设置响应头（Express 兼容），支持单键和对象批量设置 |
+| get(name) | 获取已设置的响应头（Express 兼容），不区分大小写 |
+| type(contentType) | 设置 Content-Type（Express 兼容），支持简写（html→text/html） |
+| on(event, listener) | 代理原生 ServerResponse 事件监听（Express 兼容） |
 | setHeader(name, value) | 设置响应头 |
 | getHeader(name) | 获取已设置的响应头 |
 | status(code) | 设置 HTTP 状态码，支持链式调用 |
 | json(data) | 输出 JSON 格式响应，自动补充对应 Content-Type |
-| send(data) | 通用输出，支持字符串、HTML、Buffer |
+| send(data) | 通用输出，支持字符串、HTML、Buffer、对象；`null` 序列化为 `"null"`（Express 兼容），`undefined` 返回空响应 |
 | sendFile(path, options) | 发送本地文件，内置断点续传、缓存、Gzip 能力 |
-| download(path, filename) | 触发浏览器文件下载，支持大文件进度展示 |
+| download(path, filename) | 触发浏览器文件下载，支持断点续传 |
 | redirect([code,] url) | 重定向响应，兼容 Express 签名：`redirect(url)` 默认 302，`redirect(status, url)` 指定状态码 |
 | sse() | 创建 SSE 推送实例 |
 | cookie(name, value, opts) | 设置响应 Cookie |
 
 #### sendFile 核心逻辑
 
-1. **进度展示**：文件大于 1MB 时，自动在控制台展示传输进度；
-2. **Range 断点续传**：识别请求 `Range` 头，返回 206 分段响应；
-3. **缓存校验**：通过 ETag、Last-Modified 校验，命中缓存返回 304；
-4. **Gzip 压缩**：对文本类文件，根据客户端 `Accept-Encoding` 自动开启压缩；
-5. **HEAD 请求**：匹配 GET 路由但仅发送响应头，不发送响应体（Express 兼容行为）。
+1. **Range 断点续传**：识别请求 `Range` 头，返回 206 分段响应；
+2. **缓存校验**：通过 ETag、Last-Modified 校验，命中缓存返回 304；
+3. **Gzip 压缩**：对文本类文件，根据客户端 `Accept-Encoding` 自动开启压缩；
+4. **HEAD 请求**：匹配 GET 路由但仅发送响应头，不发送响应体（Express 兼容行为）。
 
 ### 3.5 SSE 类
 
@@ -287,7 +304,7 @@ class Request {
 - `event(name, data)`： 发送自定义命名事件；
 - `retry(ms)`：			设置客户端重连间隔（毫秒）；
 - `comment(text)`：		发送注释消息（可作为心跳保活）；
-- `close()`：			主动关闭 SSE 连接。
+- `close()`：			主动关闭 SSE 连接，自动移除 `close`/`aborted` 事件监听器防止内存泄漏。
 
 #### 使用规则
 
@@ -303,10 +320,12 @@ class Request {
 2. `send(data)` 方法：自动区分文本、JSON 对象、二进制 Buffer，匹配对应帧类型；
 3. `close(code, reason)` 方法：先发送 Close 帧（此时 connected 仍为 true），再标记 connected=false、_closing=true，限时 2 秒等待对端 Close 帧，超时则强制销毁 socket；
 4. Close 帧状态码：对端发送无状态码的 Close 帧时，默认为 1005（RFC 6455 规定的"无状态码"语义码），非法状态码（0-999）自动修正为 1005；
-5. 关闭握手期间（_closing=true）：忽略非控制帧，仅处理 Ping/Pong/Close 帧；
-6. 帧负载长度超过 `Number.MAX_SAFE_INTEGER` 时视为超限帧，拒绝处理；
-7. 支持分片帧解析（continuation frame），多帧消息自动合并后触发事件；
-8. 监听底层套接字事件，处理消息接收、连接断开。
+5. RFC 6455 Section 7.4.1 规定：1005（无状态码）和 1006（异常关闭）不得在 Close 帧中发送，httpm 在回复 Close 帧时会自动将这两种状态码替换为不携带状态码的 Close 帧；
+6. 关闭握手期间（_closing=true）：忽略非控制帧，仅处理 Ping/Pong/Close 帧；
+7. 帧负载长度超过 `Number.MAX_SAFE_INTEGER` 时视为超限帧，拒绝处理；
+8. 支持分片帧解析（continuation frame），多帧消息自动合并后触发事件；
+9. 发送失败时触发 `error` 事件，便于用户感知和处理异常；
+10. 监听底层套接字事件，处理消息接收、连接断开。
 
 #### 3.6.2 WebSocketServer 类
 
@@ -543,11 +562,9 @@ const defaultConfig = {
 3. **请求响应完成后**，自动删除当前请求产生的所有临时文件；
 4. 客户端主动断开连接时，同步清理已生成的不完整临时文件。
 
-### 7.3 上传进度展示
+### 7.3 临时文件清理时机
 
-规则：文件大小 **大于 1MB** 时自动开启控制台进度展示。
-
-展示内容：文件名进度条、已传 / 总大小、百分比、传输速度、耗时。
+请求响应完成后，自动删除当前请求产生的所有临时文件；客户端主动断开连接时，同步清理已生成的不完整临时文件。
 
 ---
 
@@ -601,14 +618,14 @@ module.exports = Object.assign(httpm, {
   SSE, WebSocket, WebSocketServer, Logger,
 
   // 工具方法
-  WebSocketHandShark,
+  WebSocketHandShak,
 
   // 内置中间件
   bodyParser, cookieParser, static,
 
   // 通用工具函数
   parseUrl, parseQuery, parseCookies, getMimeType,
-  fmtSize, fmtTime, isPathSafe, generateETag, parseRange
+  fmtSize, fmtTime, isPathSafe, generateETag, parseRange, escapeHtml
 });
 ```
 
@@ -655,7 +672,7 @@ app.post('/upload', (req, res) => {
 app.ws('/chat', (ws, req) => {
   ws.send({ type: 'welcome', id: ws.id });
   ws.on('text', msg => {
-    app.wsServer.broadcast('/chat', msg, ws.id);
+    app.wss.broadcast('/chat', msg, ws);
   });
 });
 ```
@@ -696,7 +713,7 @@ app.sse('/events', (sse, req) => {
 ```json
 {
   "name": "@lzpong/httpm",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
   "engines": { "node": ">=18.0.0" },

@@ -710,7 +710,7 @@ module.exports = Object.assign(httpm, {
   Logger,
   
   // 函数
-  WebSocketHandShark,
+  WebSocketHandShak,
   
   // 中间件
   bodyParser,
