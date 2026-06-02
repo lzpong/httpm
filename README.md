@@ -122,9 +122,11 @@ app.use((err, req, res, next) => {
 | `req.body` | 请求体（JSON/URL-encoded 自动解析） |
 | `req.formData` | 表单数据（multipart 解析后） |
 | `req.cookies` | Cookie 对象 |
+| `req.signedCookies` | 签名 Cookie 对象（需配置 `cookieParserSecret`） |
 | `req.get(name)` | 获取请求头（不区分大小写） |
 | `req.headers` | 请求头对象 |
 | `req.ip` | 客户端 IP |
+| `req.hostname` | 请求域名 |
 | `req.protocol` | 协议（http/https） |
 
 ## 响应对象 (res)
@@ -134,8 +136,8 @@ app.use((err, req, res, next) => {
 | `res.status(code)` | 设置状态码，链式调用 |
 | `res.json(obj)` | 发送 JSON 响应 |
 | `res.send(data)` | 发送响应（自动识别类型；`null`→`"null"`，`undefined`→空响应） |
-| `res.sendFile(path, opts)` | 发送文件 |
-| `res.download(path, name)` | 下载文件 |
+| `res.sendFile(path, opts)` | 发送文件，opts 支持 `{ root, contentType }` |
+| `res.download(path, [name], [opts])` | 下载文件，兼容 Express 签名：opts 传递给 sendFile |
 | `res.redirect([code,] url)` | 重定向，兼容 Express 签名：`redirect(url)` 默认 302，`redirect(status, url)` 指定状态码 |
 | `res.cookie(name, value, opts)` | 设置 Cookie |
 | `res.clearCookie(name, opts)` | 清除 Cookie |

@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.2.0
+**文档版本**：V1.2.3
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -223,6 +223,7 @@ class Request {
     this.params = {};            // 动态路由解析后的路径参数
     this.body = null;            // 解析后的请求体数据
     this.cookies = {};           // 解析后的 Cookie 对象
+    this.signedCookies = {};    // 签名 Cookie 对象（需配置 cookieParserSecret）
     this.files = [];             // 上传文件数组（兼容旧版本）
     this.path = '';              // 解码后的请求路径（不含 query）
     this.formData = {            // 统一表单数据对象（推荐使用）
@@ -276,8 +277,8 @@ class Request {
 | status(code) | 设置 HTTP 状态码，支持链式调用 |
 | json(data) | 输出 JSON 格式响应，自动补充对应 Content-Type |
 | send(data) | 通用输出，支持字符串、HTML、Buffer、对象；`null` 序列化为 `"null"`（Express 兼容），`undefined` 返回空响应 |
-| sendFile(path, options) | 发送本地文件，内置断点续传、缓存、Gzip 能力 |
-| download(path, filename) | 触发浏览器文件下载，支持断点续传 |
+| sendFile(path, options) | 发送本地文件，内置断点续传、缓存、Gzip 能力；options 支持 `{ root, contentType }` |
+| download(path, [filename], [options]) | 触发浏览器文件下载，支持断点续传；兼容 Express 签名，options 传递给 sendFile |
 | redirect([code,] url) | 重定向响应，兼容 Express 签名：`redirect(url)` 默认 302，`redirect(status, url)` 指定状态码 |
 | sse() | 创建 SSE 推送实例 |
 | cookie(name, value, opts) | 设置响应 Cookie |

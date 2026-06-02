@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.2.2
+ * @version     1.2.3
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -164,8 +164,7 @@ const MIME_TYPES = {
  * 根据文件后缀匹配标准 MIME 类型
  */
 function getMimeType(ext) {
-  if (!ext) return 'application/octet-stream';
-  const lower = ext.toLowerCase();
+  const lower = ext?.toString().toLowerCase();
   return MIME_TYPES[lower] || 'application/octet-stream';
 }
 
@@ -773,7 +772,12 @@ class Response {
       }
 
       const mime = getMimeType(path.extname(fullPath));
-      this.setHeader('Content-Type', mime);
+      // Content-Type 优先级：options.contentType > 已设置的 Content-Type > 自动检测
+      if (options.contentType) {
+        this.setHeader('Content-Type', options.contentType);
+      } else if (!this.getHeader('Content-Type')) {
+        this.setHeader('Content-Type', mime);
+      }
       this.setHeader('Accept-Ranges', 'bytes');
 
       // ETag 缓存校验
@@ -872,10 +876,19 @@ class Response {
   /**
    * 触发浏览器文件下载，支持大文件进度展示
    */
-  download(filePath, filename) {
-    const name = filename || path.basename(filePath);
+  download(filePath, filename, options) {
+    // Express 兼容签名：download(path), download(path, filename), download(path, filename, options), download(path, options)
+    let name = filename;
+    let opts = options;
+    if (typeof filename === 'object' && filename !== null) {
+      // download(path, options) 形式
+      opts = filename;
+      name = null;
+    }
+    name = name || path.basename(filePath);
+    opts = opts || {};
     this.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(name)}"`);
-    this.sendFile(filePath);
+    this.sendFile(filePath, opts);
   }
 
   /**
@@ -1686,10 +1699,8 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
   let cleanupOnError = false;
   let paused = false;
 
-  // 确保临时目录存在
-  if (!fs.existsSync(tempDir)) {
-    fs.mkdirSync(tempDir, { recursive: true });
-  }
+  // 确保临时目录存在（recursive: true 时目录已存在不报错，无需 existsSync）
+  fs.mkdirSync(tempDir, { recursive: true });
 
   function processBuffer() {
     while (buffer.length > 0) {
@@ -2312,18 +2323,20 @@ class Application extends Router {
       }
 
       if (stat.isDirectory()) {
-        // 目录：查找 index.html
+        // 目录：查找 index.html（异步检查避免阻塞事件循环）
         const indexPath = path.join(fullPath, 'index.html');
-        if (fs.existsSync(indexPath)) {
-          res.sendFile(path.relative(rootPath, indexPath), { root: rootPath });
-          return;
-        }
-        // 展示目录列表
-        if (this.settings.showDir) {
-          this._serveDirectory(req, res, fullPath, requestPath);
-        } else {
-          res.status(404).json({ error: 'Not Found', status: 404 });
-        }
+        fs.stat(indexPath, (idxErr) => {
+          if (!idxErr) {
+            res.sendFile(path.relative(rootPath, indexPath), { root: rootPath });
+            return;
+          }
+          // 展示目录列表
+          if (this.settings.showDir) {
+            this._serveDirectory(req, res, fullPath, requestPath);
+          } else {
+            res.status(404).json({ error: 'Not Found', status: 404 });
+          }
+        });
         return;
       }
 
@@ -2384,18 +2397,21 @@ class Application extends Router {
     // requestPath 已去掉前导 /，空字符串表示根目录
     // 根目录时显示 '/'，否则显示请求路径
     const displayPath = requestPath || '/';
+    // 构建链接前缀：确保以 / 开头并以 / 结尾，用于生成绝对路径 href
+    const prefix = '/' + (requestPath ? requestPath.replace(/\/+$/, '') + '/' : '');
     let html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Directory: ${escapeHtml(displayPath)}</title>`;
     html += `<style>body{font-family:-apple-system,sans-serif;margin:20px;background:#f5f5f5}h1{font-size:18px;color:#333}table{width:100%;border-collapse:collapse;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.1)}th{text-align:left;padding:10px 12px;background:#f8f8f8;border-bottom:2px solid #ddd;font-size:13px;color:#666}td{padding:8px 12px;border-bottom:1px solid #eee;font-size:13px}a{color:#0066cc;text-decoration:none}a:hover{text-decoration:underline}.dir{font-weight:bold}.size{color:#999}</style>`;
     html += `</head><body><h1>Directory: ${escapeHtml(displayPath)}</h1><table><tr><th>Name</th><th>Size</th><th>Modified</th></tr>`;
 
-    // 父目录链接：使用相对路径 .. 返回上一级（根目录时不显示）
+    // 父目录链接：使用绝对路径返回上一级（根目录时不显示）
     if (requestPath && requestPath !== '/') {
-      html += `<tr><td><a href=".." class="dir">../</a></td><td class="size">-</td><td>-</td></tr>`;
+      const parentHref = prefix + '..';
+      html += `<tr><td><a href="${escapeHtml(parentHref)}" class="dir">../</a></td><td class="size">-</td><td>-</td></tr>`;
     }
 
     for (const item of items) {
-      // 仅使用文件名作为相对 href，页面 URL 本身已包含目录路径
-      const href = item.name;
+      // 使用绝对路径 href，避免 URL 缺少尾部斜杠时解析错误
+      const href = prefix + item.name;
       const name = item.isDirectory ? item.name + '/' : item.name;
       const size = item.isDirectory ? '-' : fmtSize(item.size);
       const cls = item.isDirectory ? 'dir' : '';
@@ -2412,6 +2428,13 @@ class Application extends Router {
   _handleUpgrade(req, socket, head) {
     // 防御性检查：_wss 在 listen() 中初始化，正常流程不会为 null
     if (!this._wss) {
+      this._logger.warn('WebSocket server not initialized (call listen() first)');
+      socket.destroy();
+      return;
+    }
+    // 校验 Upgrade 头必须为 websocket
+    if (req.headers['upgrade']?.toLowerCase() !== 'websocket') {
+      this._logger.warn('Invalid upgrade header:', req.headers['upgrade'], 'expected: websocket');
       socket.destroy();
       return;
     }
@@ -2600,13 +2623,16 @@ function staticMiddleware(rootPath, options = {}) {
         return next();
       }
       if (stat.isDirectory()) {
-        // 目录：尝试 index.html
+        // 目录：尝试 index.html（异步检查避免阻塞事件循环）
         const indexPath = path.join(fullPath, 'index.html');
-        if (fs.existsSync(indexPath)) {
-          res.sendFile(path.relative(root, indexPath), { root });
-          return;
-        }
-        return next();
+        fs.stat(indexPath, (idxErr) => {
+          if (!idxErr) {
+            res.sendFile(path.relative(root, indexPath), { root });
+            return;
+          }
+          return next();
+        });
+        return;
       }
       res.sendFile(requestPath, { root });
     });
