@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.2.3
+**文档版本**：V1.3.0
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -241,6 +241,7 @@ class Request {
 
 - `req.method`：   HTTP 请求方法
 - `req.url`：	   原始请求 URL
+- `req.originalUrl`：原始请求 URL（Express 兼容，与 req.url 等价）
 - `req.get(name)`：  获取请求头（不区分大小写，Express 兼容）
 - `req.headers`：  请求头对象
 - `req.ip`：	   客户端 IP 地址
@@ -277,11 +278,14 @@ class Request {
 | status(code) | 设置 HTTP 状态码，支持链式调用 |
 | json(data) | 输出 JSON 格式响应，自动补充对应 Content-Type |
 | send(data) | 通用输出，支持字符串、HTML、Buffer、对象；`null` 序列化为 `"null"`（Express 兼容），`undefined` 返回空响应 |
-| sendFile(path, options) | 发送本地文件，内置断点续传、缓存、Gzip 能力；options 支持 `{ root, contentType }` |
+| sendFile(path, options, [callback]) | 发送本地文件，内置断点续传、缓存、Gzip 能力；options 支持 `{ root, contentType }`；callback(err) 在完成/出错时调用 |
 | download(path, [filename], [options]) | 触发浏览器文件下载，支持断点续传；兼容 Express 签名，options 传递给 sendFile |
 | redirect([code,] url) | 重定向响应，兼容 Express 签名：`redirect(url)` 默认 302，`redirect(status, url)` 指定状态码 |
+| location(url) | 设置 Location 响应头（不发送响应，常与 send 配合） |
 | sse() | 创建 SSE 推送实例 |
 | cookie(name, value, opts) | 设置响应 Cookie |
+| append(field, value) | 追加响应头值（不覆盖已有值，适用于 Set-Cookie 等多值头） |
+| locals | 请求级数据传递对象（中间件间共享数据），初始为 `Object.create(null)` |
 
 #### sendFile 核心逻辑
 
@@ -425,6 +429,13 @@ function middleware(req, res, next) {
 #### 4.3.2 cookieParser
 
 解析请求头中的 `Cookie` 字段，格式化后存入 `req.cookies`，供业务使用。
+
+当配置了 `cookieParserSecret` 时，自动验证签名 Cookie：
+
+1. 识别 `s:` 前缀的 Cookie 值，提取签名和原始值；
+2. 使用 HMAC-SHA256 重新计算签名，与 Cookie 中的签名比对；
+3. 验证通过：将原始值存入 `req.signedCookies`，并从 `req.cookies` 中删除该键（Express 兼容行为，防止误用未验证的签名值）；
+4. 验证失败：保留在 `req.cookies` 中，不写入 `req.signedCookies`。
 
 #### 4.3.3 static
 
@@ -617,21 +628,39 @@ app.use((err, req, res, next) => {
 `httpm.js` 统一导出所有对外可用类、函数、中间件，入口如下：
 
 ```javascript
-module.exports = Object.assign(httpm, {
-  // 核心类
-  Application, Router, Request, Response,
-  SSE, WebSocket, WebSocketServer, Logger,
+// 入口函数
+function httpm(options) { return new Application(options); }
 
-  // 工具方法
-  WebSocketHandShak,
+// 导出核心类
+httpm.Application = Application;
+httpm.Router = Router;
+httpm.Request = Request;
+httpm.Response = Response;
+httpm.SSE = SSE;
+httpm.WebSocket = WebSocket;
+httpm.WebSocketServer = WebSocketServer;
+httpm.Logger = Logger;
 
-  // 内置中间件
-  bodyParser, cookieParser, static,
+// 导出内置中间件
+httpm.bodyParser = bodyParser;
+httpm.cookieParser = cookieParser;
+httpm.static = staticMiddleware;
 
-  // 通用工具函数
-  parseUrl, parseQuery, parseCookies, getMimeType,
-  fmtSize, fmtTime, isPathSafe, generateETag, parseRange, escapeHtml
-});
+// 导出工具函数
+httpm.parseUrl = parseUrl;
+httpm.parseQuery = parseQuery;
+httpm.parseCookies = parseCookies;
+httpm.getMimeType = getMimeType;
+httpm.fmtSize = fmtSize;
+httpm.fmtTime = fmtTime;
+httpm.isPathSafe = isPathSafe;
+httpm.generateETag = generateETag;
+httpm.parseRange = parseRange;
+httpm.WebSocketHandShak = WebSocketHandShak;
+httpm.escapeHtml = escapeHtml;
+httpm.version = '1.3.0';
+
+module.exports = httpm;
 ```
 
 ---
@@ -697,7 +726,7 @@ app.sse('/events', (sse, req) => {
 
 ## 12. 补充设计规则与边界约束
 
-1. **路由匹配优先级**：精准静态路由 > 动态参数路由 > ALL 通用路由 > 静态文件服务；
+1. **路由匹配优先级**：精准静态路由 > 动态参数路由 > ALL 通用路由 > 静态文件服务；同方法同级别路由按注册顺序匹配（先注册先匹配）；
 2. **API 兼容**：对齐 Express 常用语法，降低迁移成本；
 3. **文件限制**：严格执行单文件、表单字段大小限制，防护超大请求；
 4. **编码规则**：所有对外文本、HTML、JSON 默认使用 UTF-8 编码；
@@ -718,7 +747,7 @@ app.sse('/events', (sse, req) => {
 ```json
 {
   "name": "@lzpong/httpm",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
   "engines": { "node": ">=18.0.0" },

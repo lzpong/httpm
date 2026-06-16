@@ -64,7 +64,7 @@ app.delete('/users/:id', (req, res) => res.json({ deleted: true }));
 app.all('/any', (req, res) => res.json({ method: req.method }));
 ```
 
-路由匹配优先级：精准静态路由 > 动态参数路由 > ALL 通用路由 > 静态文件服务。
+路由匹配优先级：精准静态路由 > 动态参数路由 > ALL 通用路由 > 静态文件服务。同方法同级别路由按注册顺序匹配（先注册先匹配）。
 
 - **HEAD 请求**：自动匹配 GET 路由，仅返回响应头（Express 兼容）
 - **OPTIONS 请求**：自动返回 `Allow` 头和 CORS 预检响应，动态查询该路径支持的方法
@@ -117,6 +117,7 @@ app.use((err, req, res, next) => {
 | `req.method` | 请求方法 |
 | `req.path` | 请求路径 |
 | `req.url` | 完整请求 URL |
+| `req.originalUrl` | 原始请求 URL（Express 兼容，与 req.url 等价） |
 | `req.query` | Query 参数对象 |
 | `req.params` | 路由参数对象 |
 | `req.body` | 请求体（JSON/URL-encoded 自动解析） |
@@ -136,15 +137,18 @@ app.use((err, req, res, next) => {
 | `res.status(code)` | 设置状态码，链式调用 |
 | `res.json(obj)` | 发送 JSON 响应 |
 | `res.send(data)` | 发送响应（自动识别类型；`null`→`"null"`，`undefined`→空响应） |
-| `res.sendFile(path, opts)` | 发送文件，opts 支持 `{ root, contentType }` |
+| `res.sendFile(path, opts, [callback])` | 发送文件，opts 支持 `{ root, contentType }`；callback(err) 在完成/出错时调用 |
 | `res.download(path, [name], [opts])` | 下载文件，兼容 Express 签名：opts 传递给 sendFile |
 | `res.redirect([code,] url)` | 重定向，兼容 Express 签名：`redirect(url)` 默认 302，`redirect(status, url)` 指定状态码 |
+| `res.location(url)` | 设置 Location 响应头（不发送响应，常与 send 配合） |
 | `res.cookie(name, value, opts)` | 设置 Cookie |
 | `res.clearCookie(name, opts)` | 清除 Cookie |
 | `res.set(name, value)` / `res.setHeader()` | 设置响应头（set 支持对象批量；setHeader 为底层方法，功能相同） |
 | `res.get(name)` / `res.getHeader()` | 获取响应头（get 为 Express 兼容方法，功能相同） |
+| `res.append(field, value)` | 追加响应头值（不覆盖已有值，适用于多值头） |
 | `res.removeHeader(name)` | 移除已设置的响应头 |
 | `res.type(type)` | 设置 Content-Type（支持简写：html→text/html） |
+| `res.locals` | 请求级数据传递对象（中间件间共享数据） |
 | `res.on(event, fn)` | 监听响应事件（finish/close 等） |
 | `res.sse()` | 创建 SSE 实例 |
 
@@ -157,7 +161,7 @@ const app = httpm({ cookieParserSecret: 'your-secret' });
 res.cookie('token', 'abc123', { signed: true });
 
 // 读取时自动验证签名
-req.cookies.token; // 'abc123'（签名验证通过）
+req.signedCookies.token; // 'abc123'（签名验证通过，已从 req.cookies 移除）
 ```
 
 ## 静态文件服务

@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.2.3
+ * @version     1.3.0
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -515,6 +515,7 @@ class Request {
     this.params = {};
     this.body = null;
     this.cookies = {};
+    this.signedCookies = {};
     this.files = [];
     this.path = '';
     this.formData = {
@@ -529,6 +530,8 @@ class Request {
   // 通用快捷属性代理
   get method() { return this._req.method; }
   get url() { return this._req.url; }
+  // Express 兼容：originalUrl 保留原始 URL（与 url 等价，httpm 中间件不修改 url）
+  get originalUrl() { return this._req.url; }
   get headers() { return this._req.headers; }
   get ip() {
     // 优先取代理头
@@ -613,6 +616,8 @@ class Response {
     this._headersSent = false;
     this._isHead = false;
     this._sse = null;
+    // Express 兼容：请求级数据传递，中间件间共享数据
+    this.locals = Object.create(null);
   }
 
   // 代理原生响应方法
@@ -634,6 +639,15 @@ class Response {
   }
 
   /**
+   * 设置 Location 响应头（Express 兼容）
+   * 仅设置头部，不发送响应，常与 res.send() 配合使用
+   */
+  location(url) {
+    this.setHeader('Location', url);
+    return this;
+  }
+
+  /**
    * 设置响应头（Express 兼容），支持单键和对象批量设置
    * res.set('Content-Type', 'text/html')
    * res.set({ 'Content-Type': 'text/html', 'X-Custom': 'value' })
@@ -645,6 +659,28 @@ class Response {
       }
     } else {
       this._res.setHeader(name, value);
+    }
+    return this;
+  }
+
+  /**
+   * 追加响应头值（Express 兼容），不覆盖已有值
+   * 适用于 Set-Cookie、Link 等多值头场景
+   */
+  append(field, value) {
+    const prev = this.getHeader(field);
+    if (prev) {
+      // 已有值：合并为数组
+      const vals = Array.isArray(prev) ? prev : [prev];
+      // Express 兼容：value 为数组时展开合并
+      if (Array.isArray(value)) {
+        vals.push(...value);
+      } else {
+        vals.push(value);
+      }
+      this.setHeader(field, vals);
+    } else {
+      this.setHeader(field, value);
     }
     return this;
   }
@@ -760,14 +796,29 @@ class Response {
 
   /**
    * 发送本地文件，内置断点续传、缓存、Gzip 能力
+   * Express 兼容签名：sendFile(path), sendFile(path, options), sendFile(path, options, callback), sendFile(path, callback)
+   * callback(err) 在发送完成或出错时调用
    */
-  sendFile(filePath, options = {}) {
+  sendFile(filePath, options, callback) {
+    // 参数归一化：支持 sendFile(path, callback) 形式
+    if (typeof options === 'function') {
+      callback = options;
+      options = {};
+    }
+    options = options || {};
+    const done = typeof callback === 'function' ? callback : null;
+    // 防止回调被多次调用（finish 和 error 可能先后触发）
+    let doneCalled = false;
+    const doneOnce = (err) => {
+      if (done && !doneCalled) { doneCalled = true; done(err); }
+    };
     const root = options.root || this._app.settings.rootPath || process.cwd();
     const fullPath = path.resolve(root, filePath);
 
     fs.stat(fullPath, (err, stat) => {
       if (err || !stat.isFile()) {
         this.status(404).send('Not Found');
+        doneOnce(err || new Error('Not a file'));
         return;
       }
 
@@ -797,6 +848,7 @@ class Response {
           this.removeHeader('Content-Length');
           this._res.statusCode = 304;
           this._res.end();
+          doneOnce(null);
           return;
         }
       }
@@ -809,7 +861,7 @@ class Response {
           this.status(206);
           this.setHeader('Content-Range', `bytes ${range.start}-${range.end}/${range.total}`);
           this.setHeader('Content-Length', range.end - range.start + 1);
-          this._streamFile(fullPath, range.start, range.end);
+          this._streamFile(fullPath, range.start, range.end, doneOnce);
           return;
         }
       }
@@ -822,6 +874,7 @@ class Response {
         // HEAD 请求不传输内容
         if (this._isHead) {
           this._send('');
+          doneOnce(null);
           return;
         }
         this.removeHeader('Content-Length');
@@ -831,34 +884,46 @@ class Response {
         const raw = fs.createReadStream(fullPath);
         const gzip = zlib.createGzip();
         // 流错误处理：文件读取或压缩出错时返回 500
-        const onError = (err) => {
+        const onError = (streamErr) => {
           raw.destroy();
           gzip.destroy();
           if (!this._res.finished) {
             this._res.statusCode = 500;
             this._res.end('Internal Server Error');
           }
+          doneOnce(streamErr);
         };
         raw.on('error', onError);
         gzip.on('error', onError);
+        // 流完成时回调
+        this._res.on('finish', () => doneOnce(null));
         raw.pipe(gzip).pipe(this._res);
         return;
       }
 
-      this._streamFile(fullPath, 0, stat.size - 1);
+      this._streamFile(fullPath, 0, stat.size - 1, doneOnce);
     });
   }
 
   /**
    * 流式发送文件
    */
-  _streamFile(fullPath, start, end) {
-    if (this._res.finished) return;
+  _streamFile(fullPath, start, end, callback) {
+    // 防止回调被多次调用
+    let called = false;
+    const done = (err) => {
+      if (callback && !called) { called = true; callback(err); }
+    };
+    if (this._res.finished) {
+      done(null);
+      return;
+    }
     this._res.statusCode = this.statusCode;
     this._headersSent = true;
     // HEAD 请求只发送头部，不传输文件内容
     if (this._isHead) {
       this._res.end();
+      done(null);
       return;
     }
     const stream = fs.createReadStream(fullPath, { start, end });
@@ -869,7 +934,10 @@ class Response {
         this._res.statusCode = 500;
         this._res.end('Internal Server Error');
       }
+      done(err);
     });
+    // 流完成时回调
+    this._res.on('finish', () => done(null));
     stream.pipe(this._res);
   }
 
@@ -1902,14 +1970,12 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
 }
 
 /**
- * 清理临时文件
+ * 异步清理临时文件，避免阻塞事件循环
  */
 function _cleanupTempFiles(files) {
   if (!files || files.length === 0) return;
   files.forEach(f => {
-    try {
-      if (fs.existsSync(f)) fs.unlinkSync(f);
-    } catch (e) { /* 忽略清理失败 */ }
+    fs.unlink(f, () => { /* 忽略清理失败 */ });
   });
 }
 
@@ -1942,6 +2008,8 @@ function cookieParser(secret) {
             const expected = crypto.createHmac('sha256', secret).update(rawValue).digest('base64').replace(/=+$/, '');
             if (sig === expected) {
               req.signedCookies[key] = rawValue;
+              // Express 兼容：验证通过后从 req.cookies 中删除，防止误用未验证的签名值
+              delete req.cookies[key];
             }
           }
         }
@@ -2651,6 +2719,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
+httpm.version = '1.3.0';
 
 /**
  * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）
