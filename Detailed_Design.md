@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.3.2
+**文档版本**：V1.3.3
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -186,7 +186,12 @@ class Router {
 1. 遍历路径，匹配 `:参数名` 占位符；
 2. 收集所有参数名存入 `params` 数组；
 3. 将占位符替换为正则捕获组 `([^/]+)`；
-4. 生成完整正则对象用于路径匹配。
+4. 生成完整正则对象用于路径匹配；
+5. 同时生成 `prefixPattern`（前缀匹配正则，供路径级中间件使用）：路径之后必须跟随 `/` 或字符串结尾（`(?=/|$)`）作为边界，避免 `/api` 误匹配 `/apixyz`；`/` 特殊处理为 `/^\//`，匹配所有以 `/` 开头的路径（根路径中间件等价于应用级中间件）。
+
+#### 参数传递语义（_dispatch）
+
+中间件链与路由处理器执行时，**每个 layer 执行前重置 `req.params` 为该 layer 自己的参数**（与 Express 行为一致），避免路径级中间件参数（如 `use('/api/:version')` 的 `version`）污染到路由处理器。路由处理器若需读取路径级中间件设置的参数，应在中间件中挂到 `req` 自定义属性上（如 `req._mwVer = req.params.version`），不要依赖 `req.params` 跨 layer 传递。
 
 #### HEAD 请求匹配
 
@@ -251,8 +256,8 @@ class Request {
 - `req.originalUrl`：原始请求 URL（Express 兼容，与 req.url 等价）
 - `req.get(name)`：  获取请求头（不区分大小写，Express 兼容）
 - `req.headers`：  请求头对象
-- `req.ip`：	   客户端 IP 地址
-- `req.hostname`： 请求域名
+- `req.ip`：	   客户端 IP 地址；仅在 `trustProxy=true` 时信任 `X-Forwarded-For`，默认取 `socket.remoteAddress`（防止客户端伪造）
+- `req.hostname`： 请求域名；`trustProxy=true` 时优先取 `X-Forwarded-Host`，默认取 `Host` 头
 - `req.protocol`： 当前协议（http /https）
 - `req.files`：	   上传文件数组（兼容旧版，可以使用 `req.formData.files`）
 
@@ -335,7 +340,7 @@ class Request {
 
 1. 核心属性：原生 socket、连接路径、唯一 ID、连接状态（connected / _closing / _closed）、心跳时间戳；
 2. `send(data)` 方法：自动区分文本、JSON 对象、二进制 Buffer，匹配对应帧类型；
-3. `close(code, reason)` 方法：先发送 Close 帧（此时 connected 仍为 true），再标记 connected=false、_closing=true，限时 2 秒等待对端 Close 帧，超时则强制销毁 socket；
+3. `close(code = 1000, reason = '')` 方法：先发送 Close 帧（此时 connected 仍为 true），再标记 connected=false、_closing=true，限时 2 秒等待对端 Close 帧，超时则强制销毁 socket 并触发 `close` 事件携带原始 code/reason；
 4. Close 帧状态码：对端发送无状态码的 Close 帧时，默认为 1005（RFC 6455 规定的"无状态码"语义码），非法状态码（0-999）自动修正为 1005；
 5. RFC 6455 Section 7.4.1 规定：1005（无状态码）和 1006（异常关闭）不得在 Close 帧中发送，httpm 在回复 Close 帧时会自动将这两种状态码替换为不携带状态码的 Close 帧；
 6. 关闭握手期间（_closing=true）：忽略非控制帧，仅处理 Ping/Pong/Close 帧；

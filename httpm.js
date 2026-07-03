@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.3.2
+ * @version     1.3.3
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -40,8 +40,10 @@ const util = require('util');
 
 /**
  * 解析 URL，拆分路径与 Query 参数
+ * 非字符串输入返回空 pathname + 空 query，避免抛异常（导出函数需防御）
  */
 function parseUrl(urlStr) {
+  if (!urlStr || typeof urlStr !== 'string') return { pathname: '', query: {} };
   const hashIdx = urlStr.indexOf('#');
   if (hashIdx !== -1) {
     urlStr = urlStr.substring(0, hashIdx);
@@ -372,8 +374,17 @@ class Logger {
     const timestamp = this._formatTime(new Date());
     const color = this._colors[level] || '';
     const levelTag = level.toUpperCase().padEnd(6);
-    // 对象类参数用 util.inspect 格式化，避免输出 [object Object]
-    const formatted = args.map(a => (typeof a === 'object' && a !== null ? util.inspect(a) : a));
+    // Error 对象特殊处理：输出 message + stack，比 util.inspect 更清晰
+    // 普通对象用 util.inspect 格式化，避免输出 [object Object]
+    const formatted = args.map(a => {
+      if (a instanceof Error) {
+        return a.stack || (a.name + ': ' + a.message);
+      }
+      if (typeof a === 'object' && a !== null) {
+        return util.inspect(a);
+      }
+      return a;
+    });
     const msg = `[${timestamp}] [${levelTag}] ${formatted.join(' ')}`;
 
     // 控制台彩色输出
@@ -571,12 +582,22 @@ class Request {
   get originalUrl() { return this._req.url; }
   get headers() { return this._req.headers; }
   get ip() {
-    // 优先取代理头
-    const fwd = this._req.headers['x-forwarded-for'];
-    if (fwd) return fwd.split(',')[0].trim();
+    // 仅在 trustProxy=true 时信任 X-Forwarded-For（默认 false，防止客户端伪造 IP）
+    // 反向代理场景需手动开启：httpm({ trustProxy: true })
+    if (this._app?.settings?.trustProxy) {
+      const fwd = this._req.headers['x-forwarded-for'];
+      if (fwd) return fwd.split(',')[0].trim();
+    }
     return this._req.socket?.remoteAddress || '';
   }
-  get hostname() { return this._req.headers['host']?.split(':')[0] || ''; }
+  get hostname() {
+    // trustProxy=true 时优先取 X-Forwarded-Host（反向代理后的真实主机名）
+    if (this._app?.settings?.trustProxy) {
+      const fwh = this._req.headers['x-forwarded-host'];
+      if (fwh) return fwh.split(':')[0];
+    }
+    return this._req.headers['host']?.split(':')[0] || '';
+  }
   get protocol() {
     return (this._req.socket?.encrypted || this._req.connection?.encrypted) ? 'https' : 'http';
   }
@@ -769,9 +790,24 @@ class Response {
 
   /**
    * 输出 JSON 格式响应
+   * 序列化失败（如循环引用）时返回 500，避免异常冒泡暴露内部细节
    */
   json(data) {
-    const body = JSON.stringify(data);
+    let body;
+    try {
+      body = JSON.stringify(data);
+    } catch (e) {
+      // 序列化失败（如循环引用、BigInt 等）：记录日志并返回 500 友好响应
+      // 注意：不能递归调用 this.json，否则再次抛异常；直接用 _send 输出固定错误体
+      // 传 Error 对象给 Logger，会输出 message + stack，便于定位序列化失败原因
+      try { this._app?._logger?.error('JSON.stringify failed:', e); } catch (logErr) { /* 忽略日志失败 */ }
+      this.status(500);
+      this.setHeader('Content-Type', 'application/json; charset=utf-8');
+      const errBody = '{"error":"Response serialization failed","status":500}';
+      this.setHeader('Content-Length', Buffer.byteLength(errBody));
+      this._send(errBody);
+      return;
+    }
     this.setHeader('Content-Type', 'application/json; charset=utf-8');
     this.setHeader('Content-Length', Buffer.byteLength(body));
     this._send(body);
@@ -1007,17 +1043,24 @@ class Response {
 
   /**
    * 重定向响应（兼容 Express: redirect(status, url) 或 redirect(url)）
+   * url='back' 时取 Referrer 头回退到上一页，无 Referrer 时回退到 '/'
    */
   redirect(...args) {
+    let url;
     if (typeof args[0] === 'number') {
       // redirect(status, url)
       this.status(args[0]);
-      this.setHeader('Location', args[1]);
+      url = args[1];
     } else {
       // redirect(url) 默认 302
       this.status(302);
-      this.setHeader('Location', args[0]);
+      url = args[0];
     }
+    // Express 兼容：'back' 特殊值回退到 Referer
+    if (url === 'back') {
+      url = this._req?.headers?.['referer'] || this._req?.headers?.['referrer'] || '/';
+    }
+    this.setHeader('Location', url);
     this.setHeader('Content-Length', 0);
     this._send('');
   }
@@ -1054,7 +1097,14 @@ class Response {
     if (opts.path) str += `; Path=${opts.path}`;
     if (opts.secure) str += '; Secure';
     if (opts.httpOnly) str += '; HttpOnly';
-    if (opts.sameSite) str += `; SameSite=${opts.sameSite}`;
+    if (opts.sameSite) {
+      // SameSite=None 必须配合 Secure，否则浏览器会拒绝该 Cookie（Chrome 80+ 强制）
+      // 此处仅记录警告日志，不强制阻断，保持调用方灵活性
+      if (String(opts.sameSite).toLowerCase() === 'none' && !opts.secure) {
+        this._app?._logger?.warn('[Cookie] SameSite=None without Secure may be rejected by browser');
+      }
+      str += `; SameSite=${opts.sameSite}`;
+    }
     const existing = this.getHeader('Set-Cookie');
     const cookies = existing ? (Array.isArray(existing) ? existing : [existing]) : [];
     cookies.push(str);
@@ -1064,9 +1114,10 @@ class Response {
 
   /**
    * 清除 Cookie
+   * 同时设置 maxAge=0 和 expires=epoch（1970-01-01），兼容不支持 Max-Age 的旧浏览器
    */
   clearCookie(name, opts = {}) {
-    this.cookie(name, '', { ...opts, maxAge: 0 });
+    this.cookie(name, '', { ...opts, maxAge: 0, expires: new Date(0) });
     return this;
   }
 }
@@ -1082,12 +1133,13 @@ class SSE {
 
     // 设置 SSE 标准响应头（仅在 headers 未发送时）
     // 沿用 res 当前状态码（默认 200），避免覆盖用户主动设置的状态码
+    // CORS 头由 _applyCORSHeaders 在 _handleRequest 中统一设置，此处不硬编码 ACAO
+    // 避免覆盖用户的 cors.origin 配置（如 credentials=true 场景）
     if (!res.headersSent) {
       res.writeHead(res.statusCode || 200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'Access-Control-Allow-Origin': '*'
+        'Connection': 'keep-alive'
       });
     }
 
@@ -1468,10 +1520,10 @@ class WebSocket {
 
   /**
    * 关闭连接（限时等待对端 Close 帧完成握手）
-   * @param {number} [code] 关闭状态码（RFC 6455 Section 7.4）
-   * @param {string} [reason] 关闭原因
+   * @param {number} [code=1000] 关闭状态码（RFC 6455 Section 7.4），默认 1000 正常关闭
+   * @param {string} [reason=''] 关闭原因
    */
-  close(code, reason) {
+  close(code = 1000, reason = '') {
     if (this._closed) return;
     // 重要：必须先发送 Close 帧再设 connected=false
     // _sendFrame 内部检查 this.connected，若先断开则 Close 帧无法发出
@@ -1482,10 +1534,13 @@ class WebSocket {
     // 限时等待对端 Close 帧（2秒超时）
     this._closeTimer = setTimeout(() => {
       this._closeTimer = null;
-      // 先标记已关闭，防止 socket.destroy 触发 close 事件时重复 _emitClose
+      // 超时强制关闭：直接 emit close 事件携带原始 code/reason
+      // 注意：不能调用 _emitClose（其首行 if(this._closed) return 会因下方置位而失效）
+      // 也不能让 socket 'close' 事件的无参 _emitClose 覆盖掉 code/reason
+      if (this._closed) return;
       this._closed = true;
       try { this.socket.destroy(); } catch (e) { /* 忽略 */ }
-      this._emitClose(code, reason);
+      this._emit('close', code, reason);
     }, 2000);
   }
 
@@ -1833,12 +1888,24 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
   let cleanupOnError = false;
   let paused = false;
 
+  // 统一防护：任何错误分支调用 next 后，终止请求流并阻止后续 next 重复调用
+  // 场景：fieldSize 超限后仅 return 退出 processBuffer，但 req 'data' 事件会继续触发
+  //       再次进入 processBuffer 重新触发错误分支，导致 next 被多次调用
+  let nextCalled = false;
+  const safeNext = (e) => {
+    if (nextCalled) return;
+    nextCalled = true;
+    // 终止请求流，避免客户端继续发送数据触发后续处理
+    try { req._req.destroy(); } catch (err) { /* 忽略 */ }
+    next(e);
+  };
+
   // 确保临时目录存在（recursive: true 时目录已存在不报错，无需 existsSync）
   try {
     fs.mkdirSync(tempDir, { recursive: true });
   } catch (e) {
     // 临时目录创建失败（权限不足/路径非法等）直接终止解析
-    next(e);
+    safeNext(e);
     return;
   }
 
@@ -1861,7 +1928,7 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
       streamErrored = true;
       if (currentFile.stream) currentFile.stream.destroy();
       _cleanupTempFiles(req._tempFiles);
-      next(streamErr);
+      safeNext(streamErr);
     });
     currentFile.stream = stream;
     return stream;
@@ -1935,7 +2002,7 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
           if (fieldSize > maxFieldSize) {
             const err = new Error(`Field exceeds maximum size of ${fmtSize(maxFieldSize)}`, { cause: { actual: fieldSize, maxSize: maxFieldSize } });
             err.status = 413;
-            next(err);
+            safeNext(err);
             return;
           }
           currentField.value += chunk;
@@ -1948,9 +2015,9 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
         if (fieldSize > maxFieldSize) {
           const err = new Error(`Field exceeds maximum size of ${fmtSize(maxFieldSize)}`, { cause: { actual: fieldSize, maxSize: maxFieldSize } });
           err.status = 413;
-          next(err);
-          return;
-        }
+          safeNext(err);
+            return;
+          }
         currentField.value += chunk;
         // 去掉末尾的 \r\n
         if (currentField.value.endsWith('\r\n')) {
@@ -1991,7 +2058,7 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
             if (currentFile.stream) currentFile.stream.destroy();
             const err = new Error(`File exceeds maximum size of ${fmtSize(maxFileSize)}`, { cause: { actual: fileSize, maxSize: maxFileSize, filename: currentFile.filename } });
             err.status = 413;
-            next(err);
+            safeNext(err);
             return;
           }
           buffer = buffer.subarray(safeLen);
@@ -2045,8 +2112,16 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
   });
 
   req._req.on('end', () => {
+    // error 已触发 safeNext 时跳过，避免正常流程在错误后继续执行
+    if (nextCalled) return;
     // 处理剩余缓冲区
     processBuffer();
+    // 状态校验：请求结束时若仍在 BODY_FILE（文件字段未正常结束），
+    // 说明客户端中途断开或畸形请求，需关闭未完成的文件流并清理临时文件
+    if (state === 'BODY_FILE') {
+      if (currentFile.stream) currentFile.stream.destroy();
+      _cleanupTempFiles(req._tempFiles);
+    }
     req.body = req.formData.fields;
     next();
   });
@@ -2057,7 +2132,7 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
       currentFile.stream.destroy();
     }
     _cleanupTempFiles(req._tempFiles);
-    next(err);
+    safeNext(err);
   });
 }
 
@@ -2155,11 +2230,12 @@ class Application extends Router {
   }
 
   /**
-   * 获取配置（当参数为字符串且非路由路径时）或注册 GET 路由
+   * 获取配置（当参数为非路径字符串时）或注册 GET 路由
+   * Express 兼容：app.get('key') 获取配置，app.get('/path', handler) 注册路由
+   * 判定规则：单参数且字符串不以 '/' 开头 → 获取配置；否则 → 注册路由
    */
   get(...args) {
-    // 单个字符串参数且不是路径格式 → 获取配置
-    if (args.length === 1 && typeof args[0] === 'string') {
+    if (args.length === 1 && typeof args[0] === 'string' && !args[0].startsWith('/')) {
       return this.settings[args[0]];
     }
     // 否则调用 Router 的 get 方法注册路由
@@ -2239,14 +2315,31 @@ class Application extends Router {
    */
   close(callback) {
     if (this._wss) {
-      // 关闭所有 WebSocket 连接
+      // 关闭所有 WebSocket 连接，并强制销毁底层 socket，确保连接不泄漏
       for (const ws of this._wss.connections.values()) {
         ws.close();
+        // ws.close() 依赖对端回复 Close 帧或 2 秒超时，直接强制销毁 socket 加速关闭
+        try { ws.socket && ws.socket.destroy(); } catch (e) { /* 忽略销毁错误 */ }
       }
       this._wss._stopHeartbeat();
     }
     if (this.server) {
-      this.server.close(callback);
+      // 强制关闭所有现有 HTTP 连接（含 keep-alive 空闲连接），
+      // 避免 server.close() 等待 keepAliveTimeout 导致关闭延迟（Node.js 18.2+）
+      if (typeof this.server.closeAllConnections === 'function') {
+        this.server.closeAllConnections();
+      }
+      // 超时兜底：极少数情况下 socket 未被 closeAllConnections 关闭，
+      // server.close 回调会无限等待，2 秒超时强制完成关闭
+      let called = false;
+      const done = () => {
+        if (called) return;
+        called = true;
+        clearTimeout(timer);
+        if (callback) callback();
+      };
+      this.server.close(done);
+      const timer = setTimeout(done, 2000);
     } else if (callback) {
       callback();
     }
@@ -2256,34 +2349,43 @@ class Application extends Router {
    * 处理 HTTP 请求（核心入口）
    */
   _handleRequest(incomingMessage, serverResponse) {
-    const req = new Request(incomingMessage);
-    const res = new Response(serverResponse, this);
-    req._app = this;
-    req._res = res;
-    res._req = req;
-
-    // 基础解析
-    const parsed = parseUrl(incomingMessage.url);
     try {
-      req.path = decodeURIComponent(parsed.pathname);
-    } catch (e) {
-      // 非法 URI 编码，返回 400
-      res.status(400).send('Bad Request: Invalid URI encoding');
-      return;
+      const req = new Request(incomingMessage);
+      const res = new Response(serverResponse, this);
+      req._app = this;
+      req._res = res;
+      res._req = req;
+
+      // 基础解析
+      const parsed = parseUrl(incomingMessage.url);
+      try {
+        req.path = decodeURIComponent(parsed.pathname);
+      } catch (e) {
+        // 非法 URI 编码，返回 400
+        res.status(400).send('Bad Request: Invalid URI encoding');
+        return;
+      }
+      req.query = parsed.query;
+      // Cookie 由 cookieParser 中间件统一解析，此处不再重复处理
+
+      // HEAD 请求标记：执行路由处理器但丢弃响应体
+      if (req.method === 'HEAD') {
+        res._isHead = true;
+      }
+
+      // 为所有跨域请求设置基础 CORS 响应头（实际请求 + 预检均需要）
+      this._applyCORSHeaders(req, res);
+
+      // 构建中间件 + 路由处理器执行链
+      this._dispatch(req, res);
+    } catch (err) {
+      // 顶层兜底：parseUrl / new Request / new Response 等抛异常时防止冒泡到 http server 导致进程崩溃
+      this._logger.error('Unhandled request error:', err);
+      if (!serverResponse.headersSent) {
+        serverResponse.statusCode = 500;
+        serverResponse.end('Internal Server Error');
+      }
     }
-    req.query = parsed.query;
-    // Cookie 由 cookieParser 中间件统一解析，此处不再重复处理
-
-    // HEAD 请求标记：执行路由处理器但丢弃响应体
-    if (req.method === 'HEAD') {
-      res._isHead = true;
-    }
-
-    // 为所有跨域请求设置基础 CORS 响应头（实际请求 + 预检均需要）
-    this._applyCORSHeaders(req, res);
-
-    // 构建中间件 + 路由处理器执行链
-    this._dispatch(req, res);
   }
 
   /**
@@ -2303,9 +2405,10 @@ class Application extends Router {
     }
 
     // 2. 路由处理器
+    // 注意：路由参数不在收集阶段合并到 req.params，而是在执行阶段按 layer 重置
+    // 这样每个 layer 执行时 req.params 仅含该 layer 自己的参数，避免相互污染（与 Express 行为一致）
     const routeMatches = this.match(req.method, req.path);
     for (const match of routeMatches) {
-      Object.assign(req.params, match.params);
       for (const handler of match.handlers) {
         stack.push({ handler, params: match.params });
       }
@@ -2328,9 +2431,10 @@ class Application extends Router {
 
       const item = stack[idx++];
       const handler = item.handler;
-      // 将当前 layer 的参数合并到 req.params（路径级中间件 / 路由参数均通过此方式传递）
-      // 注意：路由参数已在收集阶段 Object.assign 到 req.params，此处保证中间件参数同样可见
-      if (item.params) Object.assign(req.params, item.params);
+      // 每个 layer 执行前重置 req.params 为该 layer 自己的参数（与 Express 行为一致）
+      // 避免中间件参数（如 use('/api/:version') 的 version）污染到路由处理器
+      // 路由处理器若需读取路径级中间件设置的参数，应在中间件中挂到 req 自定义属性上
+      req.params = item.params || {};
       // 防止同一 handler 多次调用 next()
       let handlerCalledNext = false;
       const safeNext = (e) => {
@@ -2442,9 +2546,10 @@ class Application extends Router {
     }
     if (origin) {
       res.setHeader('Access-Control-Allow-Origin', origin);
-      // 当 origin 为具体域名（非 *）时，回显 Vary: Origin
+      // 当 origin 为具体域名（非 *）时，追加 Vary: Origin
+      // 使用 append 而非 setHeader，避免覆盖已设置的 Vary 头（如 Accept-Encoding）
       if (origin !== '*') {
-        res.setHeader('Vary', 'Origin');
+        res.append('Vary', 'Origin');
       }
     }
     if (cors.credentials) {
@@ -2458,7 +2563,9 @@ class Application extends Router {
   _handleCORS(req, res) {
     const cors = this.settings.cors;
     if (!cors) {
-      res.status(204)._send('');
+      // 未配置 CORS 时，OPTIONS 仍需返回 Allow 头告知客户端支持的方法（RFC 7231）
+      const allowed = this._getAllowedMethods(req.path);
+      res.set('Allow', allowed.join(', ')).status(204)._send('');
       return;
     }
     // 基础 CORS 头（Allow-Origin/Credentials/Vary）已在 _handleRequest 中通过 _applyCORSHeaders 设置
@@ -2779,6 +2886,10 @@ const defaultConfig = {
   https: null,
   http2: false,
 
+  // 是否信任反向代理头（X-Forwarded-For/X-Forwarded-Host），默认 false 安全优先
+  // 反向代理部署时设为 true 才能获取真实客户端 IP/主机名
+  trustProxy: false,
+
   logLevel: 'info',
   logDir: './log',
   // 日志写入失败（磁盘满/权限等）时是否退出进程：false=仅控制台打印（默认），true=退出进程
@@ -2872,7 +2983,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.3.2';
+httpm.version = '1.3.3';
 
 /**
  * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）

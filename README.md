@@ -139,10 +139,10 @@ app.use((err, req, res, next) => {
 | `res.send(data)` | 发送响应（自动识别类型；`null`→`"null"`，`undefined`→空响应） |
 | `res.sendFile(path, opts, [callback])` | 发送文件，opts 支持 `{ root, contentType }`；callback(err) 在完成/出错时调用 |
 | `res.download(path, [name], [opts])` | 下载文件，兼容 Express 签名：opts 传递给 sendFile |
-| `res.redirect([code,] url)` | 重定向，兼容 Express 签名：`redirect(url)` 默认 302，`redirect(status, url)` 指定状态码 |
+| `res.redirect([code,] url)` | 重定向，兼容 Express 签名：`redirect(url)` 默认 302，`redirect(status, url)` 指定状态码；url='back' 时取 Referer 回退到上一页 |
 | `res.location(url)` | 设置 Location 响应头（不发送响应，常与 send 配合） |
-| `res.cookie(name, value, opts)` | 设置 Cookie，opts 支持 `maxAge`（单位秒，直接写入 Max-Age）、`expires`（Date 对象）、`domain`、`path`、`secure`、`httpOnly`、`sameSite`、`signed` |
-| `res.clearCookie(name, opts)` | 清除 Cookie |
+| `res.cookie(name, value, opts)` | 设置 Cookie，opts 支持 `maxAge`（单位秒，直接写入 Max-Age）、`expires`（Date 对象）、`domain`、`path`、`secure`、`httpOnly`、`sameSite`、`signed`；`sameSite=None` 需配 `secure`，否则记录警告 |
+| `res.clearCookie(name, opts)` | 清除 Cookie，同时设置 `maxAge=0` 和 `expires=epoch`（1970-01-01），兼容不支持 Max-Age 的旧浏览器 |
 | `res.set(name, value)` / `res.setHeader()` | 设置响应头（set 支持对象批量；setHeader 为底层方法，功能相同） |
 | `res.get(name)` / `res.getHeader()` | 获取响应头（get 为 Express 兼容方法，功能相同） |
 | `res.append(field, value)` | 追加响应头值（不覆盖已有值，适用于多值头） |
@@ -194,6 +194,11 @@ app.use(httpm.static('./public'));
 // 允许访问隐藏文件
 app.use(httpm.static('./public', { allowAccessToAllFiles: true }));
 ```
+
+> **`httpm.static` 与内置 `_serveStatic` 的差异**：
+> - `httpm.static(root, opts)` 是中间件形式，目录无 `index.html` 时调用 `next()` 交给后续路由/中间件，不展示目录列表；
+> - 内置 `_serveStatic`（由 `app` 配置 `rootPath`/`showDir` 触发）是兜底处理，目录无 `index.html` 时根据 `showDir` 展示目录列表或返回 404。
+> - 中间件形式适合组合式路由栈；兜底形式适合纯静态服务器。
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
@@ -403,6 +408,7 @@ const app = httpm({ svrPort: 3000 }); // svrPort=3000, enableGzip=true(来自app
 | `keepAliveTimeout` | `65000` | Keep-Alive 超时（ms） |
 | `https` | `null` | HTTPS 配置（cert/key） |
 | `http2` | `false` | 启用 HTTP/2 |
+| `trustProxy` | `false` | 是否信任反向代理头（X-Forwarded-For / X-Forwarded-Host）。默认 `false` 安全优先，反向代理部署时设为 `true` 才能获取真实客户端 IP/主机名 |
 | `logLevel` | `'info'` | 日志级别 |
 | `logDir` | `'./log'` | 日志文件目录 |
 | `exitOnDiskFull` | `false` | 日志写入失败时是否退出进程（false=仅控制台打印，true=退出） |
