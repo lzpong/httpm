@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.3.1
+ * @version     1.3.2
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -32,6 +32,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const zlib = require('zlib');
+const util = require('util');
 
 // ============================================================
 // 工具函数层
@@ -91,6 +92,8 @@ function parseCookies(cookieStr) {
     const eIdx = pair.indexOf('=');
     if (eIdx === -1) return;
     const key = pair.substring(0, eIdx).trim();
+    // 过滤空键（如 "=value" 形式），避免污染 cookies 对象
+    if (!key) return;
     const val = pair.substring(eIdx + 1).trim();
     cookies[key] = val;
   });
@@ -101,6 +104,8 @@ function parseCookies(cookieStr) {
  * HTML 实体转义，防止 XSS
  */
 function escapeHtml(str) {
+  // 非字符串入参先做 String 转换，避免 null/undefined 触发 TypeError
+  str = str == null ? '' : String(str);
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
@@ -169,13 +174,15 @@ function getMimeType(ext) {
 }
 
 /**
- * 字节单位格式化（B/KB/MB/GB）
+ * 字节单位格式化（B/KB/MB/GB/TB/PB）
  */
 function fmtSize(bytes) {
   if (!Number.isFinite(bytes) || bytes < 0) return '0B';
   if (bytes === 0) return '0B';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  // 补充 PB 单位，避免 PB 级字节越界返回 undefined
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  // 限制 i 上限，超过 units 范围时沿用最大单位（PB）
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   const value = bytes / (1024 ** i);
   // 小于 10 时保留 2 位小数，否则保留 1 位，整数不显示小数
   const formatted = value < 10 ? value.toFixed(2) : (value === Math.floor(value) ? value.toString() : value.toFixed(1));
@@ -183,12 +190,13 @@ function fmtSize(bytes) {
 }
 
 /**
- * 毫秒时间格式化（ms/s/m）
+ * 毫秒时间格式化（ms/s/m/h）
  */
 function fmtTime(ms) {
   if (ms < 1000) return ms.toFixed(0) + 'ms';
   if (ms < 60000) return (ms / 1000).toFixed(2) + 's';
-  return (ms / 60000).toFixed(2) + 'm';
+  if (ms < 3600000) return (ms / 60000).toFixed(2) + 'm';
+  return (ms / 3600000).toFixed(2) + 'h';
 }
 
 /**
@@ -364,7 +372,9 @@ class Logger {
     const timestamp = this._formatTime(new Date());
     const color = this._colors[level] || '';
     const levelTag = level.toUpperCase().padEnd(6);
-    const msg = `[${timestamp}] [${levelTag}] ${args.join(' ')}`;
+    // 对象类参数用 util.inspect 格式化，避免输出 [object Object]
+    const formatted = args.map(a => (typeof a === 'object' && a !== null ? util.inspect(a) : a));
+    const msg = `[${timestamp}] [${levelTag}] ${formatted.join(' ')}`;
 
     // 控制台彩色输出
     console.log(`${color}${msg}${this._reset}`);
@@ -400,8 +410,15 @@ class Router {
       params.push(name);
       return '([^/]+)';
     });
+    // 精确匹配正则（路由使用）
     const pattern = new RegExp('^' + patternStr + '$');
-    return { pattern, params };
+    // 前缀匹配正则（中间件使用）：路径之后可跟子路径
+    //   /api/:version → ^/api/([^/]+)(?=/|$)，匹配 /api/v1、/api/v1/users，不匹配 /apixyz
+    //   /             → ^/，匹配所有以 / 开头的路径（根路径中间件等价应用级，修复 use('/') 不命中子路径）
+    const prefixPattern = pathStr === '/'
+      ? /^\//
+      : new RegExp('^' + patternStr + '(?=/|$)');
+    return { pattern, params, prefixPattern };
   }
 
   /**
@@ -431,8 +448,8 @@ class Router {
       // 路径级中间件
       const pathStr = args[0];
       const handlers = args.slice(1);
-      const { pattern, params } = this._compilePath(pathStr);
-      this.middlewareStack.push({ path: pathStr, pattern, params, handlers });
+      const { pattern, params, prefixPattern } = this._compilePath(pathStr);
+      this.middlewareStack.push({ path: pathStr, pattern, params, prefixPattern, handlers });
     } else {
       // 应用级中间件
       const handlers = args;
@@ -488,28 +505,24 @@ class Router {
       if (!mw.pattern) {
         // 应用级中间件，匹配所有路径
         results.push({ middleware: mw, params: {} });
-      } else {
-        // 路径级中间件：前缀匹配
-        // 中间件路径 /api 应匹配 /api、/api/users、/api/users/123 等
-        const mwPath = mw.path;
-        if (pathname === mwPath || pathname.startsWith(mwPath + '/')) {
-          const params = {};
-          // 如果有动态参数，也需要提取
-          if (mw.params.length > 0) {
-            const match = mw.pattern.exec(pathname);
-            if (match) {
-              mw.params.forEach((name, i) => {
-                try {
-                  params[name] = decodeURIComponent(match[i + 1]);
-                } catch (e) {
-                  // 非法 URI 编码，保留原始值
-                  params[name] = match[i + 1];
-                }
-              });
-            }
+        continue;
+      }
+      // 路径级中间件：用前缀正则匹配，正确处理 use('/') 和动态参数路径
+      // prefixPattern 通过 (?=/|$) 边界约束：
+      //   - use('/') 命中所有以 / 开头的路径
+      //   - use('/api/:version') 命中 /api/v1 及其子路径，并提取 version 参数
+      const match = mw.prefixPattern.exec(pathname);
+      if (match) {
+        const params = {};
+        mw.params.forEach((name, i) => {
+          try {
+            params[name] = decodeURIComponent(match[i + 1]);
+          } catch (e) {
+            // 非法 URI 编码，保留原始值
+            params[name] = match[i + 1];
           }
-          results.push({ middleware: mw, params });
-        }
+        });
+        results.push({ middleware: mw, params });
       }
     }
     return results;
@@ -888,6 +901,13 @@ class Response {
           this._streamFile(fullPath, range.start, range.end, doneOnce);
           return;
         }
+        // 无效 Range：RFC 7233 规定返回 416 Range Not Satisfiable
+        this.status(416);
+        this.setHeader('Content-Range', `bytes */${stat.size}`);
+        this.setHeader('Content-Length', 0);
+        this._send('');
+        doneOnce(null);
+        return;
       }
 
       this.setHeader('Content-Length', stat.size);
@@ -1028,6 +1048,8 @@ class Response {
     }
     let str = `${encodeURIComponent(name)}=${encodedValue}`;
     if (opts.maxAge !== undefined) str += `; Max-Age=${opts.maxAge}`;
+    // Express 兼容：支持 expires 选项（Date 对象或时间字符串）
+    if (opts.expires) str += `; Expires=${opts.expires instanceof Date ? opts.expires.toUTCString() : opts.expires}`;
     if (opts.domain) str += `; Domain=${opts.domain}`;
     if (opts.path) str += `; Path=${opts.path}`;
     if (opts.secure) str += '; Secure';
@@ -1059,8 +1081,9 @@ class SSE {
     this.connected = true;
 
     // 设置 SSE 标准响应头（仅在 headers 未发送时）
+    // 沿用 res 当前状态码（默认 200），避免覆盖用户主动设置的状态码
     if (!res.headersSent) {
-      res.writeHead(200, {
+      res.writeHead(res.statusCode || 200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
@@ -1296,8 +1319,8 @@ class WebSocket {
         return;
       }
       // 非关闭握手状态：回复 Close 帧后关闭
-      // RFC 6455 Section 7.4.1: 1005/1006 状态码不得在 Close 帧中发送
-      this._sendCloseFrame(code === 1005 || code === 1006 ? undefined : code);
+      // RFC 6455 Section 7.4.1: 1005/1006/1015 状态码不得在 Close 帧中发送
+      this._sendCloseFrame(code === 1005 || code === 1006 || code === 1015 ? undefined : code);
       this.connected = false;
       this._emitClose(code, reason);
       return;
@@ -1325,6 +1348,11 @@ class WebSocket {
       }
     } else {
       // 新消息帧（opcode=0x01/0x02）
+      // RFC 6455 Section 5.4: 分片消息进行中收到新数据帧属于协议错误，必须关闭连接
+      if (this._fragmented) {
+        this.close(1002, 'Protocol error: new data frame during fragmented message');
+        return;
+      }
       if (fin) {
         // 非分片：直接触发
         this._emitData(opcode, payload);
@@ -1357,11 +1385,15 @@ class WebSocket {
   send(data) {
     if (!this.connected) return;
     if (typeof data === 'object' && !Buffer.isBuffer(data)) {
+      // 普通对象 → JSON 文本帧
       this._sendFrame(0x01, Buffer.from(JSON.stringify(data)));
     } else if (typeof data === 'string') {
       this._sendFrame(0x01, Buffer.from(data));
     } else if (Buffer.isBuffer(data)) {
       this._sendFrame(0x02, data);
+    } else if (data !== undefined && data !== null) {
+      // number/boolean 等基础类型转字符串后按文本帧发送
+      this._sendFrame(0x01, Buffer.from(String(data)));
     }
   }
 
@@ -1802,7 +1834,38 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
   let paused = false;
 
   // 确保临时目录存在（recursive: true 时目录已存在不报错，无需 existsSync）
-  fs.mkdirSync(tempDir, { recursive: true });
+  try {
+    fs.mkdirSync(tempDir, { recursive: true });
+  } catch (e) {
+    // 临时目录创建失败（权限不足/路径非法等）直接终止解析
+    next(e);
+    return;
+  }
+
+  // 标志位：文件写入流出错时防止 next 重复调用
+  let streamErrored = false;
+  // 惰性创建文件写入流，统一绑定 drain/error 事件（DRY：两处创建点共用）
+  function ensureFileStream() {
+    if (currentFile.stream) return currentFile.stream;
+    const stream = fs.createWriteStream(currentFile.path);
+    // 背压处理：写入流满时暂停请求读取，drain 后恢复
+    stream.on('drain', () => {
+      if (paused) {
+        paused = false;
+        req._req.resume();
+      }
+    });
+    // 写入流出错（磁盘满/权限等）：清理临时文件并终止解析
+    stream.on('error', (streamErr) => {
+      if (streamErrored) return;
+      streamErrored = true;
+      if (currentFile.stream) currentFile.stream.destroy();
+      _cleanupTempFiles(req._tempFiles);
+      next(streamErr);
+    });
+    currentFile.stream = stream;
+    return stream;
+  }
 
   function processBuffer() {
     while (buffer.length > 0) {
@@ -1893,7 +1956,13 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
         if (currentField.value.endsWith('\r\n')) {
           currentField.value = currentField.value.slice(0, -2);
         }
-        req.formData.fields[currentField.name] = currentField.value;
+        // 同名字段聚合为数组（Express 兼容）
+        const existingField = req.formData.fields[currentField.name];
+        if (existingField !== undefined) {
+          req.formData.fields[currentField.name] = Array.isArray(existingField) ? [...existingField, currentField.value] : [existingField, currentField.value];
+        } else {
+          req.formData.fields[currentField.name] = currentField.value;
+        }
         buffer = buffer.subarray(idx + delimiter.length);
         // 跳过 \r\n
         if (buffer.length >= 2 && buffer[0] === 0x0D && buffer[1] === 0x0A) {
@@ -1909,16 +1978,7 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
           // 保留尾部回看字节，防止分隔符跨 chunk 截断
           const safeLen = Math.max(0, buffer.length - lookBehind);
           const writeData = buffer.subarray(0, safeLen);
-          if (!currentFile.stream) {
-            currentFile.stream = fs.createWriteStream(currentFile.path);
-            // 背压处理：写入流满时暂停请求读取，drain 后恢复
-            currentFile.stream.on('drain', () => {
-              if (paused) {
-                paused = false;
-                req._req.resume();
-              }
-            });
-          }
+          ensureFileStream();
           const canWrite = currentFile.stream.write(writeData);
           // 写入流缓冲区满时暂停请求读取，避免内存积压
           if (!canWrite) {
@@ -1944,9 +2004,7 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
           ? fileData.subarray(0, -2)
           : fileData;
 
-        if (!currentFile.stream) {
-          currentFile.stream = fs.createWriteStream(currentFile.path);
-        }
+        ensureFileStream();
         currentFile.stream.write(trimmedData);
         // 结束写入（注意：stream.end 为异步操作，极端情况如磁盘满时可能写入不完整，
         // 但 fileInfo 仍会被记录。若需严格保证写入完整性，需改为异步流程）
@@ -2040,7 +2098,10 @@ function cookieParser(secret) {
               continue;
             }
             const expected = crypto.createHmac('sha256', secret).update(rawValue).digest('base64').replace(/=+$/, '');
-            if (sig === expected) {
+            // 使用常量时间比较防止时序攻击（先比较长度，等长时用 timingSafeEqual）
+            const sigBuf = Buffer.from(sig);
+            const expectedBuf = Buffer.from(expected);
+            if (sigBuf.length === expectedBuf.length && crypto.timingSafeEqual(sigBuf, expectedBuf)) {
               req.signedCookies[key] = rawValue;
               // Express 兼容：验证通过后从 req.cookies 中删除，防止误用未验证的签名值
               delete req.cookies[key];
@@ -2164,7 +2225,9 @@ class Application extends Router {
     this.server.listen(listenPort, ip, () => {
       const addr = this.server.address();
       const protocol = this.settings.https ? 'https' : 'http';
-      this._logger.info(`Server running at ${protocol}://${addr.address === '::' ? 'localhost' : addr.address}:${addr.port}/`);
+      // IPv6 :: 与 IPv4 0.0.0.0 均为通配地址，日志显示 localhost 更友好
+      const host = (addr.address === '::' || addr.address === '0.0.0.0') ? 'localhost' : addr.address;
+      this._logger.info(`Server running at ${protocol}://${host}:${addr.port}/`);
       if (callback) callback();
     });
 
@@ -2216,6 +2279,9 @@ class Application extends Router {
       res._isHead = true;
     }
 
+    // 为所有跨域请求设置基础 CORS 响应头（实际请求 + 预检均需要）
+    this._applyCORSHeaders(req, res);
+
     // 构建中间件 + 路由处理器执行链
     this._dispatch(req, res);
   }
@@ -2262,6 +2328,9 @@ class Application extends Router {
 
       const item = stack[idx++];
       const handler = item.handler;
+      // 将当前 layer 的参数合并到 req.params（路径级中间件 / 路由参数均通过此方式传递）
+      // 注意：路由参数已在收集阶段 Object.assign 到 req.params，此处保证中间件参数同样可见
+      if (item.params) Object.assign(req.params, item.params);
       // 防止同一 handler 多次调用 next()
       let handlerCalledNext = false;
       const safeNext = (e) => {
@@ -2288,6 +2357,8 @@ class Application extends Router {
           });
         }
       } catch (err) {
+        // handler 已通过 next(err) 传递错误时，跳过避免重复处理
+        if (handlerCalledNext) return;
         this._handleError(err, req, res, stack, idx);
       }
     };
@@ -2348,6 +2419,40 @@ class Application extends Router {
   }
 
   /**
+   * 为所有跨域请求设置基础 CORS 响应头（Allow-Origin / Credentials / Vary）
+   * 预检请求的额外头（Allow-Methods/Headers/Max-Age）在 _handleCORS 中处理
+   * 修复：原实现仅处理 OPTIONS 预检，实际 GET/POST 请求无 CORS 头导致跨域读取失败
+   */
+  _applyCORSHeaders(req, res) {
+    const cors = this.settings.cors;
+    if (!cors) return;
+    const reqOrigin = req.headers['origin'];
+    let origin = '*';
+    // origin 支持字符串、数组、函数：数组/函数需 reqOrigin 精确判断，无 Origin 时回退 '*'
+    if (typeof cors.origin === 'string') {
+      origin = cors.origin;
+    } else if (Array.isArray(cors.origin)) {
+      origin = (reqOrigin && cors.origin.includes(reqOrigin)) ? reqOrigin : '*';
+    } else if (typeof cors.origin === 'function') {
+      origin = cors.origin(reqOrigin) || '*';
+    }
+    // credentials=true 时 origin 不能为 '*'（浏览器会拒绝），回退为具体来源
+    if (cors.credentials && origin === '*') {
+      origin = reqOrigin || '';
+    }
+    if (origin) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      // 当 origin 为具体域名（非 *）时，回显 Vary: Origin
+      if (origin !== '*') {
+        res.setHeader('Vary', 'Origin');
+      }
+    }
+    if (cors.credentials) {
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+    }
+  }
+
+  /**
    * CORS 预检响应（动态查询该路径支持的 HTTP 方法）
    */
   _handleCORS(req, res) {
@@ -2356,32 +2461,15 @@ class Application extends Router {
       res.status(204)._send('');
       return;
     }
+    // 基础 CORS 头（Allow-Origin/Credentials/Vary）已在 _handleRequest 中通过 _applyCORSHeaders 设置
     // 动态查找该路径匹配的所有 HTTP 方法
     const allowedMethods = this._getAllowedMethods(req.path);
-    // origin 支持字符串、数组、函数：数组时检查请求 Origin 是否在列表中
-    let origin = '*';
-    const reqOrigin = req.headers['origin'];
-    if (typeof cors.origin === 'string') {
-      origin = cors.origin;
-    } else if (Array.isArray(cors.origin)) {
-      origin = (reqOrigin && cors.origin.includes(reqOrigin)) ? reqOrigin : '*';
-    } else if (typeof cors.origin === 'function') {
-      origin = cors.origin(reqOrigin) || '*';
-    }
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    // 当 origin 为具体域名（非 *）时，回显 Vary: Origin
-    if (origin !== '*') {
-      res.setHeader('Vary', 'Origin');
-    }
     // 动态设置允许的方法列表，而非硬编码
     res.setHeader('Access-Control-Allow-Methods', allowedMethods.join(', '));
     res.setHeader('Access-Control-Allow-Headers', cors.headers || 'Content-Type, Authorization');
     res.setHeader('Access-Control-Max-Age', parseInt(cors.maxAge, 10) || 86400);
     // Allow 头告知客户端该路径实际支持的方法
     res.setHeader('Allow', allowedMethods.join(', '));
-    if (cors.credentials) {
-      res.setHeader('Access-Control-Allow-Credentials', 'true');
-    }
     res.status(204)._send('');
   }
 
@@ -2471,6 +2559,10 @@ class Application extends Router {
         res.status(500).send('Internal Server Error');
         return;
       }
+      // allowAccessToAllFiles=false 时过滤隐藏文件（.env、.git 等），与访问策略保持一致
+      if (!this.settings.allowAccessToAllFiles) {
+        entries = entries.filter(e => !e.name.startsWith('.'));
+      }
 
       // 异步获取文件信息，避免同步阻塞事件循环
       const tasks = entries.map(entry => {
@@ -2559,14 +2651,14 @@ class Application extends Router {
 
     // 匹配 app.ws() 注册的处理器（支持动态参数路径）
     // _compilePath 始终返回 pattern，静态和动态路径均通过正则精确匹配
-    if (this._wsHandlers) {
+    if (this._wsHandlers && this._wsHandlers.length > 0) {
       const pathname = parseUrl(req.url).pathname;
+      let matchedEntry = null;
+      let params = {};
       for (const entry of this._wsHandlers) {
-        let matched = false;
-        let params = {};
         const m = entry.pattern.exec(pathname);
         if (m) {
-          matched = true;
+          matchedEntry = entry;
           entry.params.forEach((name, i) => {
             try {
               params[name] = decodeURIComponent(m[i + 1]);
@@ -2575,18 +2667,28 @@ class Application extends Router {
               params[name] = m[i + 1];
             }
           });
+          break;
         }
-        if (matched) {
-          // 将动态参数挂载到 req 上
-          if (Object.keys(params).length > 0) {
-            req.params = params;
-          }
-          const cleanup = entry.handler(ws, req);
+      }
+      if (matchedEntry) {
+        // 将动态参数挂载到 req 上
+        if (Object.keys(params).length > 0) {
+          req.params = params;
+        }
+        // 捕获处理器异常，避免崩溃整个服务
+        try {
+          const cleanup = matchedEntry.handler(ws, req);
           if (typeof cleanup === 'function') {
             ws.on('close', cleanup);
           }
-          break;
+        } catch (e) {
+          this._logger.error('WebSocket handler error:', e);
+          ws.close(1011, 'Internal server error');
         }
+      } else {
+        // 无匹配的 ws 路由：关闭连接避免孤儿连接
+        this._logger.warn(`No ws handler matched: ${pathname}`);
+        ws.close(1000, 'No handler');
       }
     }
   }
@@ -2606,9 +2708,9 @@ class Application extends Router {
     this.get(pathStr, (req, res) => {
       const sseInstance = res.sse();
       const cleanup = handler(sseInstance, req);
-      // 连接关闭时执行清理
+      // 连接关闭时执行清理（通过 Response.on 代理，保持封装一致性）
       if (typeof cleanup === 'function') {
-        res._res.on('close', cleanup);
+        res.on('close', cleanup);
       }
     });
   }
@@ -2770,7 +2872,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.3.1';
+httpm.version = '1.3.2';
 
 /**
  * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）

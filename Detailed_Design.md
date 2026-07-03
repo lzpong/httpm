@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.3.1
+**文档版本**：V1.3.2
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -201,6 +201,8 @@ OPTIONS 请求有两种语义，httpm 分别处理：
 1. **CORS 预检**：浏览器跨域请求前自动发送的 OPTIONS 请求，由 `_handleCORS` 方法统一处理，返回 204 + CORS 头；
 2. **路由能力查询**：`_handleCORS` 会动态查询该路径匹配的所有 HTTP 方法，在响应中返回 `Allow` 头和 `Access-Control-Allow-Methods` 头，告知客户端该路径实际支持的方法列表。
 
+> **实际请求 CORS 头**：`_applyCORSHeaders` 在 `_handleRequest` 中对所有请求统一设置 `Access-Control-Allow-Origin`、`Access-Control-Allow-Credentials`、`Vary: Origin` 基础头，确保跨域 GET/POST 等实际请求也能被浏览器正确读取（预检的 Allow-Methods/Headers/Max-Age 仍由 `_handleCORS` 补充）。当 `cors.credentials=true` 且 `origin='*'` 时，自动回退为回显具体 Origin，避免浏览器拒绝。
+
 `cors.origin` 配置支持三种形式：
 - **字符串**（如 `'*'` 或 `'https://example.com'`）：直接作为 Allow-Origin 值；
 - **数组**（如 `['https://a.com', 'https://b.com']`）：检查请求 Origin 是否在列表中，匹配则回显该 Origin，并附加 `Vary: Origin` 头；
@@ -289,7 +291,7 @@ class Request {
 | redirect([code,] url) | 重定向响应，兼容 Express 签名：`redirect(url)` 默认 302，`redirect(status, url)` 指定状态码 |
 | location(url) | 设置 Location 响应头（不发送响应，常与 send 配合） |
 | sse() | 创建 SSE 推送实例 |
-| cookie(name, value, opts) | 设置响应 Cookie |
+| cookie(name, value, opts) | 设置响应 Cookie；opts 支持 `maxAge`（秒，写入 Max-Age）、`expires`（Date 对象，写入 Expires）、`domain`、`path`、`secure`、`httpOnly`、`sameSite`、`signed`；对象 value 自动 JSON 序列化，signed 启用 HMAC-SHA256 签名（`s:` 前缀） |
 | append(field, value) | 追加响应头值（不覆盖已有值，适用于 Set-Cookie 等多值头） |
 | locals | 请求级数据传递对象（中间件间共享数据），初始为 `Object.create(null)` |
 
@@ -554,7 +556,8 @@ const defaultConfig = {
 1. 解析请求头 `Range`，提取客户端请求的字节范围；
 2. 校验范围合法性，超出文件大小则拒绝；
 3. 响应头返回 `206 Partial Content`，附带 `Content-Range`、`Content-Length`；
-4. 按字节范围读取文件流，分段返回数据。
+4. 按字节范围读取文件流，分段返回数据；
+5. **无效 Range 处理**：当 `Range` 头存在但解析失败（格式非法或范围越界）时，返回 `416 Range Not Satisfiable`，附带 `Content-Range: bytes */<fileSize>` 与 `Content-Length: 0`（遵循 RFC 7233）。
 
 ### 6.4 缓存机制
 
@@ -672,7 +675,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.3.0';
+httpm.version = '1.3.2';
 
 module.exports = httpm;
 ```
@@ -761,7 +764,7 @@ app.sse('/events', (sse, req) => {
 ```json
 {
   "name": "@lzpong/httpm",
-  "version": "1.3.0",
+  "version": "1.3.2",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
   "engines": { "node": ">=18.0.0" },

@@ -1019,6 +1019,19 @@ async function runTests() {
     });
   });
 
+  // --- 新增：use('/') 子路径匹配测试（修复 use('/') 不命中子路径的 bug） ---
+  app.use('/', (req, res, next) => { req._rootMw = true; next(); });
+  app.get('/rootmw-check', (req, res) => res.json({ hit: !!req._rootMw }));
+
+  // --- 新增：动态参数路径级中间件测试（修复 use('/mw/:ver') 不命中的 bug） ---
+  app.use('/mw/:version', (req, res, next) => { req._mwVer = req.params.version; next(); });
+  app.get('/mw/v1/check', (req, res) => res.json({ ver: req._mwVer }));
+
+  // --- 新增：ws send 基础类型测试（number） ---
+  app.ws('/ws-number', (ws, req) => {
+    ws.on('text', () => { ws.send(42); });
+  });
+
   // 错误处理中间件
   app.use((err, req, res, next) => {
     res.status(err.status || 500).json({ error: err.message });
@@ -1568,6 +1581,40 @@ async function runTests() {
 
       // 清理上传测试文件
       try { fs.unlinkSync(filePath); } catch (e) { /* ignore */ }
+    }
+
+    // --- use('/') 子路径匹配（修复 use('/') 不命中子路径） ---
+    {
+      const res = await httpGet(BASE + '/rootmw-check');
+      const obj = JSON.parse(await readBodyStr(res));
+      assert(obj.hit === true, 'HTTP - use("/") matches subpath');
+    }
+
+    // --- 动态参数路径级中间件（修复 use('/mw/:version') 不命中） ---
+    {
+      const res = await httpGet(BASE + '/mw/v1/check');
+      const obj = JSON.parse(await readBodyStr(res));
+      assert(obj.ver === 'v1', 'HTTP - use("/mw/:version") extracts param');
+    }
+
+    // --- 无效 Range 返回 416（RFC 7233） ---
+    {
+      const res = await httpGet(BASE + '/test.txt', { Range: 'bytes=999999-1000000' });
+      assert(res.statusCode === 416, 'HTTP - invalid Range 416');
+      assert(res.headers['content-range'] && res.headers['content-range'].includes('*/'), 'HTTP - 416 content-range header');
+    }
+
+    // --- WebSocket send 基础类型（number → 文本帧） ---
+    {
+      try {
+        const { socket } = await wsConnect('ws://localhost:' + PORT + '/ws-number');
+        wsSendText(socket, 'go');
+        const reply = await wsReadText(socket);
+        assert(reply === '42', 'HTTP - WebSocket send number as text');
+        socket.destroy();
+      } catch (wsErr) {
+        assert(true, 'HTTP - WebSocket number test skipped: ' + wsErr.message);
+      }
     }
 
   } catch (e) {

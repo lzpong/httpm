@@ -141,7 +141,7 @@ app.use((err, req, res, next) => {
 | `res.download(path, [name], [opts])` | 下载文件，兼容 Express 签名：opts 传递给 sendFile |
 | `res.redirect([code,] url)` | 重定向，兼容 Express 签名：`redirect(url)` 默认 302，`redirect(status, url)` 指定状态码 |
 | `res.location(url)` | 设置 Location 响应头（不发送响应，常与 send 配合） |
-| `res.cookie(name, value, opts)` | 设置 Cookie |
+| `res.cookie(name, value, opts)` | 设置 Cookie，opts 支持 `maxAge`（单位秒，直接写入 Max-Age）、`expires`（Date 对象）、`domain`、`path`、`secure`、`httpOnly`、`sameSite`、`signed` |
 | `res.clearCookie(name, opts)` | 清除 Cookie |
 | `res.set(name, value)` / `res.setHeader()` | 设置响应头（set 支持对象批量；setHeader 为底层方法，功能相同） |
 | `res.get(name)` / `res.getHeader()` | 获取响应头（get 为 Express 兼容方法，功能相同） |
@@ -221,6 +221,7 @@ app.post('/upload', (req, res) => {
 | `tempDir` | `'tempupdir'` | 临时文件目录 |
 | `maxFileSize` | `128MB` | 单文件大小限制 |
 | `maxFieldSize` | `1MB` | 表单字段大小限制 |
+| `maxBodySize` | `128MB` | JSON/urlencoded 请求体大小限制 |
 
 ## WebSocket
 
