@@ -513,6 +513,28 @@ async function runTests() {
     const timeMatch = logContent.match(/\[(\d{2}:\d{2}:\d{2})\]/);
     assert(timeMatch !== null, 'Logger - file content has HH:MM:SS timestamp');
 
+    // 正向：exitOnDiskFull 默认 false（业界主流，日志故障不影响主业务）
+    const logger4 = new httpm.Logger({ level: 'debug' });
+    assert(logger4.exitOnDiskFull === false, 'Logger - exitOnDiskFull default false');
+
+    // 正向：exitOnDiskFull 可配置为 true
+    const logger5 = new httpm.Logger({ level: 'debug', exitOnDiskFull: true });
+    assert(logger5.exitOnDiskFull === true, 'Logger - exitOnDiskFull configurable true');
+
+    // 正向：_handleWriteError 方法存在
+    assert(typeof logger4._handleWriteError === 'function', 'Logger - _handleWriteError method exists');
+
+    // 正向：exitOnDiskFull=false 时 _handleWriteError 仅打印不退出（捕获 console.error 验证打印，进程不退出即通过）
+    const origConsoleError = console.error;
+    let errorPrinted = false;
+    console.error = () => { errorPrinted = true; };
+    const fakeErr = new Error('no space left on device');
+    fakeErr.code = 'ENOSPC';
+    logger4._handleWriteError(fakeErr); // 若退出则测试进程终止，后续断言无法执行
+    console.error = origConsoleError;
+    assert(errorPrinted === true, 'Logger - _handleWriteError prints to console');
+    assert(logger4.exitOnDiskFull === false, 'Logger - _handleWriteError no exit when exitOnDiskFull=false');
+
     // 清理：先关闭写入流再删除目录
     if (logger._stream) { logger._stream.end(); logger._stream = null; }
     if (logger3._stream) { logger3._stream.end(); logger3._stream = null; }
@@ -972,7 +994,8 @@ async function runTests() {
   });
 
   // bodyParser 413 超限测试路由
-  app.post('/api/limited-body', httpm.bodyParser({ maxFieldSize: 50 }), (req, res) => {
+  // O6 修复后：JSON/urlencoded 请求体大小受 maxBodySize 限制，maxFieldSize 仅用于 multipart 表单字段
+  app.post('/api/limited-body', httpm.bodyParser({ maxBodySize: 50 }), (req, res) => {
     res.json({ body: req.body });
   });
 

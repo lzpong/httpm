@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.3.0
+**文档版本**：V1.3.1
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -54,15 +54,15 @@ httpm 是基于 Node.js 原生模块开发的**单文件、零依赖** HTTP 服�
 ┌─────────────────────────────────────────────────────────┐
 │                        httpm.js                         │
 ├─────────────────────────────────────────────────────────┤
-│ 【导出接口层】对外暴露类、方法、中间件、工具函数          │
-│ httpm() 入口函数 / 各类核心类 / 内置中间件 / 工具方法     │
+│ 【导出接口层】对外暴露类、方法、中间件、工具函数                │
+│ httpm() 入口函数 / 各类核心类 / 内置中间件 / 工具方法         │
 ├─────────────────────────────────────────────────────────┤
-│ 【核心类层】业务核心逻辑实现                             │
+│ 【核心类层】业务核心逻辑实现                                 │
 │ Application / Router / Request / Response               │
-│ SSE / WebSocket / WebSocketServer / Logger               │
+│ SSE / WebSocket / WebSocketServer / Logger              │
 ├─────────────────────────────────────────────────────────┤
-│ 【工具函数层】通用公共方法                               │
-│ 路径解析、参数解析、MIME、大小格式化、安全校验等         │
+│ 【工具函数层】通用公共方法                                   │
+│ 路径解析、参数解析、MIME、大小格式化、安全校验等                │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -201,6 +201,11 @@ OPTIONS 请求有两种语义，httpm 分别处理：
 1. **CORS 预检**：浏览器跨域请求前自动发送的 OPTIONS 请求，由 `_handleCORS` 方法统一处理，返回 204 + CORS 头；
 2. **路由能力查询**：`_handleCORS` 会动态查询该路径匹配的所有 HTTP 方法，在响应中返回 `Allow` 头和 `Access-Control-Allow-Methods` 头，告知客户端该路径实际支持的方法列表。
 
+`cors.origin` 配置支持三种形式：
+- **字符串**（如 `'*'` 或 `'https://example.com'`）：直接作为 Allow-Origin 值；
+- **数组**（如 `['https://a.com', 'https://b.com']`）：检查请求 Origin 是否在列表中，匹配则回显该 Origin，并附加 `Vary: Origin` 头；
+- **函数**（如 `origin => origin.endsWith('.com') ? origin : '*'`）：动态计算 Allow-Origin 值。
+
 `_getAllowedMethods(pathname)` 方法遍历所有已注册路由，查找匹配该路径的方法，并自动补充隐式规则：
 - GET 路由隐式支持 HEAD；
 - OPTIONS 始终可用（CORS 预检）。
@@ -247,6 +252,7 @@ class Request {
 - `req.ip`：	   客户端 IP 地址
 - `req.hostname`： 请求域名
 - `req.protocol`： 当前协议（http /https）
+- `req.files`：	   上传文件数组（兼容旧版，可以使用 `req.formData.files`）
 
 #### 请求体读取
 
@@ -383,7 +389,14 @@ app.ws('/chat/:room', (ws, req) => {
 
 1. 颜色区分：不同日志级别对应不同控制台字体颜色，提升可读性；
 2. 文件存储规则：按年月创建目录，日志文件按日期拆分；
-3. `log(level,...args)` 统一入口方法，分发至控制台与文件。
+3. `log(level,...args)` 统一入口方法，分发至控制台与文件；
+4. **跨日切换**：检测到日期变化时，异步关闭旧流（`end()` 后 `destroy()`），创建新流写入新文件，旧流异步刷盘不阻塞主流程；
+5. **写入失败处理**：日志文件流监听 `error` 事件，磁盘满（`ENOSPC`）、权限不足（`EACCES`）等错误由 `_handleWriteError(err)` 统一处理：
+   - **控制台打印明确错误码和原因**（不再静默），格式：`[Logger] 日志文件写入失败 [ENOSPC]: no space left on device`，便于运维快速定位；
+   - **exitOnDiskFull 配置项**（默认 `false`）控制是否退出进程（注：配置项名取最常见场景磁盘满，实际任何写入错误都会触发退出）：
+     - `false`：仅控制台打印，主业务流程继续（业界主流，日志故障不影响主业务）；
+     - `true`：控制台打印后 `process.exit(1)`，便于进程管理器（pm2/systemd）感知并重启；
+   - 支持通过 `new Logger({ exitOnDiskFull: true })` 或 `httpm({ exitOnDiskFull: true })` 配置。
 
 ---
 
@@ -493,6 +506,7 @@ const defaultConfig = {
   // 日志配置
   logLevel: 'info',
   logDir: './log',
+  exitOnDiskFull: false,             // 日志写入失败时是否退出进程（false=仅控制台打印，true=退出）
 
   // 跨域配置
   cors: { origin: '*', headers: 'Content-Type, Authorization', maxAge: 86400 },

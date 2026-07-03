@@ -164,6 +164,23 @@ res.cookie('token', 'abc123', { signed: true });
 req.signedCookies.token; // 'abc123'（签名验证通过，已从 req.cookies 移除）
 ```
 
+### 响应头与请求级数据
+
+```javascript
+// 追加多值响应头（不覆盖已有值）
+res.append('Set-Cookie', 'a=1');
+res.append('Set-Cookie', 'b=2');
+
+// 中间件间共享数据
+app.use((req, res, next) => {
+  res.locals.user = { id: 1, name: 'Tom' };
+  next();
+});
+app.get('/profile', (req, res) => {
+  res.json(res.locals.user); // { id: 1, name: 'Tom' }
+});
+```
+
 ## 静态文件服务
 
 ```javascript
@@ -323,6 +340,27 @@ logger.fatal('Fatal message');
 
 日志文件路径格式：`./logDir/YYYY/MM/name_DD.log`，时间格式：`HH:MM:SS`。
 
+### 写入失败处理策略
+
+日志文件写入失败（磁盘满 `ENOSPC`、权限不足 `EACCES` 等）时，**控制台会打印明确错误码和原因**（不再静默），便于运维快速定位：
+
+```
+[Logger] 日志文件写入失败 [ENOSPC]: no space left on device
+```
+
+通过 `exitOnDiskFull` 配置项控制是否退出进程（默认 `false`，主业务不受日志故障影响）。注：配置项名取最常见场景（磁盘满），实际任何写入错误（权限、路径等）都会触发退出：
+
+```javascript
+// 独立使用 Logger
+const logger = new Logger({ logDir: './logs', exitOnDiskFull: true });
+
+// 通过 httpm 入口（传递给内置 Logger）
+const app = httpm({ exitOnDiskFull: true });
+```
+
+- `exitOnDiskFull: false`（默认）— 仅控制台打印错误详情，主业务流程继续（业界主流）
+- `exitOnDiskFull: true` — 控制台打印错误详情后退出进程，便于进程管理器（pm2/systemd）感知并重启
+
 ## 配置管理
 
 配置加载优先级（后者覆盖前者）：
@@ -366,7 +404,8 @@ const app = httpm({ svrPort: 3000 }); // svrPort=3000, enableGzip=true(来自app
 | `http2` | `false` | 启用 HTTP/2 |
 | `logLevel` | `'info'` | 日志级别 |
 | `logDir` | `'./log'` | 日志文件目录 |
-| `cors` | `{ origin: '*', ... }` | CORS 配置 |
+| `exitOnDiskFull` | `false` | 日志写入失败时是否退出进程（false=仅控制台打印，true=退出） |
+| `cors` | `{ origin: '*', ... }` | CORS 配置，origin 支持字符串/数组/函数 |
 | `useBodyParser` | `true` | 自动解析请求体 |
 | `useCookieParser` | `true` | 自动解析 Cookie |
 | `bodyParserOptions` | `{}` | bodyParser 选项 |

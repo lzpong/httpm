@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.3.0
+ * @version     1.3.1
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -270,6 +270,11 @@ class Logger {
     this.name = options.name || '';
     this.level = options.level || 'info';
     this.logDir = options.logDir || './log';
+    // 日志写入失败（如磁盘满 ENOSPC、权限 EACCES）时的处理策略：
+    //   false（默认）= 仅控制台打印错误详情，主业务流程继续（业界主流）
+    //   true = 控制台打印错误详情后退出进程，便于进程管理器（pm2/systemd）感知并重启
+    //   注：配置项名取最常见场景（磁盘满 disk full），实际任何写入错误都会触发退出
+    this.exitOnDiskFull = options.exitOnDiskFull === true;
     this._levels = { debug: 0, info: 1, notice: 2, warn: 3, error: 4, fatal: 5 };
     this._colors = {
       debug: '\x1b[1;30m',   // 灰色
@@ -282,6 +287,21 @@ class Logger {
     this._reset = '\x1b[0m';
     this._stream = null;
     this._streamDate = null;
+  }
+
+  /**
+   * 统一处理日志写入失败：控制台打印错误详情（含错误码，如 ENOSPC），exitOnDiskFull=true 时退出进程
+   * 明确错误原因，避免笼统的"写入失败"，便于运维快速定位（磁盘满/权限/路径等）
+   * @param {Error} err - 写入错误对象，通常含 code（如 ENOSPC）和 message
+   */
+  _handleWriteError(err) {
+    const code = err && err.code ? ` [${err.code}]` : '';
+    const msg = err && err.message ? err.message : String(err);
+    console.error(`[Logger] 日志文件写入失败${code}: ${msg}`);
+    if (this.exitOnDiskFull) {
+      console.error(`[Logger] exitOnDiskFull=true，进程即将退出。原因${code}: ${msg}`);
+      process.exit(1);
+    }
   }
 
   _shouldLog(level) {
@@ -322,6 +342,9 @@ class Logger {
     const prefix = this.name ? this.name + '_' : '';
     const filePath = path.join(dir, `${prefix}${day}.log`);
     this._stream = fs.createWriteStream(filePath, { flags: 'a' });
+    // 监听 error 事件：磁盘满（ENOSPC）、权限不足（EACCES）等异步错误统一交给 _handleWriteError 处理
+    // 避免未捕获异常导致进程崩溃，同时控制台打印明确原因，便于运维感知
+    this._stream.on('error', (err) => this._handleWriteError(err));
     this._streamDate = streamKey;
     return this._stream;
   }
@@ -331,7 +354,8 @@ class Logger {
       const stream = this._getLogStream();
       stream.write(msg + '\n');
     } catch (e) {
-      // 文件写入失败静默处理
+      // 同步异常（如 mkdirSync 失败）交给 _handleWriteError 统一处理，打印明确错误码
+      this._handleWriteError(e);
     }
   }
 
@@ -955,7 +979,9 @@ class Response {
     }
     name = name || path.basename(filePath);
     opts = opts || {};
-    this.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(name)}"`);
+    // RFC 6266: 同时提供 filename（兼容旧浏览器）和 filename*（UTF-8，支持非 ASCII 文件名）
+    const encodedName = encodeURIComponent(name);
+    this.setHeader('Content-Disposition', `attachment; filename="${encodedName}"; filename*=UTF-8''${encodedName}`);
     this.sendFile(filePath, opts);
   }
 
@@ -989,12 +1015,14 @@ class Response {
    * 设置响应 Cookie
    */
   cookie(name, value, opts = {}) {
-    let encodedValue = encodeURIComponent(value);
-    // 签名 Cookie：s:value.signature（s: 前缀不参与编码）
+    // Express 兼容：对象值先 JSON 序列化，便于存储结构化数据
+    let rawValue = typeof value === 'object' && value !== null ? JSON.stringify(value) : value;
+    let encodedValue = encodeURIComponent(rawValue);
+    // 签名 Cookie：s:value.signature（s: 前缀不参与编码，签名基于原始值）
     if (opts.signed) {
       const secret = this._app && this._app.settings && this._app.settings.cookieParserSecret;
       if (secret) {
-        const sig = crypto.createHmac('sha256', secret).update(value).digest('base64').replace(/=+$/, '');
+        const sig = crypto.createHmac('sha256', secret).update(rawValue).digest('base64').replace(/=+$/, '');
         encodedValue = 's:' + encodedValue + '.' + sig;
       }
     }
@@ -1081,10 +1109,14 @@ class SSE {
 
   /**
    * 发送注释消息（可作为心跳保活）
+   * 多行文本会按行拆分，每行均以 : 前缀标记为注释，避免破坏 SSE 协议
    */
   comment(text) {
     if (!this.connected) return this;
-    this._res.write(`: ${text}\n\n`);
+    // 按行拆分，每行加 : 前缀，确保多行注释不破坏 SSE 协议
+    const lines = String(text).split('\n');
+    const payload = lines.map(line => `: ${line}`).join('\n') + '\n\n';
+    this._res.write(payload);
     return this;
   }
 
@@ -1656,6 +1688,8 @@ class WebSocketServer {
 function bodyParser(options = {}) {
   const maxFileSize = options.maxFileSize || 128 * 1024 * 1024;
   const maxFieldSize = options.maxFieldSize || 1024 * 1024;
+  // JSON/urlencoded 请求体大小限制（语义区别于 maxFieldSize 表单字段）
+  const maxBodySize = options.maxBodySize || 128 * 1024 * 1024;
 
   return function bodyParserMiddleware(req, res, next) {
     // 初始化 formData
@@ -1673,9 +1707,9 @@ function bodyParser(options = {}) {
     }
 
     if (contentType.includes('application/json')) {
-      _parseJSON(req, maxFieldSize, next);
+      _parseJSON(req, maxBodySize, next);
     } else if (contentType.includes('application/x-www-form-urlencoded')) {
-      _parseUrlencoded(req, maxFieldSize, next);
+      _parseUrlencoded(req, maxBodySize, next);
     } else if (contentType.includes('multipart/form-data')) {
       const boundary = _extractBoundary(contentType);
       if (boundary) {
@@ -2033,7 +2067,8 @@ class Application extends Router {
     this._wss = null;
     this._logger = new Logger({
       level: this.settings.logLevel,
-      logDir: this.settings.logDir
+      logDir: this.settings.logDir,
+      exitOnDiskFull: this.settings.exitOnDiskFull
     });
 
     // 自动注册内置中间件
@@ -2323,8 +2358,21 @@ class Application extends Router {
     }
     // 动态查找该路径匹配的所有 HTTP 方法
     const allowedMethods = this._getAllowedMethods(req.path);
-    const origin = typeof cors.origin === 'string' ? cors.origin : '*';
+    // origin 支持字符串、数组、函数：数组时检查请求 Origin 是否在列表中
+    let origin = '*';
+    const reqOrigin = req.headers['origin'];
+    if (typeof cors.origin === 'string') {
+      origin = cors.origin;
+    } else if (Array.isArray(cors.origin)) {
+      origin = (reqOrigin && cors.origin.includes(reqOrigin)) ? reqOrigin : '*';
+    } else if (typeof cors.origin === 'function') {
+      origin = cors.origin(reqOrigin) || '*';
+    }
     res.setHeader('Access-Control-Allow-Origin', origin);
+    // 当 origin 为具体域名（非 *）时，回显 Vary: Origin
+    if (origin !== '*') {
+      res.setHeader('Vary', 'Origin');
+    }
     // 动态设置允许的方法列表，而非硬编码
     res.setHeader('Access-Control-Allow-Methods', allowedMethods.join(', '));
     res.setHeader('Access-Control-Allow-Headers', cors.headers || 'Content-Type, Authorization');
@@ -2631,6 +2679,9 @@ const defaultConfig = {
 
   logLevel: 'info',
   logDir: './log',
+  // 日志写入失败（磁盘满/权限等）时是否退出进程：false=仅控制台打印（默认），true=退出进程
+  // 注：配置项名取最常见场景（磁盘满 disk full），实际任何写入错误都会触发退出
+  exitOnDiskFull: false,
 
   cors: { origin: '*', headers: 'Content-Type, Authorization', maxAge: 86400 },
 
@@ -2719,7 +2770,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.3.0';
+httpm.version = '1.3.1';
 
 /**
  * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）
