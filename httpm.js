@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.3.3
+ * @version     1.3.4
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -33,6 +33,7 @@ const path = require('path');
 const crypto = require('crypto');
 const zlib = require('zlib');
 const util = require('util');
+const { StringDecoder } = require('string_decoder');
 
 // ============================================================
 // 工具函数层
@@ -354,7 +355,12 @@ class Logger {
     this._stream = fs.createWriteStream(filePath, { flags: 'a' });
     // 监听 error 事件：磁盘满（ENOSPC）、权限不足（EACCES）等异步错误统一交给 _handleWriteError 处理
     // 避免未捕获异常导致进程崩溃，同时控制台打印明确原因，便于运维感知
-    this._stream.on('error', (err) => this._handleWriteError(err));
+    // 重置 _stream 和 _streamDate：流已损坏，下次写入会重建新流，避免持续往坏流写入丢失日志
+    this._stream.on('error', (err) => {
+      this._stream = null;
+      this._streamDate = null;
+      this._handleWriteError(err);
+    });
     this._streamDate = streamKey;
     return this._stream;
   }
@@ -413,14 +419,16 @@ class Router {
 
   /**
    * 编译动态路由路径为正则表达式
+   * 注意：路径中可能含正则特殊字符（如 . ( [ + ? 等），必须先转义非参数部分，
+   * 否则 new RegExp 会抛 SyntaxError，或 . 匹配任意字符导致路由匹配不精确
    */
   _compilePath(pathStr) {
     const params = [];
-    // 将 :param 替换为正则捕获组
-    const patternStr = pathStr.replace(/:([^/]+)/g, (_, name) => {
-      params.push(name);
-      return '([^/]+)';
-    });
+    // 收集参数名（基于原始路径，避免转义影响 :param 识别）
+    pathStr.replace(/:([^/]+)/g, (_, name) => { params.push(name); return ''; });
+    // 按 :param 占位符分段，对非参数段转义正则特殊字符，再拼接捕获组 ([^/]+)
+    // 例：'/api.json' → '/api\.json'；'/users(test)' → '/users\(test\)'
+    const patternStr = pathStr.split(/:[^/]+/).map(seg => seg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('([^/]+)');
     // 精确匹配正则（路由使用）
     const pattern = new RegExp('^' + patternStr + '$');
     // 前缀匹配正则（中间件使用）：路径之后可跟子路径
@@ -887,6 +895,13 @@ class Response {
     };
     const root = options.root || this._app.settings.rootPath || process.cwd();
     const fullPath = path.resolve(root, filePath);
+    // 路径遍历防护：解析后的绝对路径必须在 root 之下，防止 ../ 逃逸
+    const resolvedRoot = path.resolve(root);
+    if (fullPath !== resolvedRoot && !fullPath.startsWith(resolvedRoot + path.sep)) {
+      this.status(403).send('Forbidden');
+      doneOnce(new Error('Path traversal blocked'));
+      return;
+    }
 
     fs.stat(fullPath, (err, stat) => {
       if (err || !stat.isFile()) {
@@ -948,6 +963,16 @@ class Response {
 
       this.setHeader('Content-Length', stat.size);
 
+      // 空文件特判：stat.size === 0 时 end = -1 会导致 createReadStream 抛 RangeError
+      // 直接 end 响应，不创建读取流（HEAD 和 GET 行为一致，仅 end 头部）
+      if (stat.size === 0) {
+        this._res.statusCode = this.statusCode;
+        this._headersSent = true;
+        this._res.end();
+        doneOnce(null);
+        return;
+      }
+
       // Gzip 压缩（仅文本类文件）
       const acceptEncoding = this._req?.headers?.['accept-encoding'] || '';
       if (this._app.settings.enableGzip && isTextMime(mime) && acceptEncoding.includes('gzip')) {
@@ -959,7 +984,8 @@ class Response {
         }
         this.removeHeader('Content-Length');
         this.setHeader('Content-Encoding', 'gzip');
-        this.status(this.statusCode);
+        // 直接写入底层响应对象的状态码（this.status() 是链式 getter/setter，赋值给自己是 no-op）
+        this._res.statusCode = this.statusCode;
         this._headersSent = true;
         const raw = fs.createReadStream(fullPath);
         const gzip = zlib.createGzip();
@@ -1060,6 +1086,13 @@ class Response {
     if (url === 'back') {
       url = this._req?.headers?.['referer'] || this._req?.headers?.['referrer'] || '/';
     }
+    // HTTP 协议要求 Location 头为 ASCII，非 ASCII 字符需编码（含中文、空格等）
+    // encodeURI 保留 : / ? # [ ] @ ! $ & ' ( ) * + , ; = 等合法 URL 字符
+    try {
+      url = encodeURI(url);
+    } catch (e) {
+      // 已编码的 URL 再 encodeURI 可能抛 URIError，忽略保持原值
+    }
     this.setHeader('Location', url);
     this.setHeader('Content-Length', 0);
     this._send('');
@@ -1070,7 +1103,10 @@ class Response {
    */
   sse() {
     if (this._sse) return this._sse;
-    this._sse = new SSE(this._res);
+    // 传入底层 IncomingMessage（this._req._req）以便 SSE 监听 'aborted' 事件
+    // ServerResponse 无 aborted 事件，必须监听 IncomingMessage
+    const incomingMsg = this._req?._req;
+    this._sse = new SSE(this._res, incomingMsg);
     return this._sse;
   }
 
@@ -1127,8 +1163,9 @@ class Response {
 // ============================================================
 
 class SSE {
-  constructor(res) {
+  constructor(res, req) {
     this._res = res;
+    this._req = req; // 保存 req 以便移除 aborted 监听器
     this.connected = true;
 
     // 设置 SSE 标准响应头（仅在 headers 未发送时）
@@ -1149,27 +1186,34 @@ class SSE {
     };
     this._onClose = onClose;
     res.on('close', onClose);
-    // HTTP/1.1 兼容：aborted 事件在请求被客户端中断时触发
-    res.on('aborted', onClose);
+    // HTTP/1.1 兼容：客户端中断请求时触发（ServerResponse 无 aborted 事件，必须监听 req）
+    // 注意：req 可能是 httpm Request 对象（无 on 方法）或底层 IncomingMessage，需校验
+    if (req && typeof req.on === 'function') req.on('aborted', onClose);
   }
 
   /**
    * 发送普通消息，自动兼容字符串/JSON 对象
+   * SSE 规范：data 中含换行符时需拆成多行 data: 前缀，接收端用 \n 拼回
    */
   send(data) {
     if (!this.connected) return this;
     const msg = typeof data === 'string' ? data : JSON.stringify(data);
-    this._res.write(`data: ${msg}\n\n`);
+    // 按行拆分，每行加 data: 前缀，确保多行消息不破坏 SSE 协议
+    const lines = msg.split('\n');
+    this._res.write(lines.map(l => `data: ${l}`).join('\n') + '\n\n');
     return this;
   }
 
   /**
    * 发送自定义命名事件
+   * event name 中含换行符属于协议违规，直接忽略该事件避免破坏流
    */
   event(name, data) {
     if (!this.connected) return this;
+    if (typeof name !== 'string' || name.includes('\n')) return this;
     const msg = typeof data === 'string' ? data : JSON.stringify(data);
-    this._res.write(`event: ${name}\ndata: ${msg}\n\n`);
+    const lines = msg.split('\n');
+    this._res.write(`event: ${name}\n` + lines.map(l => `data: ${l}`).join('\n') + '\n\n');
     return this;
   }
 
@@ -1202,7 +1246,10 @@ class SSE {
     if (!this.connected) return;
     this.connected = false;
     this._res.removeListener('close', this._onClose);
-    this._res.removeListener('aborted', this._onClose);
+    // 移除 req 上的 aborted 监听器，避免内存泄漏（需校验 on/removeListener 方法存在）
+    if (this._req && typeof this._req.removeListener === 'function') {
+      this._req.removeListener('aborted', this._onClose);
+    }
     this._res.end();
   }
 }
@@ -1277,7 +1324,7 @@ class WebSocket {
       const result = this._decodeFrame(this._frameBuffer);
       if (result === null) break; // 数据不完整，等待更多数据
       this._frameBuffer = this._frameBuffer.subarray(result.bytesConsumed);
-      this._processFrame(result.opcode, result.payload, result.fin, result.oversize);
+      this._processFrame(result.opcode, result.payload, result.fin, result.oversize, result.isMasked);
     }
   }
 
@@ -1335,17 +1382,34 @@ class WebSocket {
       }
     }
 
-    return { opcode, payload, fin, bytesConsumed: offset + payloadLength };
+    return { opcode, payload, fin, isMasked, bytesConsumed: offset + payloadLength };
   }
 
   /**
    * 处理解码后的帧，支持分片帧（continuation frame, opcode=0x00）
    */
-  _processFrame(opcode, payload, fin, oversize) {
+  _processFrame(opcode, payload, fin, oversize, isMasked) {
     // 超限帧：直接关闭连接
     if (oversize) {
       this.close(1009, 'Frame payload too large');
       return;
+    }
+    // RFC 6455 Section 5.1: 客户端到服务端的帧必须掩码，未掩码帧为协议错误
+    // 注意：oversize 标记帧不携带 isMasked，跳过校验
+    if (isMasked === false) {
+      this.close(1002, 'Protocol error: client frames must be masked');
+      return;
+    }
+    // RFC 6455 Section 5.5: 控制帧（close=0x08/ping=0x09/pong=0x0A）负载不得超过 125 字节，且不可分片（FIN 必须为 1）
+    if (opcode >= 0x08 && opcode <= 0x0A) {
+      if (payload.length > 125) {
+        this.close(1002, 'Protocol error: control frame payload exceeds 125 bytes');
+        return;
+      }
+      if (!fin) {
+        this.close(1002, 'Protocol error: control frame must not be fragmented');
+        return;
+      }
     }
     // 关闭握手期间忽略数据帧
     if (this._closing && opcode !== 0x08 && opcode !== 0x09 && opcode !== 0x0A) {
@@ -1370,10 +1434,13 @@ class WebSocket {
         this._emitClose(code, reason);
         return;
       }
-      // 非关闭握手状态：回复 Close 帧后关闭
+      // 非关闭握手状态：回复 Close 帧后关闭 socket
       // RFC 6455 Section 7.4.1: 1005/1006/1015 状态码不得在 Close 帧中发送
       this._sendCloseFrame(code === 1005 || code === 1006 || code === 1015 ? undefined : code);
       this.connected = false;
+      // 必须关闭底层 socket，否则 TCP 连接泄漏
+      // end() 发送 FIN 包优雅关闭，比 destroy() 更符合 RFC 6455 关闭握手语义
+      try { this.socket.end(); } catch (e) { /* 忽略关闭错误 */ }
       this._emitClose(code, reason);
       return;
     }
@@ -1524,7 +1591,8 @@ class WebSocket {
    * @param {string} [reason=''] 关闭原因
    */
   close(code = 1000, reason = '') {
-    if (this._closed) return;
+    // 防重复：已关闭或关闭握手中再次调用，避免发送多个 Close 帧
+    if (this._closed || this._closing) return;
     // 重要：必须先发送 Close 帧再设 connected=false
     // _sendFrame 内部检查 this.connected，若先断开则 Close 帧无法发出
     this._sendCloseFrame(code, reason);
@@ -1880,7 +1948,7 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
   const lookBehind = delimiter.length - 1;
   let state = 'INIT'; // INIT, HEADERS, BODY_FIELD, BODY_FILE
   let partHeadersBuf = Buffer.alloc(0);
-  let currentField = { name: '', value: '' };
+  let currentField = { name: '', value: '', decoder: null };
   let currentFile = { name: '', filename: '', contentType: '', size: 0, path: '', stream: null };
   let fieldSize = 0;
   let fileSize = 0;
@@ -1973,12 +2041,19 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
 
         if (filenameMatch) {
           // 文件字段
+          // 安全过滤：filename 来自客户端，可能含路径分隔符或 .. 实现路径遍历
+          // 仅保留 basename（剥离目录），再替换残留分隔符，防止写入任意路径
+          let safeFilename = filenameMatch[1].replace(/[\\\/]/g, '_'); // 替换路径分隔符
+          safeFilename = path.basename(safeFilename); // 剥离目录部分
+          if (safeFilename === '.' || safeFilename === '..' || safeFilename === '') {
+            safeFilename = 'unnamed';
+          }
           currentFile = {
             name: nameMatch ? nameMatch[1] : '',
-            filename: filenameMatch[1],
+            filename: safeFilename,
             contentType: ctMatch ? ctMatch[1].trim() : 'application/octet-stream',
             size: 0,
-            path: path.join(tempDir, `${uid()}_${filenameMatch[1]}`),
+            path: path.join(tempDir, `${uid()}_${safeFilename}`),
             stream: null
           };
           fileSize = 0;
@@ -1986,7 +2061,9 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
           cleanupOnError = true;
         } else {
           // 普通字段
-          currentField = { name: nameMatch ? nameMatch[1] : '', value: '' };
+          // 普通字段：用 StringDecoder 处理多字节 UTF-8 字符跨 chunk 拼接
+          // 直接 toString('utf8') 在字符边界截断会产生 U+FFFD 替换字符
+          currentField = { name: nameMatch ? nameMatch[1] : '', value: '', decoder: new StringDecoder('utf8') };
           fieldSize = 0;
           state = 'BODY_FIELD';
         }
@@ -1997,7 +2074,8 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
           // 还没结束，缓存数据（但检查大小限制）
           // 保留尾部回看字节，防止分隔符跨 chunk 截断
           const safeLen = Math.max(0, buffer.length - lookBehind);
-          const chunk = buffer.toString('utf8', 0, safeLen);
+          // 用 StringDecoder 处理跨 chunk 的多字节 UTF-8 字符
+          const chunk = currentField.decoder.write(buffer.subarray(0, safeLen));
           fieldSize += safeLen;
           if (fieldSize > maxFieldSize) {
             const err = new Error(`Field exceeds maximum size of ${fmtSize(maxFieldSize)}`, { cause: { actual: fieldSize, maxSize: maxFieldSize } });
@@ -2010,7 +2088,7 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
           break;
         }
         // 字段结束
-        const chunk = buffer.toString('utf8', 0, idx);
+        const chunk = currentField.decoder.write(buffer.subarray(0, idx));
         fieldSize += idx;
         if (fieldSize > maxFieldSize) {
           const err = new Error(`Field exceeds maximum size of ${fmtSize(maxFieldSize)}`, { cause: { actual: fieldSize, maxSize: maxFieldSize } });
@@ -2019,6 +2097,8 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
             return;
           }
         currentField.value += chunk;
+        // 刷新 decoder 中残留的未完成字符（末尾不完整字节会用 U+FFFD 替换）
+        currentField.value += currentField.decoder.end();
         // 去掉末尾的 \r\n
         if (currentField.value.endsWith('\r\n')) {
           currentField.value = currentField.value.slice(0, -2);
@@ -2218,9 +2298,15 @@ class Application extends Router {
 
   /**
    * 设置全局运行时配置
+   * @param {string} name - 配置名（非字符串或空字符串时抛 TypeError）
+   * @param {*} value - 配置值；undefined 表示读取配置
    */
   set(name, value) {
     if (value === undefined) return this.settings[name];
+    // 防御：name 必须是非空字符串，避免 Object.keys(null) 或 settings[null] 导致异常
+    if (typeof name !== 'string' || name === '') {
+      throw new TypeError('app.set(name, value): name must be a non-empty string');
+    }
     this.settings[name] = value;
     // 同步更新日志级别
     if (name === 'logLevel') {
@@ -2394,13 +2480,22 @@ class Application extends Router {
   _dispatch(req, res) {
     // 收集所有匹配的中间件和路由
     const stack = [];
+    // 错误处理中间件单独收集，放到 stack 末尾：
+    //   app.use 注册的错误处理中间件在 mwMatches 中（位于路由之前），
+    //   若不放末尾，路由抛错时 _handleError 从路由 idx 向后查找会找不到前面的错误处理中间件
+    const errorHandlers = [];
 
-    // 1. 应用级和路径级中间件（跳过错误处理中间件，4参数函数）
+    // 1. 应用级和路径级中间件
+    // 错误处理中间件（4 参数函数）仍入栈但标记 isErrorHandler，正常链 next() 跳过
+    // （Express 兼容：4 参数函数即错误处理中间件）
     const mwMatches = this.matchMiddleware(req.path);
     for (const mw of mwMatches) {
       for (const handler of mw.middleware.handlers) {
-        if (handler.length === 4) continue; // 错误处理中间件不在正常链中执行
-        stack.push({ handler, params: mw.params });
+        if (handler.length === 4) {
+          errorHandlers.push({ handler, params: mw.params, isErrorHandler: true });
+        } else {
+          stack.push({ handler, params: mw.params, isErrorHandler: false });
+        }
       }
     }
 
@@ -2410,9 +2505,16 @@ class Application extends Router {
     const routeMatches = this.match(req.method, req.path);
     for (const match of routeMatches) {
       for (const handler of match.handlers) {
-        stack.push({ handler, params: match.params });
+        if (handler.length === 4) {
+          errorHandlers.push({ handler, params: match.params, isErrorHandler: true });
+        } else {
+          stack.push({ handler, params: match.params, isErrorHandler: false });
+        }
       }
     }
+
+    // 3. 错误处理中间件放到 stack 末尾，确保任何位置抛错都能向后找到
+    stack.push(...errorHandlers);
 
     let idx = 0;
 
@@ -2430,6 +2532,11 @@ class Application extends Router {
       }
 
       const item = stack[idx++];
+      // 正常链跳过错误处理中间件（4 参数函数仅处理错误）
+      if (item.isErrorHandler) {
+        next();
+        return;
+      }
       const handler = item.handler;
       // 每个 layer 执行前重置 req.params 为该 layer 自己的参数（与 Express 行为一致）
       // 避免中间件参数（如 use('/api/:version') 的 version）污染到路由处理器
@@ -2476,12 +2583,12 @@ class Application extends Router {
   _handleError(err, req, res, stack, startIdx) {
     // 无错误时直接返回（错误处理中间件调用 next() 无参数表示错误已处理）
     if (!err) return;
-    // 从当前栈中查找错误处理中间件
+    // 从当前栈中查找错误处理中间件（isErrorHandler 标记的 4 参数函数）
     for (let i = startIdx; i < stack.length; i++) {
-      const handler = stack[i].handler;
-      if (handler.length === 4) {
+      const item = stack[i];
+      if (item.isErrorHandler) {
         try {
-          handler(err, req, res, (e) => {
+          item.handler(err, req, res, (e) => {
             this._handleError(e || null, req, res, stack, i + 1);
           });
           return;
@@ -2532,13 +2639,18 @@ class Application extends Router {
     if (!cors) return;
     const reqOrigin = req.headers['origin'];
     let origin = '*';
-    // origin 支持字符串、数组、函数：数组/函数需 reqOrigin 精确判断，无 Origin 时回退 '*'
+    // origin 支持字符串、数组、函数：
+    //   - 字符串：直接使用（'*' 或具体域名）
+    //   - 数组：reqOrigin 在数组中才允许，否则拒绝（credentials=true 时拒绝；否则回退 '*'）
+    //   - 函数：返回 false/''/null 表示拒绝；返回字符串表示使用该值；返回 true 表示使用 reqOrigin
     if (typeof cors.origin === 'string') {
       origin = cors.origin;
     } else if (Array.isArray(cors.origin)) {
-      origin = (reqOrigin && cors.origin.includes(reqOrigin)) ? reqOrigin : '*';
+      origin = (reqOrigin && cors.origin.includes(reqOrigin)) ? reqOrigin : '';
     } else if (typeof cors.origin === 'function') {
-      origin = cors.origin(reqOrigin) || '*';
+      const result = cors.origin(reqOrigin);
+      // 函数返回 false/''/null 表示拒绝跨域请求，origin 置空（不设置 ACAO 头，浏览器会拒绝）
+      origin = result === false || result === null || result === '' ? '' : (result === true ? (reqOrigin || '') : String(result));
     }
     // credentials=true 时 origin 不能为 '*'（浏览器会拒绝），回退为具体来源
     if (cors.credentials && origin === '*') {
@@ -2784,10 +2896,17 @@ class Application extends Router {
         }
         // 捕获处理器异常，避免崩溃整个服务
         try {
-          const cleanup = matchedEntry.handler(ws, req);
-          if (typeof cleanup === 'function') {
-            ws.on('close', cleanup);
-          }
+          const ret = matchedEntry.handler(ws, req);
+          // 支持 async handler：返回 Promise<cleanup> 时等待 resolve 后再注册清理函数
+          // 同步 handler 返回函数时直接注册
+          Promise.resolve(ret).then(cleanup => {
+            if (typeof cleanup === 'function') {
+              ws.on('close', cleanup);
+            }
+          }).catch(e => {
+            this._logger.error('WebSocket async handler error:', e);
+            ws.close(1011, 'Internal server error');
+          });
         } catch (e) {
           this._logger.error('WebSocket handler error:', e);
           ws.close(1011, 'Internal server error');
@@ -2814,11 +2933,17 @@ class Application extends Router {
   sse(pathStr, handler) {
     this.get(pathStr, (req, res) => {
       const sseInstance = res.sse();
-      const cleanup = handler(sseInstance, req);
-      // 连接关闭时执行清理（通过 Response.on 代理，保持封装一致性）
-      if (typeof cleanup === 'function') {
-        res.on('close', cleanup);
-      }
+      const ret = handler(sseInstance, req);
+      // 支持 async handler：返回 Promise<cleanup> 时等待 resolve 后再注册清理函数
+      // 同步 handler 返回函数时直接注册
+      Promise.resolve(ret).then(cleanup => {
+        if (typeof cleanup === 'function') {
+          res.on('close', cleanup);
+        }
+      }).catch(e => {
+        this._logger.error('SSE async handler error:', e);
+        sseInstance.close();
+      });
     });
   }
 
@@ -2983,7 +3108,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.3.3';
+httpm.version = '1.3.4';
 
 /**
  * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）

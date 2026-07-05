@@ -9,6 +9,7 @@ const httpm = require('./httpm');
 
 let passed = 0;
 let failed = 0;
+let skipped = 0;
 const results = [];
 
 function assert(condition, msg) {
@@ -19,6 +20,16 @@ function assert(condition, msg) {
     failed++;
     results.push('  FAIL: ' + msg);
   }
+}
+
+/**
+ * 显式标记测试为 SKIP（既不计入 PASS 也不计入 FAIL）
+ * 用于环境/依赖原因无法执行的测试（如 WebSocket 在某些环境不可用）
+ * 区别于 assert(true, 'skipped')：后者会虚假增加 PASS 计数，掩盖测试失效
+ */
+function assertSkip(msg, reason) {
+  skipped++;
+  results.push('  SKIP: ' + msg + (reason ? ' | ' + reason : ''));
 }
 
 function section(title) {
@@ -905,6 +916,8 @@ async function runTests() {
   fs.writeFileSync(path.join(testDir, 'index.html'), '<h1>Hello httpm</h1>');
   fs.writeFileSync(path.join(testDir, 'test.txt'), 'This is a test file for httpm.');
   fs.writeFileSync(path.join(testDir, 'large.txt'), 'A'.repeat(2048));
+  // P0-2 验证：创建空文件用于 sendFile 空文件测试
+  fs.writeFileSync(path.join(testDir, 'empty.txt'), '');
 
   // 创建子目录
   const subDir = path.join(testDir, 'subdir');
@@ -1118,9 +1131,27 @@ async function runTests() {
   // --- 新增：P3 #17 redirect back 回退到 Referer ---
   app.get('/redirect-back', (req, res) => res.redirect('back'));
 
-  // 错误处理中间件
+  // --- P0-1 验证：路由路径含正则特殊字符应正常匹配（不转义会崩溃或匹配不精确） ---
+  app.get('/api.json', (req, res) => res.json({ dot: true }));
+  app.get('/users(test)', (req, res) => res.json({ paren: true }));
+
+  // --- P0-2 验证：空文件 sendFile 不崩溃 ---
+  app.get('/empty-file', (req, res) => {
+    res.sendFile(path.join(testDir, 'empty.txt'));
+  });
+
+  // --- P1-1 验证：SSE send 换行符应拆多行 data: ---
+  app.get('/sse-newline', (req, res) => {
+    const sse = res.sse();
+    sse.send('line1\nline2');
+    sse.event('multi', 'data1\ndata2');
+    sse.close();
+  });
+
+  // 错误处理中间件（P0-5 修复后应被正确调用）
+  // 返回 handled: true 标记，用于验证错误确实由错误处理中间件处理（而非默认错误响应）
   app.use((err, req, res, next) => {
-    res.status(err.status || 500).json({ error: err.message });
+    res.status(err.status || 500).json({ error: err.message, handled: true });
   });
 
   const server = app.listen(PORT);
@@ -1460,7 +1491,7 @@ async function runTests() {
           assert(false, 'HTTP - Gzip decompress error: ' + gzErr.message);
         }
       } else {
-        assert(true, 'HTTP - Gzip not applied (skipped)');
+        assertSkip('HTTP - Gzip not applied', 'response not gzipped');
       }
     }
 
@@ -1589,7 +1620,7 @@ async function runTests() {
         socket.destroy();
       } catch (wsErr) {
         // WebSocket 测试可能因环境问题失败，标记为跳过
-        assert(true, 'HTTP - WebSocket test skipped: ' + wsErr.message);
+        assertSkip('HTTP - WebSocket test', wsErr.message);
       }
     }
 
@@ -1606,7 +1637,7 @@ async function runTests() {
         assert(r1 === 'echo:msg1' && r2 === 'echo:msg2' && r3 === 'echo:msg3', 'HTTP - WebSocket multiple messages');
         socket.destroy();
       } catch (wsErr) {
-        assert(true, 'HTTP - WebSocket multi-msg test skipped: ' + wsErr.message);
+        assertSkip('HTTP - WebSocket multi-msg test', wsErr.message);
       }
     }
 
@@ -1631,7 +1662,7 @@ async function runTests() {
         assert(reply === 'echo:01020304', 'HTTP - WebSocket binary echo hex');
         socket.destroy();
       } catch (wsErr) {
-        assert(true, 'HTTP - WebSocket binary test skipped: ' + wsErr.message);
+        assertSkip('HTTP - WebSocket binary test', wsErr.message);
       }
     }
 
@@ -1699,7 +1730,7 @@ async function runTests() {
         assert(reply === '42', 'HTTP - WebSocket send number as text');
         socket.destroy();
       } catch (wsErr) {
-        assert(true, 'HTTP - WebSocket number test skipped: ' + wsErr.message);
+        assertSkip('HTTP - WebSocket number test', wsErr.message);
       }
     }
 
@@ -1725,7 +1756,7 @@ async function runTests() {
         assert(reply === null, 'HTTP - WebSocket close handshake completes');
         socket.destroy();
       } catch (wsErr) {
-        assert(true, 'HTTP - WebSocket close test skipped: ' + wsErr.message);
+        assertSkip('HTTP - WebSocket close test', wsErr.message);
       }
     }
 
@@ -1782,6 +1813,50 @@ async function runTests() {
       assert(res.headers['location'] === '/', 'HTTP - redirect back fallback to /');
     }
 
+    // --- P0-1 验证：路由路径含正则特殊字符应正常匹配 ---
+    {
+      // /api.json 的 . 不应匹配任意字符（/apiXjson 不应命中）
+      const res1 = await httpGet(BASE + '/api.json');
+      const obj1 = JSON.parse(await readBodyStr(res1));
+      assert(obj1.dot === true, 'HTTP - route with dot matches literally');
+
+      const res2 = await httpGet(BASE + '/apiXjson');
+      await readBodyStr(res2);
+      assert(res2.statusCode === 404, 'HTTP - dot not treated as wildcard');
+
+      // /users(test) 的括号应被转义
+      const res3 = await httpGet(BASE + '/users(test)');
+      const obj3 = JSON.parse(await readBodyStr(res3));
+      assert(obj3.paren === true, 'HTTP - route with parens matches literally');
+    }
+
+    // --- P0-2 验证：空文件 sendFile 不崩溃 ---
+    {
+      const res = await httpGet(BASE + '/empty-file');
+      await readBodyStr(res);
+      assert(res.statusCode === 200, 'HTTP - empty file sendFile status 200');
+      assert(res.headers['content-length'] === '0', 'HTTP - empty file content-length 0');
+    }
+
+    // --- P0-5 验证：错误处理中间件被正确调用 ---
+    {
+      const res = await httpGet(BASE + '/api/error-sync');
+      const obj = JSON.parse(await readBodyStr(res));
+      assert(obj.handled === true, 'HTTP - error handled by error-handling middleware');
+    }
+
+    // --- P1-1 验证：SSE send 换行符拆多行 data: ---
+    {
+      const res = await httpRequest({
+        hostname: 'localhost', port: PORT, path: '/sse-newline', method: 'GET'
+      });
+      const body = await readBodyStr(res);
+      // send('line1\nline2') 应输出 data: line1\ndata: line2\n\n
+      assert(body.includes('data: line1\ndata: line2'), 'HTTP - SSE multiline data split correctly');
+      // event('multi', 'data1\ndata2') 应输出 event: multi\ndata: data1\ndata: data2\n\n
+      assert(body.includes('event: multi\ndata: data1\ndata: data2'), 'HTTP - SSE multiline event data split correctly');
+    }
+
   } catch (e) {
     assert(false, 'HTTP integration test error: ' + e.message + '\n' + e.stack);
   }
@@ -1800,6 +1875,7 @@ async function runTests() {
     fs.unlinkSync(path.join(testDir, 'index.html'));
     fs.unlinkSync(path.join(testDir, 'test.txt'));
     fs.unlinkSync(path.join(testDir, 'large.txt'));
+    fs.unlinkSync(path.join(testDir, 'empty.txt'));
     fs.unlinkSync(path.join(subDir, 'nested.html'));
     fs.rmSync(subDir, { recursive: true });
     fs.rmSync(testDir, { recursive: true });
@@ -1826,7 +1902,7 @@ async function runTests() {
 
   // 输出结果
   console.log(results.join('\n'));
-  console.log('\nResult: ' + passed + ' passed, ' + failed + ' failed, total ' + (passed + failed));
+  console.log('\nResult: ' + passed + ' passed, ' + failed + ' failed, ' + skipped + ' skipped, total ' + (passed + failed + skipped));
   if (failed > 0) process.exit(1);
 }
 
