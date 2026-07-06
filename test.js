@@ -69,10 +69,12 @@ function httpRequest(opts, body) {
 }
 
 function readBody(res) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const chunks = [];
     res.on('data', c => chunks.push(c));
     res.on('end', () => resolve(Buffer.concat(chunks)));
+    // 加 error 处理：连接异常断开时 reject，避免 Promise 永久挂起
+    res.on('error', reject);
   });
 }
 
@@ -169,6 +171,7 @@ function wsReadText(socket) {
       // 如果解析出了帧，消费第一个
       if (state.queue.length > 0) {
         socket.removeListener('data', onData);
+        socket.removeListener('error', onError);
         clearTimeout(timeout);
         const frame = state.queue.shift();
         if (frame.opcode === 0x01) resolve(frame.payload.toString('utf8'));
@@ -177,7 +180,15 @@ function wsReadText(socket) {
       }
     };
 
+    // 加 error 处理：socket 异常断开时 reject，避免 Promise 永久挂起
+    const onError = (err) => {
+      socket.removeListener('data', onData);
+      clearTimeout(timeout);
+      reject(err);
+    };
+
     socket.on('data', onData);
+    socket.on('error', onError);
   });
 }
 
@@ -381,6 +392,26 @@ async function runTests() {
     assert(httpm.fmtTime(500).includes('ms'), 'fmtTime - 500ms');
     assert(httpm.fmtTime(1500).includes('s'), 'fmtTime - 1.5s');
     assert(httpm.fmtTime(120000).includes('m'), 'fmtTime - 2m');
+    assert(httpm.fmtTime(3600000).includes('h'), 'fmtTime - 1h');
+    // 反向：非数字/负数返回 0ms（P2-1 修复）
+    assert(httpm.fmtTime(NaN) === '0ms', 'fmtTime - NaN returns 0ms');
+    assert(httpm.fmtTime(-1) === '0ms', 'fmtTime - negative returns 0ms');
+    assert(httpm.fmtTime(null) === '0ms', 'fmtTime - null returns 0ms');
+  }
+
+  section('工具函数 - escapeHtml');
+
+  {
+    // 正向：特殊字符转义
+    assert(httpm.escapeHtml('<script>') === '&lt;script&gt;', 'escapeHtml - angle brackets');
+    assert(httpm.escapeHtml('"hello"') === '&quot;hello&quot;', 'escapeHtml - double quotes');
+    assert(httpm.escapeHtml("it's") === 'it&#39;s', 'escapeHtml - single quotes');
+    assert(httpm.escapeHtml('a & b') === 'a &amp; b', 'escapeHtml - ampersand');
+    // 反向：null/undefined 不抛异常
+    assert(httpm.escapeHtml(null) === '', 'escapeHtml - null returns empty');
+    assert(httpm.escapeHtml(undefined) === '', 'escapeHtml - undefined returns empty');
+    // 正向：无特殊字符不变
+    assert(httpm.escapeHtml('hello world') === 'hello world', 'escapeHtml - no special chars');
   }
 
   section('工具函数 - isPathSafe');
@@ -1574,6 +1605,15 @@ async function runTests() {
       // 签名值以 s: 开头
       const cookieStr = Array.isArray(setCookie) ? setCookie.join('; ') : setCookie;
       assert(cookieStr.includes('s%3A') || cookieStr.includes('s:'), 'HTTP - signed cookie has s: prefix');
+
+      // P2-8: 验证签名 Cookie 读取
+      // 提取 Cookie 值（token=xxx），用于后续请求的 Cookie 头
+      const cookieValue = setCookie.map(c => c.split(';')[0]).join('; ');
+      const readRes = await httpGet(BASE + '/api/signed-cookie-read', { Cookie: cookieValue });
+      const readObj = JSON.parse(await readBodyStr(readRes));
+      assert(readObj.signedCookies.token === 'abc123', 'HTTP - signed cookie read verifies and returns original value');
+      // 验证通过后，签名 Cookie 应从 req.cookies 中删除（Express 兼容）
+      assert(readObj.cookies.token === undefined, 'HTTP - verified signed cookie removed from req.cookies');
     }
 
     // --- 不存在的静态文件 404 ---

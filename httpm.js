@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.3.4
+ * @version     1.3.5
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -65,20 +65,28 @@ function _parseQueryString(qs, plusAsSpace = false) {
   qs.split('&').forEach(pair => {
     const eIdx = pair.indexOf('=');
     if (eIdx === -1) {
+      // 无等号：整个 pair 作为 key，值为空字符串
+      const key = plusAsSpace ? pair.replace(/\+/g, ' ') : pair;
+      // 跳过空 key（如 "?&foo=bar" 中的空段），避免污染 query 对象
+      if (!key) return;
       try {
-        query[decodeURIComponent(plusAsSpace ? pair.replace(/\+/g, ' ') : pair)] = '';
+        query[decodeURIComponent(key)] = '';
       } catch (e) {
         // 非法 URI 编码，保留原始值
-        query[plusAsSpace ? pair.replace(/\+/g, ' ') : pair] = '';
+        query[key] = '';
       }
     } else {
       const key = pair.substring(0, eIdx);
       const val = pair.substring(eIdx + 1);
+      // 跳过空 key（如 "=value" 形式），避免污染 query 对象
+      if (!key) return;
+      const decodedKey = plusAsSpace ? key.replace(/\+/g, ' ') : key;
+      const decodedVal = plusAsSpace ? val.replace(/\+/g, ' ') : val;
       try {
-        query[decodeURIComponent(plusAsSpace ? key.replace(/\+/g, ' ') : key)] = decodeURIComponent(plusAsSpace ? val.replace(/\+/g, ' ') : val);
+        query[decodeURIComponent(decodedKey)] = decodeURIComponent(decodedVal);
       } catch (e) {
         // 非法 URI 编码，保留原始值
-        query[plusAsSpace ? key.replace(/\+/g, ' ') : key] = plusAsSpace ? val.replace(/\+/g, ' ') : val;
+        query[decodedKey] = decodedVal;
       }
     }
   });
@@ -97,7 +105,15 @@ function parseCookies(cookieStr) {
     const key = pair.substring(0, eIdx).trim();
     // 过滤空键（如 "=value" 形式），避免污染 cookies 对象
     if (!key) return;
-    const val = pair.substring(eIdx + 1).trim();
+    const rawVal = pair.substring(eIdx + 1).trim();
+    // Cookie 值可能含 URL 编码（如 name=%E4%B8%AD%E6%96%87），尝试解码
+    // 解码失败（非法编码）保留原始值，避免抛异常
+    let val;
+    try {
+      val = decodeURIComponent(rawVal);
+    } catch (e) {
+      val = rawVal;
+    }
     cookies[key] = val;
   });
   return cookies;
@@ -196,6 +212,8 @@ function fmtSize(bytes) {
  * 毫秒时间格式化（ms/s/m/h）
  */
 function fmtTime(ms) {
+  // 防御非数字/负数，避免 toFixed 抛 TypeError 或返回 NaN
+  if (!Number.isFinite(ms) || ms < 0) return '0ms';
   if (ms < 1000) return ms.toFixed(0) + 'ms';
   if (ms < 60000) return (ms / 1000).toFixed(2) + 's';
   if (ms < 3600000) return (ms / 60000).toFixed(2) + 'm';
@@ -206,6 +224,8 @@ function fmtTime(ms) {
  * 路径安全校验，防遍历攻击
  */
 function isPathSafe(requestPath, rootDir, allowAllFiles = false) {
+  // 防御非字符串入参：null/undefined/数字等会导致 replace/path.resolve 抛异常
+  if (typeof requestPath !== 'string' || typeof rootDir !== 'string') return false;
   const normalized = requestPath.replace(/^\/+/, '');
   const resolved = path.resolve(rootDir, normalized);
   const root = path.resolve(rootDir);
@@ -226,6 +246,10 @@ function isPathSafe(requestPath, rootDir, allowAllFiles = false) {
  * 根据文件信息生成 ETag 缓存标识
  */
 function generateETag(stat) {
+  // 防御非 stat 对象：null/undefined 或缺少 size/mtimeMs 属性会导致 toString 抛异常
+  if (!stat || typeof stat.size !== 'number' || typeof stat.mtimeMs !== 'number') {
+    return '"' + uid() + '"'; // 返回随机值，强制缓存失效
+  }
   const hash = crypto.createHash('md5');
   hash.update(stat.size.toString(36));
   hash.update(stat.mtimeMs.toString(36));
@@ -286,6 +310,8 @@ class Logger {
     //   true = 控制台打印错误详情后退出进程，便于进程管理器（pm2/systemd）感知并重启
     //   注：配置项名取最常见场景（磁盘满 disk full），实际任何写入错误都会触发退出
     this.exitOnDiskFull = options.exitOnDiskFull === true;
+    // 防止多次 process.exit：error 事件可能连续触发，重复 exit 无意义且可能产生竞态
+    this._exiting = false;
     this._levels = { debug: 0, info: 1, notice: 2, warn: 3, error: 4, fatal: 5 };
     this._colors = {
       debug: '\x1b[1;30m',   // 灰色
@@ -309,7 +335,8 @@ class Logger {
     const code = err && err.code ? ` [${err.code}]` : '';
     const msg = err && err.message ? err.message : String(err);
     console.error(`[Logger] 日志文件写入失败${code}: ${msg}`);
-    if (this.exitOnDiskFull) {
+    if (this.exitOnDiskFull && !this._exiting) {
+      this._exiting = true;
       console.error(`[Logger] exitOnDiskFull=true，进程即将退出。原因${code}: ${msg}`);
       process.exit(1);
     }
@@ -734,6 +761,8 @@ class Response {
    * 适用于 Set-Cookie、Link 等多值头场景
    */
   append(field, value) {
+    // 防御 null/undefined value，避免写入无效头值
+    if (value === null || value === undefined) return this;
     const prev = this.getHeader(field);
     if (prev) {
       // 已有值：合并为数组
@@ -2103,12 +2132,15 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
         if (currentField.value.endsWith('\r\n')) {
           currentField.value = currentField.value.slice(0, -2);
         }
-        // 同名字段聚合为数组（Express 兼容）
-        const existingField = req.formData.fields[currentField.name];
-        if (existingField !== undefined) {
-          req.formData.fields[currentField.name] = Array.isArray(existingField) ? [...existingField, currentField.value] : [existingField, currentField.value];
-        } else {
-          req.formData.fields[currentField.name] = currentField.value;
+        // 防御空字段名：nameMatch 未匹配时 name 为空字符串，跳过赋值避免污染 formData.fields['']
+        if (currentField.name) {
+          // 同名字段聚合为数组（Express 兼容）
+          const existingField = req.formData.fields[currentField.name];
+          if (existingField !== undefined) {
+            req.formData.fields[currentField.name] = Array.isArray(existingField) ? [...existingField, currentField.value] : [existingField, currentField.value];
+          } else {
+            req.formData.fields[currentField.name] = currentField.value;
+          }
         }
         buffer = buffer.subarray(idx + delimiter.length);
         // 跳过 \r\n
@@ -2426,6 +2458,8 @@ class Application extends Router {
       };
       this.server.close(done);
       const timer = setTimeout(done, 2000);
+      // unref 防止 timer 阻止进程退出（测试场景下 app.close 后进程应能正常退出）
+      if (typeof timer.unref === 'function') timer.unref();
     } else if (callback) {
       callback();
     }
@@ -2538,14 +2572,17 @@ class Application extends Router {
         return;
       }
       const handler = item.handler;
+      // 保存当前 handler 在 stack 中的位置快照
+      // async handler 的 Promise.catch 触发时 idx 闭包可能已变化，需用快照定位错误处理起点
+      const currentIdx = idx;
       // 每个 layer 执行前重置 req.params 为该 layer 自己的参数（与 Express 行为一致）
       // 避免中间件参数（如 use('/api/:version') 的 version）污染到路由处理器
       // 路由处理器若需读取路径级中间件设置的参数，应在中间件中挂到 req 自定义属性上
       req.params = item.params || {};
-      // 防止同一 handler 多次调用 next()
+      // 防止同一 handler 多次调用 next()（无论是否有 err，只允许一次 next 调用）
       let handlerCalledNext = false;
       const safeNext = (e) => {
-        if (handlerCalledNext && !e) return;
+        if (handlerCalledNext) return;
         handlerCalledNext = true;
         next(e);
       };
@@ -2564,13 +2601,15 @@ class Application extends Router {
               this._serveStatic(req, res);
             }
           }).catch(err => {
-            this._handleError(err, req, res, stack, idx);
+            // 用 currentIdx 快照定位错误处理起点，避免 idx 闭包失效
+            this._handleError(err, req, res, stack, currentIdx);
           });
         }
       } catch (err) {
         // handler 已通过 next(err) 传递错误时，跳过避免重复处理
         if (handlerCalledNext) return;
-        this._handleError(err, req, res, stack, idx);
+        // 用 currentIdx 快照定位错误处理起点
+        this._handleError(err, req, res, stack, currentIdx);
       }
     };
 
@@ -3108,7 +3147,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.3.4';
+httpm.version = '1.3.5';
 
 /**
  * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）

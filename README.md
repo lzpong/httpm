@@ -5,7 +5,7 @@
 ## 特性
 
 - **单文件架构** — 所有代码整合至 `httpm.js`，拷贝即用
-- **零第三方依赖** — 仅使用 Node.js 内置模块（`http`、`https`、`fs`、`path`、`crypto`、`zlib`）
+- **零第三方依赖** — 仅使用 Node.js 内置模块（`http`、`https`、`http2`、`fs`、`path`、`crypto`、`zlib`、`util`、`string_decoder`）
 - **Express 兼容** — 路由、中间件、请求/响应 API 对齐 Express 语法
 - **静态文件服务** — Range 断点续传、ETag/Last-Modified 缓存、Gzip 压缩
 - **WebSocket** — 路径分组、心跳保活、广播、文本/二进制子事件、分片帧支持、动态参数路由

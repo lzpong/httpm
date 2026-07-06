@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.3.4
+**文档版本**：V1.3.5
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -108,6 +108,15 @@ httpm 是基于 Node.js 原生模块开发的**单文件、零依赖** HTTP 服�
 
 `Application extends Router`
 
+#### 构造函数自动注册中间件
+
+构造函数会根据配置自动注册两个内置中间件（可通过配置关闭）：
+
+- `useBodyParser !== false`（默认启用）：自动注册 `bodyParser` 中间件，解析 JSON/urlencoded/multipart 请求体；
+- `useCookieParser !== false`（默认启用）：自动注册 `cookieParser` 中间件，解析 Cookie 并支持签名验证。
+
+这两个中间件在所有用户注册的中间件之前执行，确保 `req.body`、`req.cookies`、`req.signedCookies` 在后续中间件和路由中可用。
+
 #### 核心属性
 
 ```javascript
@@ -185,9 +194,10 @@ class Router {
 
 1. 遍历路径，匹配 `:参数名` 占位符；
 2. 收集所有参数名存入 `params` 数组；
-3. 将占位符替换为正则捕获组 `([^/]+)`；
-4. 生成完整正则对象用于路径匹配；
-5. 同时生成 `prefixPattern`（前缀匹配正则，供路径级中间件使用）：路径之后必须跟随 `/` 或字符串结尾（`(?=/|$)`）作为边界，避免 `/api` 误匹配 `/apixyz`；`/` 特殊处理为 `/^\//`，匹配所有以 `/` 开头的路径（根路径中间件等价于应用级中间件）。
+3. **非参数部分转义**：用 `:参数名` 作为分隔符 split 路径，对每一段静态文本调用 `seg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')` 转义正则特殊字符，避免 `.`、`(`、`[`、`+`、`?` 等字符被当作正则元字符解释（如 `/api.json` 中的 `.` 不转义会匹配 `apiXjson`，`/users(test)` 会抛 SyntaxError）；
+4. 将占位符替换为正则捕获组 `([^/]+)`，与转义后的静态段拼接成完整 pattern；
+5. 生成完整正则对象用于路径匹配；
+6. 同时生成 `prefixPattern`（前缀匹配正则，供路径级中间件使用）：路径之后必须跟随 `/` 或字符串结尾（`(?=/|$)`）作为边界，避免 `/api` 误匹配 `/apixyz`；`/` 特殊处理为 `/^\//`，匹配所有以 `/` 开头的路径（根路径中间件等价于应用级中间件）。
 
 #### 参数传递语义（_dispatch）
 
@@ -210,8 +220,11 @@ OPTIONS 请求有两种语义，httpm 分别处理：
 
 `cors.origin` 配置支持三种形式：
 - **字符串**（如 `'*'` 或 `'https://example.com'`）：直接作为 Allow-Origin 值；
-- **数组**（如 `['https://a.com', 'https://b.com']`）：检查请求 Origin 是否在列表中，匹配则回显该 Origin，并附加 `Vary: Origin` 头；
-- **函数**（如 `origin => origin.endsWith('.com') ? origin : '*'`）：动态计算 Allow-Origin 值。
+- **数组**（如 `['https://a.com', 'https://b.com']`）：白名单校验，请求 Origin 在列表中才回显该 Origin 并附加 `Vary: Origin` 头；不在列表中则不设置 ACAO 头（拒绝跨域），`credentials=true` 时同样拒绝；
+- **函数**（如 `origin => origin.endsWith('.com') ? origin : false`）：动态计算 Allow-Origin 值。返回值语义：
+  - 返回字符串：作为 Allow-Origin 值
+  - 返回 `true`：使用请求 Origin 作为 Allow-Origin 值
+  - 返回 `false`/`null`/`''`：拒绝跨域请求（不设置 ACAO 头，浏览器会拒绝）
 
 `_getAllowedMethods(pathname)` 方法遍历所有已注册路由，查找匹配该路径的方法，并自动补充隐式规则：
 - GET 路由隐式支持 HEAD；
@@ -302,10 +315,12 @@ class Request {
 
 #### sendFile 核心逻辑
 
-1. **Range 断点续传**：识别请求 `Range` 头，返回 206 分段响应；
-2. **缓存校验**：通过 ETag、Last-Modified 校验，命中缓存返回 304；
-3. **Gzip 压缩**：对文本类文件，根据客户端 `Accept-Encoding` 自动开启压缩；
-4. **HEAD 请求**：匹配 GET 路由但仅发送响应头，不发送响应体（Express 兼容行为）。
+1. **路径遍历防护**：配置 `root` 时，解析后 fullPath 必须等于 root 或以 `root + path.sep` 开头，否则返回 403 并中止；
+2. **空文件特判**：`stat.size === 0` 时跳过 Range/缓存/Gzip 流程，直接 `res.end()` 返回空响应体（避免 `end = size - 1 = -1` 触发 `createReadStream({start:0, end:-1})` 的 RangeError）；
+3. **Range 断点续传**：识别请求 `Range` 头，返回 206 分段响应；
+4. **缓存校验**：通过 ETag、Last-Modified 校验，命中缓存返回 304；
+5. **Gzip 压缩**：对文本类文件，根据客户端 `Accept-Encoding` 自动开启压缩；
+6. **HEAD 请求**：匹配 GET 路由但仅发送响应头，不发送响应体（Express 兼容行为）。
 
 ### 3.5 SSE 类
 
@@ -328,6 +343,26 @@ class Request {
 - `comment(text)`：		发送注释消息（可作为心跳保活）；
 - `close()`：			主动关闭 SSE 连接，自动移除 `close`/`aborted` 事件监听器防止内存泄漏。
 
+#### 换行符处理（SSE 协议合规）
+
+SSE 协议规定每行数据以 `data:` 前缀开头，消息之间以 `\n\n` 分隔。若消息体本身包含 `\n`，直接拼接 `data: ${msg}\n\n` 会插入额外的 `data:` 行，导致客户端解析出多条消息或解析错误。httpm 对 `send` 和 `event` 方法做换行符拆分处理：
+
+```javascript
+const lines = msg.split('\n');
+this._res.write(lines.map(l => `data: ${l}`).join('\n') + '\n\n');
+```
+
+`event(name, data)` 还会校验事件名不能包含 `\n`（事件名跨行违反协议），违规时直接返回不发送。
+
+#### 连接断开检测
+
+SSE 监听两类断开事件以兼容 HTTP/1.1 与 HTTP/2：
+
+- **ServerResponse 的 `close` 事件**：底层 socket 关闭时触发（HTTP/1.1 主要路径）；
+- **IncomingMessage 的 `aborted` 事件**：客户端主动 abort 时触发（HTTP/2 主要路径）。
+
+`res.sse()` 内部从 `req._req`（httpm Request 包装的底层 IncomingMessage）取得原始请求对象监听 `aborted`，构造函数中加 `typeof req.on === 'function'` 校验防御非 IncomingMessage 入参。
+
 #### 使用规则
 
 注册 SSE 路由时，支持返回清理函数，连接断开后自动执行资源回收。
@@ -342,12 +377,13 @@ class Request {
 2. `send(data)` 方法：自动区分文本、JSON 对象、二进制 Buffer，匹配对应帧类型；
 3. `close(code = 1000, reason = '')` 方法：先发送 Close 帧（此时 connected 仍为 true），再标记 connected=false、_closing=true，限时 2 秒等待对端 Close 帧，超时则强制销毁 socket 并触发 `close` 事件携带原始 code/reason；
 4. Close 帧状态码：对端发送无状态码的 Close 帧时，默认为 1005（RFC 6455 规定的"无状态码"语义码），非法状态码（0-999）自动修正为 1005；
-5. RFC 6455 Section 7.4.1 规定：1005（无状态码）和 1006（异常关闭）不得在 Close 帧中发送，httpm 在回复 Close 帧时会自动将这两种状态码替换为不携带状态码的 Close 帧；
+5. RFC 6455 Section 7.4.1 规定：1005（无状态码）、1006（异常关闭）、1015（TLS 握手失败）不得在 Close 帧中发送，httpm 在回复 Close 帧时会自动将这三种状态码替换为不携带状态码的 Close 帧；
 6. 关闭握手期间（_closing=true）：忽略非控制帧，仅处理 Ping/Pong/Close 帧；
-7. 帧负载长度超过 `Number.MAX_SAFE_INTEGER` 时视为超限帧，拒绝处理；
-8. 支持分片帧解析（continuation frame），多帧消息自动合并后触发事件；
-9. 发送失败时触发 `error` 事件，便于用户感知和处理异常；
-10. 监听底层套接字事件，处理消息接收、连接断开。
+7. RFC 6455 协议校验：客户端帧必须掩码（未掩码帧按协议错误关闭连接）；控制帧（Close/Ping/Pong）负载不得超过 125 字节且不可分片（FIN 必须为 1），违反时以 1002 关闭连接；
+8. 帧负载长度超过 `Number.MAX_SAFE_INTEGER` 时视为超限帧，拒绝处理；
+9. 支持分片帧解析（continuation frame），多帧消息自动合并后触发事件；
+10. 发送失败时触发 `error` 事件，便于用户感知和处理异常；
+11. 监听底层套接字事件，处理消息接收、连接断开。
 
 #### 3.6.2 WebSocketServer 类
 
@@ -604,6 +640,30 @@ const defaultConfig = {
 
 请求响应完成后，自动删除当前请求产生的所有临时文件；客户端主动断开连接时，同步清理已生成的不完整临时文件。
 
+### 7.4 文件名安全处理
+
+multipart 上传的文件名存在路径遍历风险（客户端可构造 `../../etc/passwd` 等文件名覆盖系统文件），httpm 在解析文件名时执行以下安全处理：
+
+1. **分隔符替换**：将文件名中的 `\` 和 `/` 替换为 `_`，避免路径分隔符被解析；
+2. **basename 提取**：使用 `path.basename()` 提取最后一层文件名，丢弃任何目录前缀；
+3. **特殊文件名兜底**：若处理后文件名为 `.`、`..` 或空字符串，统一替换为 `unnamed`。
+
+```javascript
+let safeFilename = filenameMatch[1].replace(/[\\\/]/g, '_');
+safeFilename = path.basename(safeFilename);
+if (safeFilename === '.' || safeFilename === '..' || safeFilename === '') {
+  safeFilename = 'unnamed';
+}
+```
+
+### 7.5 多字节 UTF-8 跨 chunk 安全处理
+
+multipart 表单字段值可能包含多字节 UTF-8 字符（如中文），当多字节字符被 chunk 边界截断时，直接 `buffer.toString('utf8')` 会产生乱码（替换字符 `\uFFFD`）。httpm 使用 `StringDecoder` 替代直接拼接：
+
+1. 字段开始时创建 `new StringDecoder('utf8')`；
+2. 每个 chunk 通过 `decoder.write(buffer)` 解码，未完成的多字节序列暂存于 decoder 内部；
+3. 字段结束时调用 `decoder.end()` 刷新剩余字节，确保完整 UTF-8 序列输出。
+
 ---
 
 ## 8. 通用工具函数设计
@@ -615,7 +675,7 @@ const defaultConfig = {
 3. **`parseCookies`**：解析 Cookie 字符串为键值对象；
 4. **`getMimeType`**：根据文件后缀匹配标准 MIME 类型；
 5. **`fmtSize`**：字节单位格式化（B/KB/MB/GB/TB），智能小数位处理；
-6. **`fmtTime`**：毫秒时间格式化（ms/s/m）；
+6. **`fmtTime`**：毫秒时间格式化（ms/s/m/h）；
 7. **`isPathSafe`**：路径安全校验，防遍历攻击，支持 `allowAllFiles` 选项允许访问隐藏文件；
 8. **`generateETag`**：根据文件信息生成缓存标识；
 9. **`parseRange`**：解析 Range 请求头，提取字节分段范围；
@@ -642,6 +702,33 @@ app.use((err, req, res, next) => {
   // 统一返回错误响应
 });
 ```
+
+#### 执行机制（对齐 Express 语义）
+
+错误处理中间件在 `_dispatch` 阶段单独收集，**放到 stack 末尾**，与正常中间件/路由处理器分离：
+
+1. **收集阶段**：遍历匹配到的中间件和路由，按 `handler.length === 4` 分流：
+   - 4 参数函数 → `errorHandlers` 数组（标记 `isErrorHandler: true`）
+   - 3 参数及以下函数 → `stack` 数组（标记 `isErrorHandler: false`）
+2. **拼接阶段**：`stack.push(...errorHandlers)`，错误处理中间件统一放在 stack 末尾；
+3. **正常链执行**：`_dispatch` 顺序执行 stack，遇到 `isErrorHandler: true` 的项直接跳过（正常请求不进入错误处理中间件）；
+4. **错误链执行**：`_handleError(err, req, res, stack, startIdx)` 从抛错位置向后查找第一个 `isErrorHandler: true` 的项调用其 handler，handler 内调用 `next(err)` 可继续向后传递给下一个错误处理中间件。
+
+> **为什么需要单独收集到末尾**：错误处理中间件通常通过 `app.use` 注册在路由之前（先注册），但路由抛错时 `_handleError` 从路由 idx 向后查找错误处理中间件。若按注册顺序混排，错误处理中间件位于路由之前会找不到，导致错误无人处理。Express 通过 `layer.HandleError` 在每一层都尝试调用错误处理中间件解决此问题，httpm 采用更简单的"末尾收集"策略达成相同效果。
+
+#### safeNext 防护
+
+`safeNext` 包装确保同一处理器多次调用 `next()` 时仅首次生效（无论是否传 err），防止重复响应或重复进入错误链：
+
+```javascript
+const safeNext = (e) => {
+  if (handlerCalledNext) return; // 仅首次生效
+  handlerCalledNext = true;
+  next(e);
+};
+```
+
+> 注：早先实现 `if (handlerCalledNext && !e) return` 允许先 `next()` 再 `next(err)`，会导致重复进入错误链，已修复为无条件去重。
 
 ---
 
@@ -680,7 +767,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.3.4';
+httpm.version = '1.3.5';
 
 module.exports = httpm;
 ```
@@ -769,7 +856,7 @@ app.sse('/events', (sse, req) => {
 ```json
 {
   "name": "@lzpong/httpm",
-  "version": "1.3.4",
+  "version": "1.3.5",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
   "engines": { "node": ">=18.0.0" },
