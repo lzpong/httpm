@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.3.5
+ * @version     1.3.6
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -1030,6 +1030,10 @@ class Response {
         };
         raw.on('error', onError);
         gzip.on('error', onError);
+        // 目标（响应）异常或客户端断开时销毁源流和压缩流，防止文件描述符泄漏
+        const onDestError = () => { raw.destroy(); gzip.destroy(); };
+        this._res.on('error', onDestError);
+        this._res.on('close', onDestError);
         // 流完成时回调
         this._res.on('finish', () => doneOnce(null));
         raw.pipe(gzip).pipe(this._res);
@@ -1071,6 +1075,11 @@ class Response {
       }
       done(err);
     });
+    // 目标（响应）异常或客户端断开时销毁源流，防止文件描述符泄漏
+    // pipe 不会自动销毁源流，高并发下客户端频繁断开会耗尽 fd
+    const onDestError = () => { stream.destroy(); };
+    this._res.on('error', onDestError);
+    this._res.on('close', onDestError);
     // 流完成时回调
     this._res.on('finish', () => done(null));
     stream.pipe(this._res);
@@ -1104,7 +1113,9 @@ class Response {
     let url;
     if (typeof args[0] === 'number') {
       // redirect(status, url)
-      this.status(args[0]);
+      // 校验为有效的 3xx 重定向状态码，非法值回退 302（避免 Node 底层抛 RangeError）
+      const code = args[0];
+      this.status(code >= 300 && code < 400 ? code : 302);
       url = args[1];
     } else {
       // redirect(url) 默认 302
@@ -1248,9 +1259,12 @@ class SSE {
 
   /**
    * 设置客户端重连间隔（毫秒）
+   * 非数字/负数/NaN 时忽略，避免写入非法值破坏 SSE 协议导致客户端解析失败
    */
   retry(ms) {
     if (!this.connected) return this;
+    // 校验为非负有限数字，避免写入 NaN/undefined 破坏 SSE 协议
+    if (!Number.isFinite(ms) || ms < 0) return this;
     this._res.write(`retry: ${ms}\n\n`);
     return this;
   }
@@ -1733,6 +1747,13 @@ class WebSocketServer {
 
     // 创建 WebSocket 实例
     const ws = new WebSocket(socket, pathname, { maxPayload: this._maxPayload });
+    // 处理握手前客户端可能已发送的首帧数据（head）
+    // Node.js upgrade 事件的 head 参数可能包含客户端在握手响应前发送的 WebSocket 帧
+    // 若不喂给解析器，会导致首帧消息丢失（浏览器在握手后立即发送 subscribe 等场景）
+    if (head && head.length > 0) {
+      ws._frameBuffer = Buffer.concat([ws._frameBuffer, head]);
+      ws._parseFrames();
+    }
     this.connections.set(ws.id, ws);
 
     // 按路径分组
@@ -2270,7 +2291,9 @@ function cookieParser(secret) {
     if (secret) {
       req.signedCookies = {};
       for (const [key, val] of Object.entries(req.cookies)) {
-        if (val.startsWith('s:')) {
+        // 防御非字符串值：用户中间件可能修改 req.cookies 导致 val 为非字符串
+        // val.startsWith 在非字符串上会抛 TypeError
+        if (typeof val === 'string' && val.startsWith('s:')) {
           // 签名 Cookie 格式: s:encodedValue.signature
           const unsigned = val.slice(2);
           const dotIdx = unsigned.lastIndexOf('.');
@@ -2591,14 +2614,25 @@ class Application extends Router {
         // 路由处理器返回 false → 进入静态文件兜底
         const result = handler(req, res, safeNext);
         if (result === false) {
-          this._serveStatic(req, res);
+          // _serveStatic 异常走错误处理链，避免冒泡到 _handleRequest 顶层 catch
+          // 顶层 catch 只记录日志，错误处理中间件无法感知
+          try {
+            this._serveStatic(req, res);
+          } catch (e) {
+            this._handleError(e, req, res, stack, currentIdx);
+          }
           return;
         }
         // 支持 async/await
         if (result && typeof result.then === 'function') {
           result.then(r => {
             if (r === false) {
-              this._serveStatic(req, res);
+              // async 路径同样捕获 _serveStatic 异常，走错误处理链
+              try {
+                this._serveStatic(req, res);
+              } catch (e) {
+                this._handleError(e, req, res, stack, currentIdx);
+              }
             }
           }).catch(err => {
             // 用 currentIdx 快照定位错误处理起点，避免 idx 闭包失效
@@ -2680,7 +2714,7 @@ class Application extends Router {
     let origin = '*';
     // origin 支持字符串、数组、函数：
     //   - 字符串：直接使用（'*' 或具体域名）
-    //   - 数组：reqOrigin 在数组中才允许，否则拒绝（credentials=true 时拒绝；否则回退 '*'）
+    //   - 数组：reqOrigin 在数组中才允许，否则拒绝（origin 置空，不设置 ACAO 头，浏览器会拒绝）
     //   - 函数：返回 false/''/null 表示拒绝；返回字符串表示使用该值；返回 true 表示使用 reqOrigin
     if (typeof cors.origin === 'string') {
       origin = cors.origin;
@@ -2725,7 +2759,9 @@ class Application extends Router {
     // 动态设置允许的方法列表，而非硬编码
     res.setHeader('Access-Control-Allow-Methods', allowedMethods.join(', '));
     res.setHeader('Access-Control-Allow-Headers', cors.headers || 'Content-Type, Authorization');
-    res.setHeader('Access-Control-Max-Age', parseInt(cors.maxAge, 10) || 86400);
+    // maxAge 显式为 0 时禁用预检缓存（每次请求都预检），不能用 || 86400 覆盖
+    const maxAge = parseInt(cors.maxAge, 10);
+    res.setHeader('Access-Control-Max-Age', Number.isFinite(maxAge) ? maxAge : 86400);
     // Allow 头告知客户端该路径实际支持的方法
     res.setHeader('Allow', allowedMethods.join(', '));
     res.status(204)._send('');
@@ -2818,12 +2854,13 @@ class Application extends Router {
         return;
       }
       // allowAccessToAllFiles=false 时过滤隐藏文件（.env、.git 等），与访问策略保持一致
-      if (!this.settings.allowAccessToAllFiles) {
-        entries = entries.filter(e => !e.name.startsWith('.'));
-      }
+      // 不重新赋值函数参数 entries，用新变量 filtered 提升可读性
+      const filtered = this.settings.allowAccessToAllFiles
+        ? entries
+        : entries.filter(e => !e.name.startsWith('.'));
 
       // 异步获取文件信息，避免同步阻塞事件循环
-      const tasks = entries.map(entry => {
+      const tasks = filtered.map(entry => {
         if (entry.isDirectory()) {
           return Promise.resolve({ name: entry.name, isDirectory: true, size: 0, modified: '' });
         }
@@ -2881,7 +2918,7 @@ class Application extends Router {
       const name = item.isDirectory ? item.name + '/' : item.name;
       const size = item.isDirectory ? '-' : fmtSize(item.size);
       const cls = item.isDirectory ? 'dir' : '';
-      html += `<tr><td><a href="${escapeHtml(href)}" class="${cls}">${escapeHtml(name)}</a></td><td class="size">${size}</td><td class="size">${item.modified}</td></tr>`;
+      html += `<tr><td><a href="${escapeHtml(href)}" class="${cls}">${escapeHtml(name)}</a></td><td class="size">${size}</td><td class="size">${escapeHtml(item.modified)}</td></tr>`;
     }
 
     html += `</table></body></html>`;
@@ -3147,7 +3184,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.3.5';
+httpm.version = '1.3.6';
 
 /**
  * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）

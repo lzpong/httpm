@@ -1179,6 +1179,27 @@ async function runTests() {
     sse.close();
   });
 
+  // --- P2-3 验证：redirect 非法状态码回退 302 ---
+  app.get('/redirect-invalid', (req, res) => res.redirect(999, '/target'));
+  app.get('/redirect-valid', (req, res) => res.redirect(301, '/target'));
+
+  // --- P2-1 验证：SSE retry 非法值不写入 ---
+  app.get('/sse-retry-invalid', (req, res) => {
+    const sse = res.sse();
+    sse.retry(NaN);
+    sse.retry(-1);
+    sse.retry('abc');
+    sse.retry(1000); // 合法值应写入
+    sse.close();
+  });
+
+  // --- P2-4 验证：_serveStatic 异常走错误处理链 ---
+  // req.path 为正常路径，_serveStatic 内部异常难以模拟，改用路由返回 false 触发静态兜底
+  app.get('/fallback-static/:name', (req, res) => {
+    // 不存在的文件，返回 false 触发 _serveStatic，_serveStatic 返回 404（正常路径）
+    return false;
+  });
+
   // 错误处理中间件（P0-5 修复后应被正确调用）
   // 返回 handled: true 标记，用于验证错误确实由错误处理中间件处理（而非默认错误响应）
   app.use((err, req, res, next) => {
@@ -1895,6 +1916,42 @@ async function runTests() {
       assert(body.includes('data: line1\ndata: line2'), 'HTTP - SSE multiline data split correctly');
       // event('multi', 'data1\ndata2') 应输出 event: multi\ndata: data1\ndata: data2\n\n
       assert(body.includes('event: multi\ndata: data1\ndata: data2'), 'HTTP - SSE multiline event data split correctly');
+    }
+
+    // --- P2-3 验证：redirect 非法状态码回退 302，合法状态码保持 ---
+    {
+      // 999 非法，应回退 302
+      const res1 = await httpGet(BASE + '/redirect-invalid');
+      await readBodyStr(res1);
+      assert(res1.statusCode === 302, 'HTTP - redirect invalid status falls back to 302');
+      assert(res1.headers['location'] === '/target', 'HTTP - redirect invalid status keeps location');
+
+      // 301 合法，应保持
+      const res2 = await httpGet(BASE + '/redirect-valid');
+      await readBodyStr(res2);
+      assert(res2.statusCode === 301, 'HTTP - redirect valid 301 kept');
+    }
+
+    // --- P2-1 验证：SSE retry 非法值不写入，合法值写入 ---
+    {
+      const res = await httpRequest({
+        hostname: 'localhost', port: PORT, path: '/sse-retry-invalid', method: 'GET'
+      });
+      const body = await readBodyStr(res);
+      // NaN/-1/'abc' 应被忽略，不写入 retry:
+      // 合法值 1000 应写入 retry: 1000
+      assert(body.includes('retry: 1000'), 'HTTP - SSE retry valid value written');
+      // 非法值不应写入（body 中只能有一个 retry: 行）
+      const retryLines = body.split('\n').filter(l => l.startsWith('retry:'));
+      assert(retryLines.length === 1, 'HTTP - SSE retry invalid values skipped');
+    }
+
+    // --- P2-4 验证：路由返回 false 触发 _serveStatic 静态兜底 ---
+    {
+      // /fallback-static/nonexistent 不存在文件，_serveStatic 返回 404
+      const res = await httpGet(BASE + '/fallback-static/nonexistent');
+      await readBodyStr(res);
+      assert(res.statusCode === 404, 'HTTP - route return false falls back to static 404');
     }
 
   } catch (e) {
