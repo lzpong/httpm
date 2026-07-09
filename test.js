@@ -1200,6 +1200,9 @@ async function runTests() {
     return false;
   });
 
+  // --- P1-1 验证：hostname IPv6 解析 ---
+  app.get('/hostname-test', (req, res) => res.json({ hostname: req.hostname }));
+
   // 错误处理中间件（P0-5 修复后应被正确调用）
   // 返回 handled: true 标记，用于验证错误确实由错误处理中间件处理（而非默认错误响应）
   app.use((err, req, res, next) => {
@@ -1761,6 +1764,34 @@ async function runTests() {
       try { fs.unlinkSync(filePath); } catch (e) { /* ignore */ }
     }
 
+    // --- P1-1 验证：hostname IPv6 解析（修复 host.split(':') 对 IPv6 误切） ---
+    {
+      // IPv6 带端口 [::1]:PORT → ::1
+      const res1 = await httpGet(BASE + '/hostname-test', { Host: '[::1]:' + PORT });
+      const obj1 = JSON.parse(await readBodyStr(res1));
+      assert(obj1.hostname === '::1', 'HTTP - hostname IPv6 [::1]:port → ::1');
+
+      // IPv6 无端口 [::1] → ::1
+      const res2 = await httpGet(BASE + '/hostname-test', { Host: '[::1]' });
+      const obj2 = JSON.parse(await readBodyStr(res2));
+      assert(obj2.hostname === '::1', 'HTTP - hostname IPv6 [::1] → ::1');
+
+      // IPv6 长地址 [2001:db8::1]:PORT → 2001:db8::1
+      const res3 = await httpGet(BASE + '/hostname-test', { Host: '[2001:db8::1]:' + PORT });
+      const obj3 = JSON.parse(await readBodyStr(res3));
+      assert(obj3.hostname === '2001:db8::1', 'HTTP - hostname IPv6 [2001:db8::1] → 2001:db8::1');
+
+      // 普通 IPv4 域名带端口 example.com:8080 → example.com
+      const res4 = await httpGet(BASE + '/hostname-test', { Host: 'example.com:8080' });
+      const obj4 = JSON.parse(await readBodyStr(res4));
+      assert(obj4.hostname === 'example.com', 'HTTP - hostname example.com:8080 → example.com');
+
+      // 普通域名无端口 example.com → example.com
+      const res5 = await httpGet(BASE + '/hostname-test', { Host: 'example.com' });
+      const obj5 = JSON.parse(await readBodyStr(res5));
+      assert(obj5.hostname === 'example.com', 'HTTP - hostname example.com → example.com');
+    }
+
     // --- use('/') 子路径匹配（修复 use('/') 不命中子路径） ---
     {
       const res = await httpGet(BASE + '/rootmw-check');
@@ -1966,6 +1997,67 @@ async function runTests() {
 
   // 等待文件句柄释放
   await new Promise(r => setTimeout(r, 100));
+
+  // --- P1-2 验证：multipart 头部 DoS 防护（partHeadersBuf 超限返回 413） ---
+  // 使用独立 app 配置小 maxFieldSize，避免发送 1MB+ 测试数据
+  {
+    const PORT2 = PORT + 1;
+    const app2 = httpm({
+      svrPort: PORT2,
+      logLevel: 'error',
+      bodyParserOptions: { maxFieldSize: 100 } // 限制 part 头部 100 字节
+    });
+    app2.post('/upload', (req, res) => res.json({ ok: true }));
+    const server2 = app2.listen(PORT2);
+    await new Promise(r => setTimeout(r, 300));
+
+    try {
+      // 构造超大 part 头部（> 100 字节，无 \r\n\r\n 结束标记）
+      const boundary = 'TestBoundary';
+      const hugeHeader = 'X-Huge-' + 'A'.repeat(200); // 超 100 字节的单个头部
+      const body = Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="field"\r\n${hugeHeader}: value\r\n`,
+        'utf8'
+      );
+
+      // DoS 防护：part 头部超限时 safeNext 会销毁请求流（req._req.destroy()），
+      // 服务端主动断开恶意连接，客户端会收到 socket 错误（socket hang up / ECONNRESET）
+      // 这是预期的安全行为：立即断开比发送 413 更安全（避免攻击者继续消耗带宽）
+      let dosBlocked = false;
+      try {
+        await httpRequest({
+          hostname: 'localhost', port: PORT2, path: '/upload', method: 'POST',
+          headers: {
+            'Content-Type': 'multipart/form-data; boundary=' + boundary,
+            'Content-Length': body.length
+          }
+        }, body);
+      } catch (e) {
+        // 连接被断开证明 DoS 防护生效
+        dosBlocked = true;
+      }
+      assert(dosBlocked === true, 'HTTP - multipart huge part header triggers connection drop (DoS protection)');
+
+      // 对照组：正常 part 头部（< 100 字节）应正常处理
+      const normalBody = Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="field"\r\n\r\nvalue\r\n--${boundary}--\r\n`,
+        'utf8'
+      );
+      const res2 = await httpRequest({
+        hostname: 'localhost', port: PORT2, path: '/upload', method: 'POST',
+        headers: {
+          'Content-Type': 'multipart/form-data; boundary=' + boundary,
+          'Content-Length': normalBody.length
+        }
+      }, normalBody);
+      assert(res2.statusCode === 200, 'HTTP - multipart normal part header returns 200');
+    } catch (e) {
+      assertSkip('HTTP - multipart part header DoS test', e.message);
+    } finally {
+      await new Promise(r => server2.close(r));
+      await closeLoggerStream(app2._logger);
+    }
+  }
 
   // 清理测试文件
   try {

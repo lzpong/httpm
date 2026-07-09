@@ -1,11 +1,12 @@
 {
   "name": "@lzpong/httpm",
-  "version": "1.3.6",
+  "version": "1.3.7",
   "description": "基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库，兼容 Express API",
   "main": "httpm.js",
   "files": [
     "httpm.js",
-    "README.md"
+    "README.md",
+    "Detailed_Design.md"
   ],
   "keywords": [
     "http",

@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.3.6
+**文档版本**：V1.3.7
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -270,7 +270,7 @@ class Request {
 - `req.get(name)`：  获取请求头（不区分大小写，Express 兼容）
 - `req.headers`：  请求头对象
 - `req.ip`：	   客户端 IP 地址；仅在 `trustProxy=true` 时信任 `X-Forwarded-For`，默认取 `socket.remoteAddress`（防止客户端伪造）
-- `req.hostname`： 请求域名；`trustProxy=true` 时优先取 `X-Forwarded-Host`，默认取 `Host` 头
+- `req.hostname`： 请求域名；`trustProxy=true` 时优先取 `X-Forwarded-Host`，默认取 `Host` 头；正确处理 IPv6 地址（如 `[::1]:8080` → `::1`、`[2001:db8::1]` → `2001:db8::1`），使用 `new URL('http://' + host).hostname` 解析端口后剥离 IPv6 方括号，对齐 Express 4.x 行为
 - `req.protocol`： 当前协议（http /https）
 - `req.files`：	   上传文件数组（兼容旧版，可以使用 `req.formData.files`）
 
@@ -664,6 +664,29 @@ multipart 表单字段值可能包含多字节 UTF-8 字符（如中文），当
 2. 每个 chunk 通过 `decoder.write(buffer)` 解码，未完成的多字节序列暂存于 decoder 内部；
 3. 字段结束时调用 `decoder.end()` 刷新剩余字节，确保完整 UTF-8 序列输出。
 
+### 7.6 Part 头部大小限制（DoS 防护）
+
+multipart 解析的 `HEADERS` 状态会累积 part 头部缓冲（`partHeadersBuf`），等待 `\r\n\r\n` 结束标记。恶意客户端可发送永不结束的超大单个 part 头部，导致缓冲无限增长耗尽内存（DoS 攻击）。
+
+httpm 复用 `maxFieldSize`（默认 1MB）作为 part 头部大小上限，在两处累积点均校验：
+
+1. **未找到结束标记时**：每次累积后校验 `partHeadersBuf.length`，超限立即触发错误；
+2. **找到结束标记时**：单个 chunk 可能含超大头部，拼接后再次校验总大小。
+
+超限时通过 `safeNext(err)` 传递 413 错误，`safeNext` 会先销毁请求流（`req._req.destroy()`）主动断开恶意连接，再触发错误处理中间件。这种"立即断开"策略比发送 413 响应更安全：避免攻击者继续消耗服务端带宽和资源。客户端会收到 socket 错误（`ECONNRESET` / `socket hang up`）。
+
+```javascript
+partHeadersBuf = Buffer.concat([partHeadersBuf, buffer]);
+if (partHeadersBuf.length > maxFieldSize) {
+  const err = new Error(`Part header exceeds maximum size of ${fmtSize(maxFieldSize)}`);
+  err.status = 413;
+  safeNext(err); // 内部调用 req._req.destroy() 断开连接
+  return;
+}
+```
+
+正常 part 头部通常仅几百字节（Content-Disposition、Content-Type），1MB 上限足以容纳合法请求，同时有效防御恶意超大头部攻击。
+
 ---
 
 ## 8. 通用工具函数设计
@@ -844,7 +867,9 @@ app.sse('/events', (sse, req) => {
 7. **安全防御**：所有 `decodeURIComponent` 调用均有 try-catch 降级处理，防止非法 URI 编码导致请求崩溃；
 8. **XSS 防护**：目录列表 HTML 输出使用 `escapeHtml` 转义，防止文件名注入脚本；
 9. **Cookie 签名**：签名基于原始值计算，编码后的值不参与签名验证，确保 `encodeURIComponent` 不影响签名一致性；
-10. **请求体大小限制**：`_readBody` 方法内置超时保护（默认 30 秒）和流式大小检查，超限时返回 413 状态码。
+10. **请求体大小限制**：`_readBody` 方法内置超时保护（默认 30 秒）和流式大小检查，超限时返回 413 状态码；
+11. **IPv6 兼容**：`req.hostname` 使用 `new URL()` 解析 Host 头，正确处理 IPv6 方括号语法（`[::1]:8080` → `::1`），并剥离方括号对齐 Express 行为；
+12. **Part 头部 DoS 防护**：multipart 解析的 `partHeadersBuf` 累积时校验大小，复用 `maxFieldSize` 作为上限，超限时通过 `safeNext` 销毁请求流主动断开恶意连接，防止恶意超大头部耗尽内存。
 
 ---
 
@@ -856,7 +881,7 @@ app.sse('/events', (sse, req) => {
 ```json
 {
   "name": "@lzpong/httpm",
-  "version": "1.3.6",
+  "version": "1.3.7",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
   "engines": { "node": ">=18.0.0" },

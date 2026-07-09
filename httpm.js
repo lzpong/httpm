@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.3.6
+ * @version     1.3.7
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -626,12 +626,32 @@ class Request {
     return this._req.socket?.remoteAddress || '';
   }
   get hostname() {
+    // 解析 Host 头，正确处理 IPv6 地址（如 [::1]:8080、[::1]）
+    // 原实现 host.split(':')[0] 对 IPv6 会返回 '[' 或 '2001' 等错误值
+    // 对齐 Express 行为：剥离端口后，IPv6 方括号也一并剥离（[::1] → ::1）
+    const parseHost = (h) => {
+      if (!h) return '';
+      let host = h;
+      try {
+        // 补全协议构造 URL，u.hostname 会自动剥离端口
+        // [::1]:8080 → [::1]，example.com:8080 → example.com
+        host = new URL('http://' + h).hostname;
+      } catch (e) {
+        // 极端非法 Host 头回退到 split(':')，保证不抛异常
+        host = h.split(':')[0];
+      }
+      // 剥离 IPv6 方括号，对齐 Express（Express 4.x hostname getter 会 strip brackets）
+      if (host[0] === '[' && host[host.length - 1] === ']') {
+        host = host.substring(1, host.length - 1);
+      }
+      return host;
+    };
     // trustProxy=true 时优先取 X-Forwarded-Host（反向代理后的真实主机名）
     if (this._app?.settings?.trustProxy) {
       const fwh = this._req.headers['x-forwarded-host'];
-      if (fwh) return fwh.split(':')[0];
+      if (fwh) return parseHost(fwh);
     }
-    return this._req.headers['host']?.split(':')[0] || '';
+    return parseHost(this._req.headers['host']);
   }
   get protocol() {
     return (this._req.socket?.encrypted || this._req.connection?.encrypted) ? 'https' : 'http';
@@ -2077,10 +2097,25 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
         if (headerEnd === -1) {
           // 累积 Buffer 避免多字节截断
           partHeadersBuf = Buffer.concat([partHeadersBuf, buffer]);
+          // 校验 part 头部大小，防止恶意客户端发送超大单个 part 头部（永不结束）导致 DoS
+          // 复用 maxFieldSize 作为上限，正常 part 头部远小于此值
+          if (partHeadersBuf.length > maxFieldSize) {
+            const err = new Error(`Part header exceeds maximum size of ${fmtSize(maxFieldSize)}`, { cause: { actual: partHeadersBuf.length, maxSize: maxFieldSize } });
+            err.status = 413;
+            safeNext(err);
+            return;
+          }
           buffer = Buffer.alloc(0);
           break;
         }
+        // 找到结束标记时也校验累积总大小（极端情况下单个 chunk 可能含超大头部）
         partHeadersBuf = Buffer.concat([partHeadersBuf, buffer.subarray(0, headerEnd)]);
+        if (partHeadersBuf.length > maxFieldSize) {
+          const err = new Error(`Part header exceeds maximum size of ${fmtSize(maxFieldSize)}`, { cause: { actual: partHeadersBuf.length, maxSize: maxFieldSize } });
+          err.status = 413;
+          safeNext(err);
+          return;
+        }
         buffer = buffer.subarray(headerEnd + 4);
         const partHeaders = partHeadersBuf.toString('utf8');
 
@@ -3184,7 +3219,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.3.6';
+httpm.version = '1.3.7';
 
 /**
  * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）
