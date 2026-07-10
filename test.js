@@ -1203,6 +1203,25 @@ async function runTests() {
   // --- P1-1 验证：hostname IPv6 解析 ---
   app.get('/hostname-test', (req, res) => res.json({ hostname: req.hostname }));
 
+  // --- P2-1 验证：redirect null/undefined url 回退到 '/' ---
+  app.get('/redirect-null', (req, res) => res.redirect());
+  app.get('/redirect-status-only', (req, res) => res.redirect(302));
+
+  // --- P2-5 验证：cookie undefined value 回退空字符串 ---
+  app.get('/cookie-undef', (req, res) => {
+    res.cookie('undef_val', undefined);
+    res.cookie('null_val', null);
+    res.json({});
+  });
+
+  // --- P2-6 验证：SSE send/event undefined 不崩溃 ---
+  app.get('/sse-undef', (req, res) => {
+    const sse = res.sse();
+    sse.send(undefined);
+    sse.event('update', null);
+    sse.close();
+  });
+
   // 错误处理中间件（P0-5 修复后应被正确调用）
   // 返回 handled: true 标记，用于验证错误确实由错误处理中间件处理（而非默认错误响应）
   app.use((err, req, res, next) => {
@@ -1790,6 +1809,41 @@ async function runTests() {
       const res5 = await httpGet(BASE + '/hostname-test', { Host: 'example.com' });
       const obj5 = JSON.parse(await readBodyStr(res5));
       assert(obj5.hostname === 'example.com', 'HTTP - hostname example.com → example.com');
+    }
+
+    // --- P2-1 验证：redirect null/undefined url 回退到 '/' ---
+    {
+      // res.redirect() 无参数 → url=undefined → 回退 '/'
+      const res1 = await httpGet(BASE + '/redirect-null');
+      assert(res1.statusCode === 302, 'HTTP - redirect() no args status 302');
+      assert(res1.headers['location'] === '/', 'HTTP - redirect() no args location /');
+
+      // res.redirect(302) 缺少 url → url=undefined → 回退 '/'
+      const res2 = await httpGet(BASE + '/redirect-status-only');
+      assert(res2.statusCode === 302, 'HTTP - redirect(302) no url status 302');
+      assert(res2.headers['location'] === '/', 'HTTP - redirect(302) no url location /');
+    }
+
+    // --- P2-5 验证：cookie undefined/null value 回退空字符串 ---
+    {
+      const res = await httpGet(BASE + '/cookie-undef');
+      const setCookie = res.headers['set-cookie'];
+      assert(Array.isArray(setCookie), 'HTTP - cookie-undef returns set-cookie array');
+      // undefined 值不应变成字符串 'undefined'，应为空值
+      const undefCookie = setCookie.find(c => c.startsWith('undef_val='));
+      assert(undefCookie && undefCookie.split(';')[0] === 'undef_val=', 'HTTP - cookie undefined value → empty (not "undefined")');
+      // null 值同样回退空字符串
+      const nullCookie = setCookie.find(c => c.startsWith('null_val='));
+      assert(nullCookie && nullCookie.split(';')[0] === 'null_val=', 'HTTP - cookie null value → empty (not "null")');
+    }
+
+    // --- P2-6 验证：SSE send/event undefined 不崩溃，发送 'null' ---
+    {
+      const res = await httpGet(BASE + '/sse-undef');
+      const body = await readBodyStr(res);
+      assert(res.statusCode === 200, 'HTTP - SSE send(undefined) status 200');
+      assert(body.includes('data: null'), 'HTTP - SSE send(undefined) writes data: null');
+      assert(body.includes('event: update'), 'HTTP - SSE event(name, null) writes event');
     }
 
     // --- use('/') 子路径匹配（修复 use('/') 不命中子路径） ---

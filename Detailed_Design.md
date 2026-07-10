@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.3.7
+**文档版本**：V1.3.8
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -306,10 +306,10 @@ class Request {
 | send(data) | 通用输出，支持字符串、HTML、Buffer、对象；`null` 序列化为 `"null"`（Express 兼容），`undefined` 返回空响应 |
 | sendFile(path, options, [callback]) | 发送本地文件，内置断点续传、缓存、Gzip 能力；options 支持 `{ root, contentType }`；callback(err) 在完成/出错时调用 |
 | download(path, [filename], [options]) | 触发浏览器文件下载，支持断点续传；兼容 Express 签名，options 传递给 sendFile |
-| redirect([code,] url) | 重定向响应，兼容 Express 签名：`redirect(url)` 默认 302，`redirect(status, url)` 指定状态码 |
+| redirect([code,] url) | 重定向响应，兼容 Express 签名：`redirect(url)` 默认 302，`redirect(status, url)` 指定状态码；url 为 null/undefined 时回退到 '/'（避免 encodeURI(undefined)='undefined'）；url='back' 时取 Referer 头回退到上一页 |
 | location(url) | 设置 Location 响应头（不发送响应，常与 send 配合） |
 | sse() | 创建 SSE 推送实例 |
-| cookie(name, value, opts) | 设置响应 Cookie；opts 支持 `maxAge`（秒，写入 Max-Age）、`expires`（Date 对象，写入 Expires）、`domain`、`path`、`secure`、`httpOnly`、`sameSite`、`signed`；对象 value 自动 JSON 序列化，signed 启用 HMAC-SHA256 签名（`s:` 前缀） |
+| cookie(name, value, opts) | 设置响应 Cookie；opts 支持 `maxAge`（秒，写入 Max-Age）、`expires`（Date 对象，写入 Expires）、`domain`、`path`、`secure`、`httpOnly`、`sameSite`、`signed`；对象 value 自动 JSON 序列化，signed 启用 HMAC-SHA256 签名（`s:` 前缀）；value 为 null/undefined 时回退空字符串（避免 encodeURIComponent(undefined)='undefined'） |
 | append(field, value) | 追加响应头值（不覆盖已有值，适用于 Set-Cookie 等多值头） |
 | locals | 请求级数据传递对象（中间件间共享数据），初始为 `Object.create(null)` |
 
@@ -337,11 +337,28 @@ class Request {
 
 #### 核心方法
 
-- `send(data)`：		发送普通消息，自动兼容字符串 / JSON 对象；
-- `event(name, data)`： 发送自定义命名事件；
+- `send(data)`：		发送普通消息，自动兼容字符串 / JSON 对象；data 为 null/undefined 时转为 'null'（避免 JSON.stringify(undefined)=undefined 导致 split 抛 TypeError）；
+- `event(name, data)`： 发送自定义命名事件；data 为 null/undefined 时同 send 处理；
 - `retry(ms)`：			设置客户端重连间隔（毫秒）；
-- `comment(text)`：		发送注释消息（可作为心跳保活）；
+- `comment(text)`：		发送注释消息（可作为心跳保活）；text 为 null/undefined 时转为空字符串；
 - `close()`：			主动关闭 SSE 连接，自动移除 `close`/`aborted` 事件监听器防止内存泄漏。
+
+#### 写入错误处理（_write 统一封装）
+
+所有 SSE 写入方法（send/event/retry/comment）通过内部 `_write(payload)` 方法统一写入，处理底层响应流异常。`this._res.write` 在响应已结束、客户端断开或底层 socket 错误时可能抛异常，`_write` 用 try/catch 包裹，失败时调用 `close()` 清理连接资源，避免未捕获异常冒泡。
+
+```javascript
+_write(payload) {
+  if (!this.connected) return false;
+  try {
+    this._res.write(payload);
+    return true;
+  } catch (e) {
+    this.close(); // 写入失败，关闭连接清理资源
+    return false;
+  }
+}
+```
 
 #### 换行符处理（SSE 协议合规）
 
@@ -349,7 +366,7 @@ SSE 协议规定每行数据以 `data:` 前缀开头，消息之间以 `\n\n` �
 
 ```javascript
 const lines = msg.split('\n');
-this._res.write(lines.map(l => `data: ${l}`).join('\n') + '\n\n');
+this._write(lines.map(l => `data: ${l}`).join('\n') + '\n\n');
 ```
 
 `event(name, data)` 还会校验事件名不能包含 `\n`（事件名跨行违反协议），违规时直接返回不发送。
@@ -869,7 +886,12 @@ app.sse('/events', (sse, req) => {
 9. **Cookie 签名**：签名基于原始值计算，编码后的值不参与签名验证，确保 `encodeURIComponent` 不影响签名一致性；
 10. **请求体大小限制**：`_readBody` 方法内置超时保护（默认 30 秒）和流式大小检查，超限时返回 413 状态码；
 11. **IPv6 兼容**：`req.hostname` 使用 `new URL()` 解析 Host 头，正确处理 IPv6 方括号语法（`[::1]:8080` → `::1`），并剥离方括号对齐 Express 行为；
-12. **Part 头部 DoS 防护**：multipart 解析的 `partHeadersBuf` 累积时校验大小，复用 `maxFieldSize` 作为上限，超限时通过 `safeNext` 销毁请求流主动断开恶意连接，防止恶意超大头部耗尽内存。
+12. **Part 头部 DoS 防护**：multipart 解析的 `partHeadersBuf` 累积时校验大小，复用 `maxFieldSize` 作为上限，超限时通过 `safeNext` 销毁请求流主动断开恶意连接，防止恶意超大头部耗尽内存；
+13. **redirect 防御**：`res.redirect()` 的 url 为 null/undefined 时回退到 '/'，避免 `encodeURI(undefined)` 返回字符串 `'undefined'` 导致重定向到错误路径；
+14. **cookie 防御**：`res.cookie(name, value)` 的 value 为 null/undefined 时回退空字符串，避免 `encodeURIComponent(undefined)` 返回 `'undefined'` 导致 cookie 值错误；
+15. **SSE 写入安全**：所有 SSE 写入方法通过 `_write` 统一封装，try/catch 处理底层响应流异常，失败时调用 `close()` 清理连接；send/event 的 data 为 null/undefined 时转为 'null'，避免 `JSON.stringify(undefined)` 返回 undefined 导致 split 抛 TypeError；
+16. **未知 HTTP 方法警告**：`_addRoute` 对未支持的 HTTP 方法（如 CONNECT/TRACE）打印警告日志而非静默忽略，便于调用方排查路由未命中问题；
+17. **WebSocket 握手写入防御**：`handleUpgrade` 中的 `socket.write` 用 try/catch 包裹，socket 已关闭/已销毁时避免抛 `ERR_STREAM_WRITE_AFTER_END`，握手响应失败时销毁 socket 并返回 null。
 
 ---
 
@@ -881,7 +903,7 @@ app.sse('/events', (sse, req) => {
 ```json
 {
   "name": "@lzpong/httpm",
-  "version": "1.3.7",
+  "version": "1.3.8",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
   "engines": { "node": ">=18.0.0" },

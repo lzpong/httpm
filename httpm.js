@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.3.7
+ * @version     1.3.8
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -482,6 +482,10 @@ class Router {
     const key = method.toUpperCase();
     if (this.routes[key]) {
       this.routes[key].push(route);
+    } else {
+      // 未知 HTTP 方法静默忽略但打印警告，便于调用方排查路由未命中问题
+      // 支持 GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS/ALL，其他方法（如 CONNECT/TRACE）不支持
+      console.warn(`[httpm] Unsupported HTTP method "${key}", route "${pathStr}" ignored. Supported: GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS/ALL`);
     }
     return this;
   }
@@ -1146,6 +1150,9 @@ class Response {
     if (url === 'back') {
       url = this._req?.headers?.['referer'] || this._req?.headers?.['referrer'] || '/';
     }
+    // 防御：url 缺失（null/undefined）时回退到根路径，避免 encodeURI(undefined) = 'undefined'
+    // 场景：res.redirect() 无参数、res.redirect(302) 缺少 url
+    if (url == null) url = '/';
     // HTTP 协议要求 Location 头为 ASCII，非 ASCII 字符需编码（含中文、空格等）
     // encodeURI 保留 : / ? # [ ] @ ! $ & ' ( ) * + , ; = 等合法 URL 字符
     try {
@@ -1174,6 +1181,9 @@ class Response {
    * 设置响应 Cookie
    */
   cookie(name, value, opts = {}) {
+    // 防御：value 为 undefined/null 时回退到空字符串
+    // 避免encodeURIComponent(undefined) = 'undefined'，设置 cookie 值为字符串 "undefined"
+    if (value == null) value = '';
     // Express 兼容：对象值先 JSON 序列化，便于存储结构化数据
     let rawValue = typeof value === 'object' && value !== null ? JSON.stringify(value) : value;
     let encodedValue = encodeURIComponent(rawValue);
@@ -1252,15 +1262,36 @@ class SSE {
   }
 
   /**
+   * 统一写入 SSE 数据，处理底层响应流异常
+   * this._res.write 在响应已结束、客户端断开或底层 socket 错误时可能抛异常，
+   * 用 try/catch 包裹，失败时调用 close() 清理连接资源，避免未捕获异常
+   * @param {string} payload - 已格式化的 SSE 协议文本
+   * @returns {boolean} true=写入成功，false=写入失败（连接已关闭）
+   */
+  _write(payload) {
+    if (!this.connected) return false;
+    try {
+      this._res.write(payload);
+      return true;
+    } catch (e) {
+      // 写入失败（客户端断开/响应已结束），关闭连接清理资源
+      this.close();
+      return false;
+    }
+  }
+
+  /**
    * 发送普通消息，自动兼容字符串/JSON 对象
    * SSE 规范：data 中含换行符时需拆成多行 data: 前缀，接收端用 \n 拼回
    */
   send(data) {
     if (!this.connected) return this;
-    const msg = typeof data === 'string' ? data : JSON.stringify(data);
+    // 防御：data 为 null/undefined 时 JSON.stringify 返回 undefined，split 会抛 TypeError
+    // 转为 'null' 符合 JSON 语义（JSON.stringify(null) = 'null'）
+    const msg = data == null ? 'null' : (typeof data === 'string' ? data : JSON.stringify(data));
     // 按行拆分，每行加 data: 前缀，确保多行消息不破坏 SSE 协议
     const lines = msg.split('\n');
-    this._res.write(lines.map(l => `data: ${l}`).join('\n') + '\n\n');
+    this._write(lines.map(l => `data: ${l}`).join('\n') + '\n\n');
     return this;
   }
 
@@ -1271,9 +1302,10 @@ class SSE {
   event(name, data) {
     if (!this.connected) return this;
     if (typeof name !== 'string' || name.includes('\n')) return this;
-    const msg = typeof data === 'string' ? data : JSON.stringify(data);
+    // 防御：data 为 null/undefined 时 JSON.stringify 返回 undefined，split 会抛 TypeError
+    const msg = data == null ? 'null' : (typeof data === 'string' ? data : JSON.stringify(data));
     const lines = msg.split('\n');
-    this._res.write(`event: ${name}\n` + lines.map(l => `data: ${l}`).join('\n') + '\n\n');
+    this._write(`event: ${name}\n` + lines.map(l => `data: ${l}`).join('\n') + '\n\n');
     return this;
   }
 
@@ -1285,7 +1317,7 @@ class SSE {
     if (!this.connected) return this;
     // 校验为非负有限数字，避免写入 NaN/undefined 破坏 SSE 协议
     if (!Number.isFinite(ms) || ms < 0) return this;
-    this._res.write(`retry: ${ms}\n\n`);
+    this._write(`retry: ${ms}\n\n`);
     return this;
   }
 
@@ -1296,9 +1328,9 @@ class SSE {
   comment(text) {
     if (!this.connected) return this;
     // 按行拆分，每行加 : 前缀，确保多行注释不破坏 SSE 协议
-    const lines = String(text).split('\n');
+    const lines = String(text == null ? '' : text).split('\n');
     const payload = lines.map(line => `: ${line}`).join('\n') + '\n\n';
-    this._res.write(payload);
+    this._write(payload);
     return this;
   }
 
@@ -1748,7 +1780,8 @@ class WebSocketServer {
     if (this._allowedOrigins) {
       const origin = req.headers['origin'];
       if (!origin || !this._allowedOrigins.includes(origin)) {
-        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+        // socket.write 在 socket 已关闭/已销毁时可能抛 ERR_STREAM_WRITE_AFTER_END
+        try { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); } catch (e) { /* socket 已关闭 */ }
         socket.destroy();
         return null;
       }
@@ -1763,7 +1796,14 @@ class WebSocketServer {
       'Connection: Upgrade',
       `Sec-WebSocket-Accept: ${accept}`
     ];
-    socket.write(responseHeaders.join('\r\n') + '\r\n\r\n');
+    // socket.write 在 socket 已关闭/已销毁时可能抛 ERR_STREAM_WRITE_AFTER_END
+    // 握手响应写入失败时无法建立连接，直接销毁 socket 并返回 null
+    try {
+      socket.write(responseHeaders.join('\r\n') + '\r\n\r\n');
+    } catch (e) {
+      socket.destroy();
+      return null;
+    }
 
     // 创建 WebSocket 实例
     const ws = new WebSocket(socket, pathname, { maxPayload: this._maxPayload });
@@ -3219,7 +3259,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.3.7';
+httpm.version = '1.3.8';
 
 /**
  * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）
