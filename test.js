@@ -954,6 +954,10 @@ async function runTests() {
   const subDir = path.join(testDir, 'subdir');
   if (!fs.existsSync(subDir)) fs.mkdirSync(subDir, { recursive: true });
   fs.writeFileSync(path.join(subDir, 'nested.html'), '<p>Nested</p>');
+  // 创建二级子目录，用于验证目录列表链接尾部斜杠（P2-1）
+  const nestedDir = path.join(subDir, 'nesteddir');
+  if (!fs.existsSync(nestedDir)) fs.mkdirSync(nestedDir, { recursive: true });
+  fs.writeFileSync(path.join(nestedDir, 'deep.txt'), 'deep file');
 
   const app = httpm({
     rootPath: testDir,
@@ -1380,6 +1384,8 @@ async function runTests() {
       const res = await httpGet(BASE + '/subdir/');
       const body = await readBodyStr(res);
       assert(body.includes('nested.html') || body.includes('Directory'), 'HTTP - directory listing');
+      // P2-1 验证：目录项链接必须包含尾部斜杠（避免浏览器多一次重定向往返）
+      assert(body.includes('href="/subdir/nesteddir/"'), 'HTTP - directory listing subdir href trailing slash');
     }
 
     // --- 重定向 302 ---
@@ -2113,6 +2119,67 @@ async function runTests() {
     }
   }
 
+  // --- P2-2 验证：CORS origin 函数抛异常时不阻断主请求 ---
+  // origin 函数异常应按拒绝跨域处理（不设置 ACAO 头），请求本身仍正常返回 200
+  {
+    const PORT3 = PORT + 2;
+    const app3 = httpm({
+      svrPort: PORT3,
+      logLevel: 'error',
+      cors: { origin: () => { throw new Error('origin func error'); } }
+    });
+    app3.get('/test', (req, res) => res.json({ ok: true }));
+    const server3 = app3.listen(PORT3);
+    await new Promise(r => setTimeout(r, 300));
+
+    try {
+      const res = await httpGet('http://localhost:' + PORT3 + '/test', { Origin: 'https://evil.com' });
+      // 请求本身不应 500（CORS 异常不阻断主请求）
+      assert(res.statusCode === 200, 'HTTP - CORS origin func error does not block request');
+      const body = await readBodyStr(res);
+      assert(body.includes('"ok":true'), 'HTTP - CORS origin func error response body correct');
+      // 异常时拒绝跨域：不设置 Access-Control-Allow-Origin 头
+      assert(res.headers['access-control-allow-origin'] === undefined, 'HTTP - CORS origin func error rejects CORS (no ACAO header)');
+    } catch (e) {
+      assertSkip('HTTP - CORS origin func error test', e.message);
+    } finally {
+      await new Promise(r => server3.close(r));
+      await closeLoggerStream(app3._logger);
+    }
+  }
+
+  // --- P2-4 验证：async handler 调用 next(err) 后 Promise reject 不重复处理 ---
+  // 场景：handler 调用 next(err) 进入错误处理链，随后 Promise 又 reject
+  // 期望：_handleError 只被调用一次，错误处理中间件不会重复执行
+  {
+    const PORT4 = PORT + 3;
+    const app4 = httpm({ svrPort: PORT4, logLevel: 'error' });
+    let errorHandlerCallCount = 0;
+    app4.use((err, req, res, next) => {
+      errorHandlerCallCount++;
+      res.status(500).json({ error: err.message, count: errorHandlerCallCount });
+    });
+    app4.get('/async-next-reject', async (req, res, next) => {
+      next(new Error('first error'));
+      throw new Error('second error');
+    });
+    const server4 = app4.listen(PORT4);
+    await new Promise(r => setTimeout(r, 300));
+
+    try {
+      const res = await httpGet('http://localhost:' + PORT4 + '/async-next-reject');
+      assert(res.statusCode === 500, 'HTTP - async next+reject returns 500');
+      const obj = JSON.parse(await readBodyStr(res));
+      assert(obj.error === 'first error', 'HTTP - async next+reject uses first error (next err)');
+      assert(errorHandlerCallCount === 1, 'HTTP - async next+reject error handler called once (no duplicate)');
+    } catch (e) {
+      assertSkip('HTTP - async next+reject duplicate error handling test', e.message);
+    } finally {
+      await new Promise(r => server4.close(r));
+      await closeLoggerStream(app4._logger);
+    }
+  }
+
   // 清理测试文件
   try {
     fs.unlinkSync(path.join(testDir, 'index.html'));
@@ -2120,6 +2187,7 @@ async function runTests() {
     fs.unlinkSync(path.join(testDir, 'large.txt'));
     fs.unlinkSync(path.join(testDir, 'empty.txt'));
     fs.unlinkSync(path.join(subDir, 'nested.html'));
+    fs.unlinkSync(path.join(nestedDir, 'deep.txt'));
     fs.rmSync(subDir, { recursive: true });
     fs.rmSync(testDir, { recursive: true });
   } catch (e) { /* ignore */ }

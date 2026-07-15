@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.3.9
+ * @version     1.4.0
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -2719,6 +2719,9 @@ class Application extends Router {
               }
             }
           }).catch(err => {
+            // handler 已通过 next(err) 传递错误时跳过，避免重复调用 _handleError
+            // （与上方 sync catch 块的 if (handlerCalledNext) return 保持一致）
+            if (handlerCalledNext) return;
             // 用 currentIdx 快照定位错误处理起点，避免 idx 闭包失效
             this._handleError(err, req, res, stack, currentIdx);
           });
@@ -2805,7 +2808,16 @@ class Application extends Router {
     } else if (Array.isArray(cors.origin)) {
       origin = (reqOrigin && cors.origin.includes(reqOrigin)) ? reqOrigin : '';
     } else if (typeof cors.origin === 'function') {
-      const result = cors.origin(reqOrigin);
+      // origin 函数可能因业务逻辑错误抛异常（如读取配置失败），CORS 是附加安全层不应阻断主请求
+      // 异常时按拒绝跨域处理（origin 置空），记录告警日志便于运维排查
+      let result;
+      try {
+        result = cors.origin(reqOrigin);
+      } catch (e) {
+        this._logger.warn('[CORS] origin 函数执行异常:', e.message);
+        origin = '';
+        result = false;
+      }
       // 函数返回 false/''/null 表示拒绝跨域请求，origin 置空（不设置 ACAO 头，浏览器会拒绝）
       origin = result === false || result === null || result === '' ? '' : (result === true ? (reqOrigin || '') : String(result));
     }
@@ -2997,8 +3009,9 @@ class Application extends Router {
     }
 
     for (const item of items) {
-      // 使用绝对路径 href，避免 URL 缺少尾部斜杠时解析错误
-      const href = prefix + item.name;
+      // 使用绝对路径 href，目录项追加尾部斜杠（对齐 Express serve-static 行为）
+      // 缺少尾部斜杠时浏览器点击目录会多一次请求往返（先请求 /foo 再重定向到 /foo/）
+      const href = prefix + (item.isDirectory ? item.name + '/' : item.name);
       const name = item.isDirectory ? item.name + '/' : item.name;
       const size = item.isDirectory ? '-' : fmtSize(item.size);
       const cls = item.isDirectory ? 'dir' : '';
@@ -3060,9 +3073,11 @@ class Application extends Router {
           // 支持 async handler：返回 Promise<cleanup> 时等待 resolve 后再注册清理函数
           // 同步 handler 返回函数时直接注册
           Promise.resolve(ret).then(cleanup => {
-            if (typeof cleanup === 'function') {
-              ws.on('close', cleanup);
-            }
+            if (typeof cleanup !== 'function') return;
+            // 竞态保护：async handler resolve 前连接可能已关闭（close 事件已触发）
+            // 此时 on('close') 注册的 cleanup 永不执行，需立即调用避免资源泄漏
+            if (ws._closed) { try { cleanup(); } catch (e) { this._logger.warn('WS cleanup 执行异常:', e.message); } return; }
+            ws.on('close', cleanup);
           }).catch(e => {
             this._logger.error('WebSocket async handler error:', e);
             ws.close(1011, 'Internal server error');
@@ -3099,9 +3114,11 @@ class Application extends Router {
       // 支持 async handler：返回 Promise<cleanup> 时等待 resolve 后再注册清理函数
       // 同步 handler 返回函数时直接注册
       Promise.resolve(ret).then(cleanup => {
-        if (typeof cleanup === 'function') {
-          res.on('close', cleanup);
-        }
+        if (typeof cleanup !== 'function') return;
+        // 竞态保护：async handler resolve 前连接可能已关闭（close 事件已触发）
+        // 此时 on('close') 注册的 cleanup 永不执行，需立即调用避免资源泄漏
+        if (!sseInstance.connected) { try { cleanup(); } catch (e) { this._logger.warn('SSE cleanup 执行异常:', e.message); } return; }
+        res.on('close', cleanup);
       }).catch(e => {
         this._logger.error('SSE async handler error:', e);
         sseInstance.close();
@@ -3270,7 +3287,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.3.9';
+httpm.version = '1.4.0';
 
 /**
  * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）

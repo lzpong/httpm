@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.3.9
+**文档版本**：V1.4.0
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -808,7 +808,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.3.6';
+httpm.version = '1.4.0';
 
 module.exports = httpm;
 ```
@@ -895,6 +895,10 @@ app.sse('/events', (sse, req) => {
 17. **WebSocket 握手写入防御**：`handleUpgrade` 中的 `socket.write` 用 try/catch 包裹，socket 已关闭/已销毁时避免抛 `ERR_STREAM_WRITE_AFTER_END`，握手响应失败时销毁 socket 并返回 null。
 18. **Logger 背压检测**：`_writeFile` 检查 `stream.write()` 返回值，`false` 时打印一次背压告警并监听 `drain` 重置标志，避免日志风暴，帮助运维感知高并发日志延迟风险。
 19. **WebSocket 无匹配路由立即清理**：`_handleUpgrade` 中无匹配 ws 路由时，`ws.close()` 后立即调用 `_removeConnection(ws)` 从连接池移除，避免依赖 close 事件异步清理的短暂内存占用（`_removeConnection` 幂等，close 事件再次调用安全）。
+20. **目录列表链接尾部斜杠**：`_renderDirectoryHTML` 生成的子目录 href 必须以 `/` 结尾（如 `/subdir/nesteddir/`），对齐 Express serve-static 行为，避免浏览器点击目录链接时多一次请求往返（先请求 `/foo` 再重定向到 `/foo/`）。
+21. **CORS origin 函数异常保护**：`_applyCORSHeaders` 调用用户提供的 `cors.origin` 函数时用 try/catch 包裹，函数抛异常时按拒绝跨域处理（不设置 ACAO 头）并记录告警日志，CORS 是附加安全层其异常不应阻断主请求。
+22. **async handler cleanup 竞态保护**：`app.ws`/`app.sse` 注册的 async handler 返回的 cleanup 函数，在 `Promise.resolve(ret).then(...)` 注册前需检查连接状态：WebSocket 检查 `ws._closed`、SSE 检查 `sseInstance.connected`，已关闭时立即调用 cleanup 避免资源泄漏（close 事件已触发后 `on('close')` 注册的监听器永不执行）。
+23. **async handler 重复错误处理防护**：`_dispatch` 中 async handler 的 `.catch` 回调必须检查 `handlerCalledNext` 标志，handler 已通过 `next(err)` 传递错误时跳过 `_handleError` 调用，避免错误处理中间件被重复执行（与 sync catch 块的 `if (handlerCalledNext) return` 保持一致）。
 
 ---
 
@@ -906,7 +910,7 @@ app.sse('/events', (sse, req) => {
 ```json
 {
   "name": "@lzpong/httpm",
-  "version": "1.3.9",
+  "version": "1.4.0",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
   "engines": { "node": ">=18.0.0" },
