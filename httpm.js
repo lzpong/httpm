@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.3.8
+ * @version     1.3.9
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -312,6 +312,8 @@ class Logger {
     this.exitOnDiskFull = options.exitOnDiskFull === true;
     // 防止多次 process.exit：error 事件可能连续触发，重复 exit 无意义且可能产生竞态
     this._exiting = false;
+    // 背压告警标志：stream.write 返回 false 时表示内部缓冲已满，仅告警一次避免日志风暴
+    this._backpressureWarned = false;
     this._levels = { debug: 0, info: 1, notice: 2, warn: 3, error: 4, fatal: 5 };
     this._colors = {
       debug: '\x1b[1;30m',   // 灰色
@@ -395,7 +397,14 @@ class Logger {
   _writeFile(level, msg) {
     try {
       const stream = this._getLogStream();
-      stream.write(msg + '\n');
+      // stream.write 返回 false 表示内部缓冲已满（背压），高并发日志场景下可能丢失日志
+      // 仅告警一次避免日志风暴，监听 drain 事件后重置标志
+      const ok = stream.write(msg + '\n');
+      if (!ok && !this._backpressureWarned) {
+        this._backpressureWarned = true;
+        console.warn('[Logger] Write backpressure detected, logs may be delayed or lost');
+        stream.once('drain', () => { this._backpressureWarned = false; });
+      }
     } catch (e) {
       // 同步异常（如 mkdirSync 失败）交给 _handleWriteError 统一处理，打印明确错误码
       this._handleWriteError(e);
@@ -3066,6 +3075,8 @@ class Application extends Router {
         // 无匹配的 ws 路由：关闭连接避免孤儿连接
         this._logger.warn(`No ws handler matched: ${pathname}`);
         ws.close(1000, 'No handler');
+        // 立即从连接池移除，避免依赖 close 事件异步清理的短暂内存占用
+        this._wss._removeConnection(ws);
       }
     }
   }
@@ -3259,7 +3270,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.3.8';
+httpm.version = '1.3.9';
 
 /**
  * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）

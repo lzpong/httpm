@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.3.8
+**文档版本**：V1.3.9
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -457,6 +457,7 @@ app.ws('/chat/:room', (ws, req) => {
      - `false`：仅控制台打印，主业务流程继续（业界主流，日志故障不影响主业务）；
      - `true`：控制台打印后 `process.exit(1)`，便于进程管理器（pm2/systemd）感知并重启；
    - 支持通过 `new Logger({ exitOnDiskFull: true })` 或 `httpm({ exitOnDiskFull: true })` 配置。
+6. **写入背压检测**：`_writeFile` 检查 `stream.write()` 返回值，返回 `false` 表示内部缓冲已满（背压），此时打印一次告警（`[Logger] Write backpressure detected`），并监听 `drain` 事件后重置告警标志，避免日志风暴。高并发日志场景下背压告警帮助运维感知日志延迟/丢失风险。
 
 ---
 
@@ -892,6 +893,8 @@ app.sse('/events', (sse, req) => {
 15. **SSE 写入安全**：所有 SSE 写入方法通过 `_write` 统一封装，try/catch 处理底层响应流异常，失败时调用 `close()` 清理连接；send/event 的 data 为 null/undefined 时转为 'null'，避免 `JSON.stringify(undefined)` 返回 undefined 导致 split 抛 TypeError；
 16. **未知 HTTP 方法警告**：`_addRoute` 对未支持的 HTTP 方法（如 CONNECT/TRACE）打印警告日志而非静默忽略，便于调用方排查路由未命中问题；
 17. **WebSocket 握手写入防御**：`handleUpgrade` 中的 `socket.write` 用 try/catch 包裹，socket 已关闭/已销毁时避免抛 `ERR_STREAM_WRITE_AFTER_END`，握手响应失败时销毁 socket 并返回 null。
+18. **Logger 背压检测**：`_writeFile` 检查 `stream.write()` 返回值，`false` 时打印一次背压告警并监听 `drain` 重置标志，避免日志风暴，帮助运维感知高并发日志延迟风险。
+19. **WebSocket 无匹配路由立即清理**：`_handleUpgrade` 中无匹配 ws 路由时，`ws.close()` 后立即调用 `_removeConnection(ws)` 从连接池移除，避免依赖 close 事件异步清理的短暂内存占用（`_removeConnection` 幂等，close 事件再次调用安全）。
 
 ---
 
@@ -903,7 +906,7 @@ app.sse('/events', (sse, req) => {
 ```json
 {
   "name": "@lzpong/httpm",
-  "version": "1.3.8",
+  "version": "1.3.9",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
   "engines": { "node": ">=18.0.0" },
