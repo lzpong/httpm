@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.4.0
+**文档版本**：V1.4.1
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -808,7 +808,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.4.0';
+httpm.version = '1.4.1';
 
 module.exports = httpm;
 ```
@@ -899,6 +899,13 @@ app.sse('/events', (sse, req) => {
 21. **CORS origin 函数异常保护**：`_applyCORSHeaders` 调用用户提供的 `cors.origin` 函数时用 try/catch 包裹，函数抛异常时按拒绝跨域处理（不设置 ACAO 头）并记录告警日志，CORS 是附加安全层其异常不应阻断主请求。
 22. **async handler cleanup 竞态保护**：`app.ws`/`app.sse` 注册的 async handler 返回的 cleanup 函数，在 `Promise.resolve(ret).then(...)` 注册前需检查连接状态：WebSocket 检查 `ws._closed`、SSE 检查 `sseInstance.connected`，已关闭时立即调用 cleanup 避免资源泄漏（close 事件已触发后 `on('close')` 注册的监听器永不执行）。
 23. **async handler 重复错误处理防护**：`_dispatch` 中 async handler 的 `.catch` 回调必须检查 `handlerCalledNext` 标志，handler 已通过 `next(err)` 传递错误时跳过 `_handleError` 调用，避免错误处理中间件被重复执行（与 sync catch 块的 `if (handlerCalledNext) return` 保持一致）。
+24. **WebSocket head 喂入异步化**：`WebSocketServer.handleUpgrade` 中将 head 数据喂给 `_parseFrames` 时必须用 `process.nextTick` 异步化，确保 `_emit('connection')` 回调和 `app.ws()` handler 同步注册 `text`/`data` 监听器后再解析 head，避免 pipeline 客户端首帧事件被 `_emitEvent` 静默丢弃。
+25. **res.send(null) 对齐 Express**：`Response.send(null)` 必须发送空字符串（Content-Length: 0），而非 `'null'` 字符串。Express 4.x 在 `case 'object'` 分支将 null 转为空字符串，与 `JSON.stringify(null) = 'null'` 行为不同。
+26. **SSE.close 异常保护**：`SSE.close` 必须在调用 `res.end()` 前检查 `res.finished || res.writableEnded`，已 finished 时直接跳过 end 调用，避免触发 `ERR_STREAM_WRITE_AFTER_END` 异步 'error' 事件（try/catch 只能捕获同步抛出，无法捕获异步 'error' 事件，会导致底层 socket 强制关闭，客户端收到 aborted 错误）。try/catch 作为双重保护兜底其他异常。
+27. **WS Origin 拒绝响应**：`WebSocketServer.handleUpgrade` 中 Origin 校验拒绝时必须用 `socket.end('HTTP/1.1 403...')` 替代 `write+destroy`，`end` 会在数据刷出后自动关闭 socket，避免 `destroy` 立即关闭导致客户端收不到 403 响应。
+28. **isPathSafe 拒绝 null byte**：`isPathSafe` 必须显式拒绝路径含 `\0` 的请求，部分 fs API（如旧版 Node）会截断含 null byte 的路径，可能导致路径注入。明确拒绝比依赖底层 fs 行为更安全。
+29. **cookie 对象值 JSON 序列化异常保护**：`Response.cookie` 对象值进行 `JSON.stringify` 时必须 try/catch，循环引用等异常场景抛 TypeError，回退到空字符串避免冒泡到调用方。
+30. **WebSocket close 定时器 unref**：`WebSocket.close` 的 2 秒超时定时器必须调用 `unref()`，防止定时器阻止进程退出（测试场景下断开所有连接后进程应能立即退出）。
 
 ---
 
@@ -910,7 +917,7 @@ app.sse('/events', (sse, req) => {
 ```json
 {
   "name": "@lzpong/httpm",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
   "engines": { "node": ">=18.0.0" },

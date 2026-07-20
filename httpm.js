@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.4.0
+ * @version     1.4.1
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -226,6 +226,9 @@ function fmtTime(ms) {
 function isPathSafe(requestPath, rootDir, allowAllFiles = false) {
   // 防御非字符串入参：null/undefined/数字等会导致 replace/path.resolve 抛异常
   if (typeof requestPath !== 'string' || typeof rootDir !== 'string') return false;
+  // 拒绝 null byte：部分 fs API（如旧版 Node）会截断含 \0 的路径，可能导致路径注入
+  // 明确拒绝比依赖底层 fs 行为更安全
+  if (requestPath.indexOf('\0') !== -1) return false;
   const normalized = requestPath.replace(/^\/+/, '');
   const resolved = path.resolve(rootDir, normalized);
   const root = path.resolve(rootDir);
@@ -894,9 +897,11 @@ class Response {
       return;
     }
     if (data === null) {
+      // Express 4.x 兼容：null 在 case 'object' 分支被转为空字符串，发送空响应
+      // 不发 'null' 字符串（与 JSON.stringify(null) 行为不同）
       this.setHeader('Content-Type', 'text/html; charset=utf-8');
-      this.setHeader('Content-Length', 4);
-      this._send('null');
+      this.setHeader('Content-Length', 0);
+      this._send('');
       return;
     }
     if (Buffer.isBuffer(data)) {
@@ -1194,7 +1199,13 @@ class Response {
     // 避免encodeURIComponent(undefined) = 'undefined'，设置 cookie 值为字符串 "undefined"
     if (value == null) value = '';
     // Express 兼容：对象值先 JSON 序列化，便于存储结构化数据
-    let rawValue = typeof value === 'object' && value !== null ? JSON.stringify(value) : value;
+    // 循环引用等异常场景 JSON.stringify 抛 TypeError，回退到空字符串避免冒泡到调用方
+    let rawValue;
+    if (typeof value === 'object' && value !== null) {
+      try { rawValue = JSON.stringify(value); } catch (e) { rawValue = ''; }
+    } else {
+      rawValue = value;
+    }
     let encodedValue = encodeURIComponent(rawValue);
     // 签名 Cookie：s:value.signature（s: 前缀不参与编码，签名基于原始值）
     if (opts.signed) {
@@ -1345,6 +1356,10 @@ class SSE {
 
   /**
    * 主动关闭 SSE 连接，移除监听器防止内存泄漏
+   * res 已 finished（如 res.send/res.end 已调用）时不再调用 end：
+   *   1. 避免触发 ERR_STREAM_WRITE_AFTER_END 异步 'error' 事件（try/catch 无法捕获）
+   *   2. 避免底层 socket 被强制关闭导致客户端收到 aborted 错误
+   * try/catch 作为双重保护，兜底其他异常（如 socket 已销毁）
    */
   close() {
     if (!this.connected) return;
@@ -1354,7 +1369,9 @@ class SSE {
     if (this._req && typeof this._req.removeListener === 'function') {
       this._req.removeListener('aborted', this._onClose);
     }
-    this._res.end();
+    // res 已 finished/writableEnded 时跳过 end，避免触发异步 'error' 事件
+    if (this._res.finished || this._res.writableEnded) return;
+    try { this._res.end(); } catch (e) { /* socket 已销毁等异常，忽略 */ }
   }
 }
 
@@ -1714,6 +1731,8 @@ class WebSocket {
       try { this.socket.destroy(); } catch (e) { /* 忽略 */ }
       this._emit('close', code, reason);
     }, 2000);
+    // unref 防止定时器阻止进程退出（测试场景下断开所有连接后进程应能立即退出）
+    if (typeof this._closeTimer.unref === 'function') this._closeTimer.unref();
   }
 
   /**
@@ -1789,9 +1808,10 @@ class WebSocketServer {
     if (this._allowedOrigins) {
       const origin = req.headers['origin'];
       if (!origin || !this._allowedOrigins.includes(origin)) {
-        // socket.write 在 socket 已关闭/已销毁时可能抛 ERR_STREAM_WRITE_AFTER_END
-        try { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); } catch (e) { /* socket 已关闭 */ }
-        socket.destroy();
+        // 用 socket.end 替代 write+destroy：end 会在数据刷出后自动关闭 socket，
+        // 避免 destroy 立即关闭导致客户端收不到 403 响应
+        // socket 已关闭/已销毁时 end 可能抛 ERR_STREAM_WRITE_AFTER_END，需 try/catch
+        try { socket.end('HTTP/1.1 403 Forbidden\r\n\r\n'); } catch (e) { /* socket 已关闭 */ }
         return null;
       }
     }
@@ -1819,9 +1839,11 @@ class WebSocketServer {
     // 处理握手前客户端可能已发送的首帧数据（head）
     // Node.js upgrade 事件的 head 参数可能包含客户端在握手响应前发送的 WebSocket 帧
     // 若不喂给解析器，会导致首帧消息丢失（浏览器在握手后立即发送 subscribe 等场景）
+    // 异步化：用 process.nextTick 延迟解析，确保 _emit('connection') 回调和 app.ws() handler
+    // 同步注册 'text'/'data' 监听器后再处理 head，避免首帧事件被 _emitEvent 静默丢弃
     if (head && head.length > 0) {
       ws._frameBuffer = Buffer.concat([ws._frameBuffer, head]);
-      ws._parseFrames();
+      process.nextTick(() => ws._parseFrames());
     }
     this.connections.set(ws.id, ws);
 
@@ -2228,8 +2250,8 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
           const err = new Error(`Field exceeds maximum size of ${fmtSize(maxFieldSize)}`, { cause: { actual: fieldSize, maxSize: maxFieldSize } });
           err.status = 413;
           safeNext(err);
-            return;
-          }
+          return;
+        }
         currentField.value += chunk;
         // 刷新 decoder 中残留的未完成字符（末尾不完整字节会用 U+FFFD 替换）
         currentField.value += currentField.decoder.end();
@@ -3287,7 +3309,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.4.0';
+httpm.version = '1.4.1';
 
 /**
  * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）
