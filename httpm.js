@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.4.1
+ * @version     1.4.2
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -639,7 +639,8 @@ class Request {
       const fwd = this._req.headers['x-forwarded-for'];
       if (fwd) return fwd.split(',')[0].trim();
     }
-    return this._req.socket?.remoteAddress || '';
+    // HTTP/2 模式下 IncomingMessage.socket 不存在，需通过 stream.session.socket 获取
+    return this._req.socket?.remoteAddress || this._req.stream?.session?.socket?.remoteAddress || '';
   }
   get hostname() {
     // 解析 Host 头，正确处理 IPv6 地址（如 [::1]:8080、[::1]）
@@ -1217,19 +1218,33 @@ class Response {
     }
     let str = `${encodeURIComponent(name)}=${encodedValue}`;
     if (opts.maxAge !== undefined) str += `; Max-Age=${opts.maxAge}`;
-    // Express 兼容：支持 expires 选项（Date 对象或时间字符串）
-    if (opts.expires) str += `; Expires=${opts.expires instanceof Date ? opts.expires.toUTCString() : opts.expires}`;
-    if (opts.domain) str += `; Domain=${opts.domain}`;
-    if (opts.path) str += `; Path=${opts.path}`;
+    // Express 兼容：支持 expires 选项（Date 对象/数字时间戳/字符串）
+    // 统一归一化为 Date.toUTCString()，无效日期不输出头（避免 Set-Cookie 解析失败）
+    if (opts.expires) {
+      const date = opts.expires instanceof Date ? opts.expires : new Date(opts.expires);
+      if (!isNaN(date.getTime())) str += `; Expires=${date.toUTCString()}`;
+    }
+    // 防御 cookie 头注入：path/domain 含 ; , 空格会破坏 Set-Cookie 结构
+    // 攻击者可通过 path="/foo;Domain=evil.com" 污染其他域名的 Cookie
+    if (opts.domain && !/[;,\s]/.test(opts.domain)) str += `; Domain=${opts.domain}`;
+    else if (opts.domain) this._app?._logger?.warn('[Cookie] domain contains invalid characters (;, ,\\s)');
+    if (opts.path && !/[;,\s]/.test(opts.path)) str += `; Path=${opts.path}`;
+    else if (opts.path) this._app?._logger?.warn('[Cookie] path contains invalid characters (;, ,\\s)');
     if (opts.secure) str += '; Secure';
     if (opts.httpOnly) str += '; HttpOnly';
     if (opts.sameSite) {
-      // SameSite=None 必须配合 Secure，否则浏览器会拒绝该 Cookie（Chrome 80+ 强制）
-      // 此处仅记录警告日志，不强制阻断，保持调用方灵活性
-      if (String(opts.sameSite).toLowerCase() === 'none' && !opts.secure) {
-        this._app?._logger?.warn('[Cookie] SameSite=None without Secure may be rejected by browser');
+      // RFC 6265bis 规定 SameSite 值为 Strict/Lax/None 大小写敏感
+      // 归一化为小写并仅接受白名单值，避免 'lax'/'NONE' 等非标准值被发送
+      const normalized = String(opts.sameSite).toLowerCase();
+      if (['strict', 'lax', 'none'].includes(normalized)) {
+        // SameSite=None 必须配合 Secure，否则浏览器会拒绝该 Cookie（Chrome 80+ 强制）
+        // 此处仅记录警告日志，不强制阻断，保持调用方灵活性
+        if (normalized === 'none' && !opts.secure) {
+          this._app?._logger?.warn('[Cookie] SameSite=None without Secure may be rejected by browser');
+        }
+        // 归一化为首字母大写（Strict/Lax/None），符合 RFC 规范
+        str += `; SameSite=${normalized.charAt(0).toUpperCase() + normalized.slice(1)}`;
       }
-      str += `; SameSite=${opts.sameSite}`;
     }
     const existing = this.getHeader('Set-Cookie');
     const cookies = existing ? (Array.isArray(existing) ? existing : [existing]) : [];
@@ -2312,8 +2327,11 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
 
         ensureFileStream();
         currentFile.stream.write(trimmedData);
-        // 结束写入（注意：stream.end 为异步操作，极端情况如磁盘满时可能写入不完整，
-        // 但 fileInfo 仍会被记录。若需严格保证写入完整性，需改为异步流程）
+        // 结束写入：end() 是异步的，但此处保持同步 push fileInfo 以确保
+        // _tempFiles 列表完整（res.on('finish') 清理时不会遗漏）
+        // 极端 race：end() 后立即磁盘满导致写入不完整，error 事件触发时
+        // fileInfo 已被 push 记录。缓解：error 处理器已通过 safeNext 销毁
+        // 请求流（_handleError → 500 响应），后续 handler 不会执行。
         currentFile.stream.end();
         fileSize += trimmedData.length;
         currentFile.size = fileSize;
@@ -3285,14 +3303,20 @@ function staticMiddleware(rootPath, options = {}) {
         const indexPath = path.join(fullPath, 'index.html');
         fs.stat(indexPath, (idxErr) => {
           if (!idxErr) {
-            res.sendFile(path.relative(root, indexPath), { root });
+            // sendFile 内部错误用回调捕获，避免同步异常冒泡到中间件链
+            res.sendFile(path.relative(root, indexPath), { root }, (err) => {
+              if (err) return next(err);
+            });
             return;
           }
           return next();
         });
         return;
       }
-      res.sendFile(requestPath, { root });
+      // sendFile 内部错误用回调捕获，避免同步异常冒泡到中间件链
+      res.sendFile(requestPath, { root }, (err) => {
+        if (err) return next(err);
+      });
     });
   };
 }

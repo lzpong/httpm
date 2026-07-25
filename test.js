@@ -1219,6 +1219,44 @@ async function runTests() {
     res.json({});
   });
 
+  // --- V1.4.2 P2-2 验证：cookie expires 数字时间戳归一化为 UTC 字符串 ---
+  app.get('/cookie-expires-num', (req, res) => {
+    res.cookie('with_expires_num', 'v', { expires: 1700000000 });
+    res.json({});
+  });
+  app.get('/cookie-expires-date', (req, res) => {
+    res.cookie('with_expires_date', 'v', { expires: new Date(1700000000000) });
+    res.json({});
+  });
+  app.get('/cookie-expires-invalid', (req, res) => {
+    res.cookie('with_expires_invalid', 'v', { expires: 'invalid-date' });
+    res.json({});
+  });
+
+  // --- V1.4.2 P2-3 验证：cookie sameSite 归一化 ---
+  app.get('/cookie-samesite-lower', (req, res) => {
+    res.cookie('s1', 'v', { sameSite: 'lax' });
+    res.json({});
+  });
+  app.get('/cookie-samesite-upper', (req, res) => {
+    res.cookie('s2', 'v', { sameSite: 'NONE' });
+    res.json({});
+  });
+  app.get('/cookie-samesite-invalid', (req, res) => {
+    res.cookie('s3', 'v', { sameSite: 'bogus' });
+    res.json({});
+  });
+
+  // --- V1.4.2 P2-4 验证：cookie path/domain 非法字符拒绝 ---
+  app.get('/cookie-path-inject', (req, res) => {
+    res.cookie('c1', 'v', { path: '/foo;Domain=evil.com' });
+    res.json({});
+  });
+  app.get('/cookie-domain-inject', (req, res) => {
+    res.cookie('c2', 'v', { domain: 'evil.com,foo.com' });
+    res.json({});
+  });
+
   // --- P2-6 验证：SSE send/event undefined 不崩溃 ---
   // V1.4.1 P1 #3 同时验证：sse.close() 后再次调用不抛异常（幂等性 + res.finished 保护）
   app.get('/sse-undef', (req, res) => {
@@ -1871,6 +1909,71 @@ async function runTests() {
       // null 值同样回退空字符串
       const nullCookie = setCookie.find(c => c.startsWith('null_val='));
       assert(nullCookie && nullCookie.split(';')[0] === 'null_val=', 'HTTP - cookie null value → empty (not "null")');
+    }
+
+    // --- V1.4.2 P2-2 验证：cookie expires 数字时间戳归一化 ---
+    {
+      const res = await httpGet(BASE + '/cookie-expires-num');
+      const setCookie = res.headers['set-cookie'];
+      const cookie = setCookie.find(c => c.startsWith('with_expires_num='));
+      // 数字时间戳应转为 UTC 字符串，不能原样输出
+      assert(cookie && cookie.includes('Expires='), 'HTTP - cookie numeric expires → Expires= header');
+      assert(cookie && !/Expires=1700000000\b/.test(cookie), 'HTTP - cookie numeric expires not raw number');
+    }
+    {
+      const res = await httpGet(BASE + '/cookie-expires-date');
+      const setCookie = res.headers['set-cookie'];
+      const cookie = setCookie.find(c => c.startsWith('with_expires_date='));
+      // Date 对象应输出 UTC 字符串（GMT 格式）
+      assert(cookie && /Expires=[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT/.test(cookie), 'HTTP - cookie Date expires → RFC 1123 GMT format');
+    }
+    {
+      const res = await httpGet(BASE + '/cookie-expires-invalid');
+      const setCookie = res.headers['set-cookie'];
+      const cookie = setCookie.find(c => c.startsWith('with_expires_invalid='));
+      // 无效日期不应输出 Expires 头
+      assert(cookie && !cookie.includes('Expires='), 'HTTP - cookie invalid date no Expires header');
+    }
+
+    // --- V1.4.2 P2-3 验证：cookie sameSite 归一化 ---
+    {
+      const res = await httpGet(BASE + '/cookie-samesite-lower');
+      const setCookie = res.headers['set-cookie'];
+      const cookie = setCookie.find(c => c.startsWith('s1='));
+      // 'lax' 应归一化为 'Lax'（首字母大写）
+      assert(cookie && cookie.includes('SameSite=Lax'), 'HTTP - cookie sameSite lowercase normalized to Lax');
+    }
+    {
+      const res = await httpGet(BASE + '/cookie-samesite-upper');
+      const setCookie = res.headers['set-cookie'];
+      const cookie = setCookie.find(c => c.startsWith('s2='));
+      // 'NONE' 应归一化为 'None'（非标准大小写拒绝）
+      assert(cookie && cookie.includes('SameSite=None'), 'HTTP - cookie sameSite UPPERCASE normalized to None');
+    }
+    {
+      const res = await httpGet(BASE + '/cookie-samesite-invalid');
+      const setCookie = res.headers['set-cookie'];
+      const cookie = setCookie.find(c => c.startsWith('s3='));
+      // 'bogus' 不在白名单中，不应输出 SameSite 头
+      assert(cookie && !cookie.includes('SameSite='), 'HTTP - cookie sameSite invalid value rejected (no header)');
+    }
+
+    // --- V1.4.2 P2-4 验证：cookie path/domain 非法字符拒绝 ---
+    {
+      const res = await httpGet(BASE + '/cookie-path-inject');
+      const setCookie = res.headers['set-cookie'];
+      const cookie = setCookie.find(c => c.startsWith('c1='));
+      // path 含 ; 应被拒绝（防止 Set-Cookie 头注入）
+      assert(cookie && !cookie.includes('Path=/foo;Domain=evil.com'), 'HTTP - cookie path injection blocked (;)');
+      // 整个 Set-Cookie 不应被破坏
+      assert(cookie && /^c1=v/.test(cookie.split(';')[0]), 'HTTP - cookie path injection cookie still set');
+    }
+    {
+      const res = await httpGet(BASE + '/cookie-domain-inject');
+      const setCookie = res.headers['set-cookie'];
+      const cookie = setCookie.find(c => c.startsWith('c2='));
+      // domain 含 , 应被拒绝
+      assert(cookie && !cookie.includes('Domain=evil.com,foo.com'), 'HTTP - cookie domain injection blocked (,)');
     }
 
     // --- P2-6 验证：SSE send/event undefined 不崩溃，发送 'null' ---

@@ -906,6 +906,12 @@ app.sse('/events', (sse, req) => {
 28. **isPathSafe 拒绝 null byte**：`isPathSafe` 必须显式拒绝路径含 `\0` 的请求，部分 fs API（如旧版 Node）会截断含 null byte 的路径，可能导致路径注入。明确拒绝比依赖底层 fs 行为更安全。
 29. **cookie 对象值 JSON 序列化异常保护**：`Response.cookie` 对象值进行 `JSON.stringify` 时必须 try/catch，循环引用等异常场景抛 TypeError，回退到空字符串避免冒泡到调用方。
 30. **WebSocket close 定时器 unref**：`WebSocket.close` 的 2 秒超时定时器必须调用 `unref()`，防止定时器阻止进程退出（测试场景下断开所有连接后进程应能立即退出）。
+31. **HTTP/2 socket 兼容**：`Request.ip`/`Request.protocol` 必须兼容 HTTP/2 模式，HTTP/2 模式下 `IncomingMessage.socket` 为 `undefined`，需通过 `req.stream?.session?.socket` 回退获取底层 TCP socket。
+32. **cookie expires 归一化**：`res.cookie()` 的 `expires` 选项支持 Date 对象/数字时间戳/字符串，统一归一化为 `Date.toUTCString()`；无效日期不输出 `Expires` 头避免 Set-Cookie 解析失败。
+33. **cookie sameSite 白名单归一化**：`res.cookie()` 的 `sameSite` 必须归一化为小写并仅接受 `strict`/`lax`/`none` 白名单值，避免 `'lax'`/`'NONE'` 等非标准大小写被发送。首字母大写输出（`Strict`/`Lax`/`None`）符合 RFC 6265bis。
+34. **cookie 头注入防护**：`res.cookie()` 的 `path`/`domain` 必须拒绝含 `;`、`,`、空白字符的值，这些字符会破坏 Set-Cookie 头结构（攻击者可通过 `path="/foo;Domain=evil.com"` 污染其他域名 Cookie），违规时仅打印警告日志不输出头。
+35. **multipart fileInfo 时序**：`_parseMultipart` 在 `stream.end()` 前后同步 push fileInfo 是有意的设计决策，原因是 `res.on('finish', () => _cleanupTempFiles(req._tempFiles))` 需要完整列表；极端 race（end 后立即磁盘满）通过 ensureFileStream 的 error handler 缓解（safeNext → 500 响应，handler 不会执行）。
+36. **staticMiddleware 错误回调**：`httpm.static()` 中 `res.sendFile()` 必须传递错误回调，避免 sendFile 内部异常（路径遍历校验等）冒泡到中间件链导致未捕获异常。
 
 ---
 
@@ -917,7 +923,7 @@ app.sse('/events', (sse, req) => {
 ```json
 {
   "name": "@lzpong/httpm",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
   "engines": { "node": ">=18.0.0" },
