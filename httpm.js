@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.4.2
+ * @version     1.4.3
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -2650,7 +2650,14 @@ class Application extends Router {
       this._logger.error('Unhandled request error:', err);
       if (!serverResponse.headersSent) {
         serverResponse.statusCode = 500;
-        serverResponse.end('Internal Server Error');
+        // 显式设置 Content-Type，避免客户端 MIME 嗅探误判
+        serverResponse.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        // HEAD 请求只发送头部不发送响应体（与 send/response.end 行为一致）
+        if (incomingMessage.method === 'HEAD') {
+          serverResponse.end();
+        } else {
+          serverResponse.end('Internal Server Error');
+        }
       }
     }
   }
@@ -3043,8 +3050,10 @@ class Application extends Router {
     html += `</head><body><h1>Directory: ${escapeHtml(displayPath)}</h1><table><tr><th>Name</th><th>Size</th><th>Modified</th></tr>`;
 
     // 父目录链接：使用绝对路径返回上一级（根目录时不显示）
+    // 末尾追加 '/' 与子目录链接保持一致（对齐 Express serve-static 行为）
+    // 缺少尾部斜杠时浏览器可能多一次重定向往返
     if (requestPath && requestPath !== '/') {
-      const parentHref = prefix + '..';
+      const parentHref = prefix + '../';
       html += `<tr><td><a href="${escapeHtml(parentHref)}" class="dir">../</a></td><td class="size">-</td><td>-</td></tr>`;
     }
 
@@ -3259,6 +3268,33 @@ const defaultConfig = {
 
 /**
  * httpm 入口函数，创建 Application 实例
+ *
+ * 配置优先级（从低到高）：默认配置 < app.json < 代码参数 < app.set() 运行时配置
+ *
+ * @param {object} [options] - 初始化配置项（详见 defaultConfig）
+ * @param {number} [options.svrPort=0] - 监听端口，0 表示随机分配
+ * @param {string} [options.rootPath] - 静态文件根目录（默认 process.cwd()）
+ * @param {string} [options.logLevel='info'] - 日志级别 debug/info/notice/warn/error/fatal
+ * @param {string} [options.logDir='./log'] - 日志目录
+ * @param {boolean} [options.exitOnDiskFull=false] - 磁盘满时是否退出进程
+ * @param {object} [options.cors] - CORS 配置 { origin, headers, maxAge, credentials }
+ * @param {boolean} [options.useBodyParser=true] - 是否自动注册 bodyParser 中间件
+ * @param {boolean} [options.useCookieParser=true] - 是否自动注册 cookieParser 中间件
+ * @param {object} [options.bodyParserOptions] - bodyParser 选项 { maxBodySize, maxFieldSize, maxFileSize }
+ * @param {string} [options.cookieParserSecret] - cookie 签名密钥（null = 不签名）
+ * @param {number} [options.wsHeartbeatInterval=30000] - WebSocket 心跳间隔（ms）
+ * @param {number} [options.wsHeartbeatTimeout=30000] - WebSocket 心跳超时（ms）
+ * @param {boolean} [options.showDir=false] - 是否允许显示目录列表
+ * @param {boolean} [options.enableRange=true] - 是否启用 Range 断点续传
+ * @param {boolean} [options.trustProxy=false] - 是否信任 X-Forwarded-* 代理头
+ * @param {boolean} [options.http2=false] - 是否启用 HTTP/2 协议
+ * @param {object} [options.https] - HTTPS 配置 { key, cert }（启用 HTTPS）
+ * @returns {Application} Application 实例
+ *
+ * @example
+ * const app = httpm({ svrPort: 3000, logLevel: 'debug' });
+ * app.get('/', (req, res) => res.send('Hello World'));
+ * app.listen(3000);
  */
 function httpm(options) {
   return new Application(options);
@@ -3333,7 +3369,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.4.1';
+httpm.version = '1.4.3';
 
 /**
  * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）

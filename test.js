@@ -1208,6 +1208,9 @@ async function runTests() {
   // --- P1-1 验证：hostname IPv6 解析 ---
   app.get('/hostname-test', (req, res) => res.json({ hostname: req.hostname }));
 
+  // 注：V1.4.3 P2-8（_handleRequest 顶层 catch 响应规范化）和 P2-9（httpm 入口 JSDoc）
+  // 通过静态分析保证，难以通过黑盒测试直接验证。设计规则已记录在 Detailed_Design.md。
+
   // --- P2-1 验证：redirect null/undefined url 回退到 '/' ---
   app.get('/redirect-null', (req, res) => res.redirect());
   app.get('/redirect-status-only', (req, res) => res.redirect(302));
@@ -1454,6 +1457,8 @@ async function runTests() {
       assert(body.includes('nested.html') || body.includes('Directory'), 'HTTP - directory listing');
       // P2-1 验证：目录项链接必须包含尾部斜杠（避免浏览器多一次重定向往返）
       assert(body.includes('href="/subdir/nesteddir/"'), 'HTTP - directory listing subdir href trailing slash');
+      // V1.4.3 P2-7 验证：父目录链接也必须以 '/' 结尾（与子目录链接一致）
+      assert(body.includes('href="/subdir/../"'), 'HTTP - directory listing parent href trailing slash');
     }
 
     // --- 重定向 302 ---

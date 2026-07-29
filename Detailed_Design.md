@@ -808,7 +808,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.4.1';
+httpm.version = '1.4.3';
 
 module.exports = httpm;
 ```
@@ -912,6 +912,9 @@ app.sse('/events', (sse, req) => {
 34. **cookie 头注入防护**：`res.cookie()` 的 `path`/`domain` 必须拒绝含 `;`、`,`、空白字符的值，这些字符会破坏 Set-Cookie 头结构（攻击者可通过 `path="/foo;Domain=evil.com"` 污染其他域名 Cookie），违规时仅打印警告日志不输出头。
 35. **multipart fileInfo 时序**：`_parseMultipart` 在 `stream.end()` 前后同步 push fileInfo 是有意的设计决策，原因是 `res.on('finish', () => _cleanupTempFiles(req._tempFiles))` 需要完整列表；极端 race（end 后立即磁盘满）通过 ensureFileStream 的 error handler 缓解（safeNext → 500 响应，handler 不会执行）。
 36. **staticMiddleware 错误回调**：`httpm.static()` 中 `res.sendFile()` 必须传递错误回调，避免 sendFile 内部异常（路径遍历校验等）冒泡到中间件链导致未捕获异常。
+37. **目录列表父目录链接尾斜杠**：`_renderDirectoryHTML` 生成的父目录链接 `parentHref = prefix + '../'` 必须以 `/` 结尾，与子目录链接（V1.4.0 第 20 条规则）保持一致，避免浏览器多一次重定向往返。
+38. **_handleRequest 顶层 catch 响应规范化**：`_handleRequest` 顶层 catch 块在响应头未发送时除设置 500 状态码外，还应显式设置 `Content-Type: text/plain; charset=utf-8` 避免客户端 MIME 嗅探误判，HEAD 请求只发头部不发送响应体（与 `response.end()` 在 HEAD 路径下的行为一致）。
+39. **httpm 入口 JSDoc 完整**：`httpm` 入口函数必须有完整 JSDoc 文档，包括所有配置项（svrPort/logLevel/cors/useBodyParser/cookieParserSecret/wsHeartbeatInterval/trustProxy/http2 等）、配置优先级、返回值类型与示例代码，支撑 IDE 智能提示和 TypeScript 类型推导。
 
 ---
 
@@ -923,7 +926,7 @@ app.sse('/events', (sse, req) => {
 ```json
 {
   "name": "@lzpong/httpm",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
   "engines": { "node": ">=18.0.0" },
