@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.4.1
+**文档版本**：V1.4.4
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -808,7 +808,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.4.3';
+httpm.version = '1.4.4';
 
 module.exports = httpm;
 ```
@@ -915,6 +915,7 @@ app.sse('/events', (sse, req) => {
 37. **目录列表父目录链接尾斜杠**：`_renderDirectoryHTML` 生成的父目录链接 `parentHref = prefix + '../'` 必须以 `/` 结尾，与子目录链接（V1.4.0 第 20 条规则）保持一致，避免浏览器多一次重定向往返。
 38. **_handleRequest 顶层 catch 响应规范化**：`_handleRequest` 顶层 catch 块在响应头未发送时除设置 500 状态码外，还应显式设置 `Content-Type: text/plain; charset=utf-8` 避免客户端 MIME 嗅探误判，HEAD 请求只发头部不发送响应体（与 `response.end()` 在 HEAD 路径下的行为一致）。
 39. **httpm 入口 JSDoc 完整**：`httpm` 入口函数必须有完整 JSDoc 文档，包括所有配置项（svrPort/logLevel/cors/useBodyParser/cookieParserSecret/wsHeartbeatInterval/trustProxy/http2 等）、配置优先级、返回值类型与示例代码，支撑 IDE 智能提示和 TypeScript 类型推导。
+40. **Request.protocol HTTP/2 兼容**：`Request.protocol` getter 必须与 `Request.ip` 保持一致的 HTTP/2 兼容回退，通过 `req.stream?.session?.socket` 获取底层 TCP socket 判断 `encrypted` 属性。HTTP/2 模式下 `IncomingMessage.socket` 为 `undefined`，直接访问会导致 protocol 永远返回 `'http'`（即使 HTTP/2 over TLS）。
 
 ---
 
@@ -926,7 +927,7 @@ app.sse('/events', (sse, req) => {
 ```json
 {
   "name": "@lzpong/httpm",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
   "engines": { "node": ">=18.0.0" },

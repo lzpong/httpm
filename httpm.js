@@ -671,7 +671,10 @@ class Request {
     return parseHost(this._req.headers['host']);
   }
   get protocol() {
-    return (this._req.socket?.encrypted || this._req.connection?.encrypted) ? 'https' : 'http';
+    // HTTP/2 模式下 IncomingMessage.socket 不存在，需通过 stream.session.socket 获取底层 socket
+    // 与 req.ip 保持一致的 HTTP/2 兼容回退（第七轮 P2-1 修复 req.ip 时遗漏了 protocol）
+    const sock = this._req.socket || this._req.stream?.session?.socket;
+    return (sock?.encrypted || this._req.connection?.encrypted) ? 'https' : 'http';
   }
 
   /**
@@ -3369,7 +3372,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.4.3';
+httpm.version = '1.4.4';
 
 /**
  * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）
