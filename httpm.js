@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.4.3
+ * @version     1.4.5
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -2626,12 +2626,14 @@ class Application extends Router {
       req._res = res;
       res._req = req;
 
-      // 基础解析
+      // 基础解析：parseUrl 仅拆分 pathname 与 query，不做 URI 解码
       const parsed = parseUrl(incomingMessage.url);
       try {
+        // 路由匹配基于解码后的路径，确保 /users/%3Aid 等编码字符能正确匹配动态路由参数
+        // 解码后再由 isPathSafe 做路径安全校验，防止 %2e%2e%2f 等编码形式的路径遍历攻击
         req.path = decodeURIComponent(parsed.pathname);
       } catch (e) {
-        // 非法 URI 编码，返回 400
+        // 非法 URI 编码（如 %ZZ），返回 400 避免下游路由匹配抛异常导致 500
         res.status(400).send('Bad Request: Invalid URI encoding');
         return;
       }
@@ -2814,6 +2816,10 @@ class Application extends Router {
     this._logger.error(`[${status}] ${req.method} ${req.path} - ${msg}`);
     if (!res.headersSent) {
       res.status(status).json({ error: msg, status });
+    } else {
+      // 响应头已发送（如流式响应中途出错），强制结束连接避免客户端挂起等待
+      // 不再写入响应体（headersSent 后无法修改状态码/头，写入会破坏已发送的响应）
+      try { res._res.end(); } catch (e) { /* 忽略 socket 已销毁等异常 */ }
     }
   }
 
@@ -2832,6 +2838,10 @@ class Application extends Router {
     } else if (method === 'POST' || method === 'PUT' || method === 'DELETE' || method === 'PATCH') {
       // 已知方法但无匹配路由，返回 405 Method Not Allowed（RFC 7231 要求必须包含 Allow 头）
       const allowed = this._getAllowedMethods(req.path);
+      // 跨域场景下浏览器需 Access-Control-Allow-Methods 头才能正确处理 405 响应
+      if (this.settings.cors) {
+        res.set('Access-Control-Allow-Methods', allowed.join(', '));
+      }
       res.set('Allow', allowed.join(', ')).status(405).json({ error: 'Method Not Allowed', status: 405 });
     } else {
       // 其他未知方法返回 404
@@ -2971,7 +2981,10 @@ class Application extends Router {
         const indexPath = path.join(fullPath, 'index.html');
         fs.stat(indexPath, (idxErr) => {
           if (!idxErr) {
-            res.sendFile(path.relative(rootPath, indexPath), { root: rootPath });
+            // 传递错误回调，与 staticMiddleware 保持一致，避免 sendFile 异常冒泡
+            res.sendFile(path.relative(rootPath, indexPath), { root: rootPath }, (err) => {
+              if (err) this._handleError(err, req, res, [], 0);
+            });
             return;
           }
           // 展示目录列表
@@ -2984,8 +2997,10 @@ class Application extends Router {
         return;
       }
 
-      // 文件：发送
-      res.sendFile(requestPath, { root: rootPath });
+      // 文件：发送（传递错误回调，与 staticMiddleware 保持一致）
+      res.sendFile(requestPath, { root: rootPath }, (err) => {
+        if (err) this._handleError(err, req, res, [], 0);
+      });
     });
   }
 
@@ -3320,6 +3335,18 @@ httpm.cookieParser = cookieParser;
 /**
  * static 中间件：Express 兼容的静态文件服务
  * 用法: app.use(httpm.static('public'))
+ *
+ * @param {string} rootPath - 静态文件根目录（绝对路径或相对 cwd 的路径）
+ * @param {Object} [options]
+ * @param {boolean} [options.allowAccessToAllFiles=false]
+ *   是否允许访问所有文件（含 .env、.git 等隐藏文件/目录）。
+ *   - false（默认）：拒绝路径中任何以 `.` 开头的段（隐藏文件与隐藏目录），防泄漏敏感配置
+ *   - true：仅做路径遍历校验，不限制隐藏文件，适用于需要分发点文件（如 .well-known）的场景
+ *   注意：Content-Type 由 sendFile 根据扩展名自动识别，本中间件不透传 contentType 选项
+ * @returns {Function} 中间件函数 (req, res, next) => void
+ *   - 仅处理 GET/HEAD 请求，其他方法直接 next()
+ *   - 路径不安全、文件不存在、目录无 index.html 时调用 next() 交由后续中间件/路由处理
+ *   - sendFile 出错时通过回调捕获并调用 next(err) 进入错误处理链，避免异常冒泡
  */
 function staticMiddleware(rootPath, options = {}) {
   return function staticHandler(req, res, next) {

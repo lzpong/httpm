@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.4.4
+**文档版本**：V1.4.5
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -911,11 +911,13 @@ app.sse('/events', (sse, req) => {
 33. **cookie sameSite 白名单归一化**：`res.cookie()` 的 `sameSite` 必须归一化为小写并仅接受 `strict`/`lax`/`none` 白名单值，避免 `'lax'`/`'NONE'` 等非标准大小写被发送。首字母大写输出（`Strict`/`Lax`/`None`）符合 RFC 6265bis。
 34. **cookie 头注入防护**：`res.cookie()` 的 `path`/`domain` 必须拒绝含 `;`、`,`、空白字符的值，这些字符会破坏 Set-Cookie 头结构（攻击者可通过 `path="/foo;Domain=evil.com"` 污染其他域名 Cookie），违规时仅打印警告日志不输出头。
 35. **multipart fileInfo 时序**：`_parseMultipart` 在 `stream.end()` 前后同步 push fileInfo 是有意的设计决策，原因是 `res.on('finish', () => _cleanupTempFiles(req._tempFiles))` 需要完整列表；极端 race（end 后立即磁盘满）通过 ensureFileStream 的 error handler 缓解（safeNext → 500 响应，handler 不会执行）。
-36. **staticMiddleware 错误回调**：`httpm.static()` 中 `res.sendFile()` 必须传递错误回调，避免 sendFile 内部异常（路径遍历校验等）冒泡到中间件链导致未捕获异常。
+36. **sendFile 错误回调统一传递**：`httpm.static()` 中间件与 `Application._serveStatic` 兜底处理中调用 `res.sendFile()` 时必须传递错误回调。`staticMiddleware` 错误回调调用 `next(err)` 进入中间件错误链；`_serveStatic` 错误回调调用 `this._handleError(err, req, res, [], 0)` 进入应用级错误处理。两者均避免 sendFile 内部异常（路径遍历校验、同步抛错等）冒泡到上层导致未捕获异常。
 37. **目录列表父目录链接尾斜杠**：`_renderDirectoryHTML` 生成的父目录链接 `parentHref = prefix + '../'` 必须以 `/` 结尾，与子目录链接（V1.4.0 第 20 条规则）保持一致，避免浏览器多一次重定向往返。
 38. **_handleRequest 顶层 catch 响应规范化**：`_handleRequest` 顶层 catch 块在响应头未发送时除设置 500 状态码外，还应显式设置 `Content-Type: text/plain; charset=utf-8` 避免客户端 MIME 嗅探误判，HEAD 请求只发头部不发送响应体（与 `response.end()` 在 HEAD 路径下的行为一致）。
 39. **httpm 入口 JSDoc 完整**：`httpm` 入口函数必须有完整 JSDoc 文档，包括所有配置项（svrPort/logLevel/cors/useBodyParser/cookieParserSecret/wsHeartbeatInterval/trustProxy/http2 等）、配置优先级、返回值类型与示例代码，支撑 IDE 智能提示和 TypeScript 类型推导。
 40. **Request.protocol HTTP/2 兼容**：`Request.protocol` getter 必须与 `Request.ip` 保持一致的 HTTP/2 兼容回退，通过 `req.stream?.session?.socket` 获取底层 TCP socket 判断 `encrypted` 属性。HTTP/2 模式下 `IncomingMessage.socket` 为 `undefined`，直接访问会导致 protocol 永远返回 `'http'`（即使 HTTP/2 over TLS）。
+41. **_handleError 响应头已发送时强制结束连接**：`_handleError` 在 `res.headersSent === true` 时无法再设置状态码/响应体，必须调用 `res._res.end()` 强制结束底层连接，避免客户端因等待响应体而挂起。try/catch 兜底底层连接已关闭等异常场景，保证 `_handleError` 自身永不抛错。
+42. **_defaultHandler 405 响应补充 CORS 头**：`_defaultHandler` 对已知方法（POST/PUT/DELETE/PATCH）无匹配路由返回 405 时，除 RFC 7231 要求的 `Allow` 头外，当 `settings.cors` 启用时还须设置 `Access-Control-Allow-Methods` 头，使跨域浏览器能正确读取该路径允许的方法列表（与 OPTIONS 预检的 Allow-Methods 头保持一致）。
 
 ---
 
@@ -927,7 +929,7 @@ app.sse('/events', (sse, req) => {
 ```json
 {
   "name": "@lzpong/httpm",
-  "version": "1.4.4",
+  "version": "1.4.5",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
   "engines": { "node": ">=18.0.0" },
