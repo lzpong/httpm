@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.4.5
+**文档版本**：V1.4.6
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -397,8 +397,8 @@ SSE 监听两类断开事件以兼容 HTTP/1.1 与 HTTP/2：
 5. RFC 6455 Section 7.4.1 规定：1005（无状态码）、1006（异常关闭）、1015（TLS 握手失败）不得在 Close 帧中发送，httpm 在回复 Close 帧时会自动将这三种状态码替换为不携带状态码的 Close 帧；
 6. 关闭握手期间（_closing=true）：忽略非控制帧，仅处理 Ping/Pong/Close 帧；
 7. RFC 6455 协议校验：客户端帧必须掩码（未掩码帧按协议错误关闭连接）；控制帧（Close/Ping/Pong）负载不得超过 125 字节且不可分片（FIN 必须为 1），违反时以 1002 关闭连接；
-8. 帧负载长度超过 `Number.MAX_SAFE_INTEGER` 时视为超限帧，拒绝处理；
-9. 支持分片帧解析（continuation frame），多帧消息自动合并后触发事件；
+8. 帧负载长度超过 `Number.MAX_SAFE_INTEGER` 时视为超限帧，拒绝处理；`maxPayload` 超限检查在掩码解析前执行，防止慢速大帧攻击（客户端声明大 `payloadLength` 但慢速发送，若等数据完整再拒绝缓冲区会持续增长，防护失效），超限时立即 `close(1009)`；
+9. 支持分片帧解析（continuation frame），多帧消息自动合并后触发事件；分片累积总大小通过 `_fragmentTotalSize` 累积器校验，超过 `maxPayload` 时清理分片状态并 `close(1009)`，防止攻击者用大量小分片（每个 < `maxPayload`）累积成巨大消息绕过单帧检查；
 10. 发送失败时触发 `error` 事件，便于用户感知和处理异常；
 11. 监听底层套接字事件，处理消息接收、连接断开。
 
@@ -411,7 +411,7 @@ SSE 监听两类断开事件以兼容 HTTP/1.1 与 HTTP/2：
 3. 广播能力：支持**按路径广播**、**全局广播**，支持排除指定连接；
 4. 连接管理：新增 / 销毁连接时自动维护连接列表；
 5. Origin 校验：支持 `allowedOrigins` 配置，防止跨站 WebSocket 劫持（CSWSH）；
-6. 帧负载限制：支持 `maxPayload` 配置，防止恶意超大帧耗尽内存。
+6. 帧负载限制：支持 `maxPayload` 配置（默认 100MB），同时校验单帧负载和分片累积总大小，防止恶意超大帧和分片累积绕过攻击耗尽内存。
 
 #### 心跳机制
 
@@ -808,7 +808,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.4.4';
+httpm.version = '1.4.6';
 
 module.exports = httpm;
 ```
@@ -918,6 +918,8 @@ app.sse('/events', (sse, req) => {
 40. **Request.protocol HTTP/2 兼容**：`Request.protocol` getter 必须与 `Request.ip` 保持一致的 HTTP/2 兼容回退，通过 `req.stream?.session?.socket` 获取底层 TCP socket 判断 `encrypted` 属性。HTTP/2 模式下 `IncomingMessage.socket` 为 `undefined`，直接访问会导致 protocol 永远返回 `'http'`（即使 HTTP/2 over TLS）。
 41. **_handleError 响应头已发送时强制结束连接**：`_handleError` 在 `res.headersSent === true` 时无法再设置状态码/响应体，必须调用 `res._res.end()` 强制结束底层连接，避免客户端因等待响应体而挂起。try/catch 兜底底层连接已关闭等异常场景，保证 `_handleError` 自身永不抛错。
 42. **_defaultHandler 405 响应补充 CORS 头**：`_defaultHandler` 对已知方法（POST/PUT/DELETE/PATCH）无匹配路由返回 405 时，除 RFC 7231 要求的 `Allow` 头外，当 `settings.cors` 启用时还须设置 `Access-Control-Allow-Methods` 头，使跨域浏览器能正确读取该路径允许的方法列表（与 OPTIONS 预检的 Allow-Methods 头保持一致）。
+43. **WebSocket maxPayload 超限检查前移**：`_decodeFrame` 中 `payloadLength > maxPayload` 检查必须在掩码解析和数据完整性检查之前执行，防止慢速大帧攻击。攻击者声明大 `payloadLength`（如 200MB）但慢速发送少量数据，若等数据完整再拒绝，缓冲区会持续增长到声明大小才拒绝，`maxPayload` 防护失效。检查前移后仅需解析长度字段即可短路，`bytesConsumed` 设为 `buf.length` 消费整个缓冲区避免循环继续解析干扰关闭流程，立即 `close(1009)`。
+44. **WebSocket 分片累积总量限制**：`_processFrame` 处理分片续帧时必须通过 `_fragmentTotalSize` 累积器校验累积总大小，超过 `maxPayload` 时清理分片状态（释放已累积的 payload 引用避免内存泄漏）并 `close(1009)`。单个分片虽通过 `_decodeFrame` 的单帧 `maxPayload` 检查，但攻击者可发送大量小分片（每个 < `maxPayload`）累积成巨大消息，最后 `Buffer.concat` 时耗尽内存。分片开始时初始化 `_fragmentTotalSize` 为首个分片大小，续帧时累加。
 
 ---
 
@@ -929,7 +931,7 @@ app.sse('/events', (sse, req) => {
 ```json
 {
   "name": "@lzpong/httpm",
-  "version": "1.4.5",
+  "version": "1.4.6",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
   "engines": { "node": ">=18.0.0" },

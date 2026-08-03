@@ -2410,6 +2410,159 @@ async function runTests() {
     }
   }
 
+  // --- P1-1/P1-2 验证：WebSocket DoS 防护（大帧慢速攻击 + 分片累积超限） ---
+  // 使用独立 app 配置小 wsMaxPayload=200，验证服务端拒绝超限帧和累积超限分片
+  // P1-1：_decodeFrame 在掩码解析前检查 payloadLength > maxPayload，防止慢速大帧攻击
+  // P1-2：_processFrame 累积分片总大小，超限时 close(1009)，防止分片绕过单帧限制
+  {
+    const PORT5 = PORT + 4;
+    const app5 = httpm({
+      svrPort: PORT5,
+      logLevel: 'error',
+      wsMaxPayload: 200 // 限制单帧/分片累积最大负载 200 字节
+    });
+    app5.ws('/ws-small', (ws, req) => {
+      ws.on('text', (msg) => ws.send('echo:' + msg));
+    });
+    const server5 = app5.listen(PORT5);
+    await new Promise(r => setTimeout(r, 300));
+
+    /**
+     * 构造客户端掩码帧（支持分片帧和扩展长度格式）
+     * @param {boolean} fin - FIN 标志位（true=最后一帧，false=分片续帧）
+     * @param {number} opcode - 帧操作码（0x01=text, 0x02=binary, 0x00=continuation）
+     * @param {Buffer} payload - 帧负载数据
+     * @returns {Buffer} 完整的掩码帧 Buffer
+     */
+    function makeMaskedFrame(fin, opcode, payload) {
+      const mask = crypto.randomBytes(4);
+      const finBit = fin ? 0x80 : 0x00;
+      let header;
+      if (payload.length < 126) {
+        header = Buffer.alloc(6);
+        header[0] = finBit | opcode;
+        header[1] = 0x80 | payload.length; // MASK + len
+        mask.copy(header, 2);
+      } else if (payload.length < 65536) {
+        header = Buffer.alloc(8);
+        header[0] = finBit | opcode;
+        header[1] = 0x80 | 126; // MASK + extended 16-bit length
+        header.writeUInt16BE(payload.length, 2);
+        mask.copy(header, 4);
+      } else {
+        header = Buffer.alloc(14);
+        header[0] = finBit | opcode;
+        header[1] = 0x80 | 127; // MASK + extended 64-bit length
+        header.writeBigUInt64BE(BigInt(payload.length), 2);
+        mask.copy(header, 10);
+      }
+      const masked = Buffer.alloc(payload.length);
+      for (let i = 0; i < payload.length; i++) {
+        masked[i] = payload[i] ^ mask[i % 4];
+      }
+      return Buffer.concat([header, masked]);
+    }
+
+    /**
+     * 构造声明超限但数据不完整的恶意帧（慢速攻击模拟）
+     * 只发送帧头部 + 少量数据，声明大 payloadLength 欺骗服务端分配缓冲区
+     * @param {number} declaredLength - 声明的负载长度（>maxPayload 触发防护）
+     * @param {number} actualDataLength - 实际发送的掩码数据长度
+     * @returns {Buffer} 恶意帧 Buffer
+     */
+    function makeOversizeHeader(declaredLength, actualDataLength) {
+      const mask = crypto.randomBytes(4);
+      // 扩展长度格式：FIN+text(1) + MASK+126(1) + len16(2) + mask(4) = 8 字节头
+      const header = Buffer.alloc(8);
+      header[0] = 0x81; // FIN + text
+      header[1] = 0xFE; // MASK + 126 (extended 16-bit length)
+      header.writeUInt16BE(declaredLength, 2);
+      mask.copy(header, 4);
+      const partialData = Buffer.alloc(actualDataLength, 0x41);
+      const masked = Buffer.alloc(actualDataLength);
+      for (let i = 0; i < actualDataLength; i++) {
+        masked[i] = partialData[i] ^ mask[i % 4];
+      }
+      return Buffer.concat([header, masked]);
+    }
+
+    try {
+      // --- 测试 1：大帧慢速攻击防护（P1-1） ---
+      // 客户端声明 payloadLength=300（>maxPayload=200）但只发送 50 字节
+      // 期望：服务端在掩码解析前检测到超限，立即 close(1009) 发送 Close 帧
+      {
+        const { socket } = await wsConnect('ws://localhost:' + PORT5 + '/ws-small');
+        const maliciousFrame = makeOversizeHeader(300, 50); // 声明 300，实际仅发 50
+        socket.write(maliciousFrame);
+
+        // 监听服务端响应：close(1009) 会发送 Close 帧（opcode 0x08）
+        const blocked = await new Promise((resolve) => {
+          socket.on('data', (buf) => {
+            // 检测 Close 帧（首字节低 4 位 opcode=0x08）
+            if (buf.length >= 2 && (buf[0] & 0x0F) === 0x08) resolve(true);
+          });
+          socket.on('close', () => resolve(true));
+          setTimeout(() => { socket.destroy(); resolve(false); }, 2500);
+        });
+        assert(blocked === true, 'HTTP - WebSocket 大帧慢速攻击防护：声明超限立即关闭');
+        socket.destroy();
+      }
+
+      // --- 测试 2：分片累积超限防护（P1-2） ---
+      // 发送两个小分片（各 <maxPayload），累积总量 250 > maxPayload=200
+      // 期望：服务端在第二个分片累积超限时 close(1009)
+      {
+        const { socket } = await wsConnect('ws://localhost:' + PORT5 + '/ws-small');
+        // 第一个分片：FIN=0, opcode=0x01(text), payload=150字节
+        const frag1 = makeMaskedFrame(false, 0x01, Buffer.alloc(150, 0x42));
+        // 第二个分片：FIN=0, opcode=0x00(continuation), payload=100字节（累积 250 > 200）
+        const frag2 = makeMaskedFrame(false, 0x00, Buffer.alloc(100, 0x43));
+        socket.write(frag1);
+        socket.write(frag2);
+
+        const blocked = await new Promise((resolve) => {
+          socket.on('data', (buf) => {
+            if (buf.length >= 2 && (buf[0] & 0x0F) === 0x08) resolve(true);
+          });
+          socket.on('close', () => resolve(true));
+          setTimeout(() => { socket.destroy(); resolve(false); }, 2500);
+        });
+        assert(blocked === true, 'HTTP - WebSocket 分片累积超限防护：累积超限关闭连接');
+        socket.destroy();
+      }
+
+      // --- 测试 3：边界值验证（payloadLength === maxPayload 正常处理） ---
+      // 发送 payloadLength=200（等于 maxPayload）的单帧
+      // 期望：服务端正常处理（不触发超限），echo 回复
+      {
+        const { socket } = await wsConnect('ws://localhost:' + PORT5 + '/ws-small');
+        const boundaryPayload = Buffer.alloc(200, 0x44); // 200字节 'D'，等于 maxPayload
+        const frame = makeMaskedFrame(true, 0x01, boundaryPayload);
+        socket.write(frame);
+
+        const reply = await wsReadText(socket);
+        assert(reply === 'echo:' + 'D'.repeat(200), 'HTTP - WebSocket 边界值：payloadLength===maxPayload 正常处理');
+        socket.destroy();
+      }
+
+      // --- 测试 4：回归验证（正常消息不受 DoS 防护影响） ---
+      // 发送正常文本消息 "hello"（5字节 << maxPayload）
+      // 期望：echo 正常回复 "echo:hello"
+      {
+        const { socket } = await wsConnect('ws://localhost:' + PORT5 + '/ws-small');
+        wsSendText(socket, 'hello');
+        const reply = await wsReadText(socket);
+        assert(reply === 'echo:hello', 'HTTP - WebSocket 回归验证：正常消息 echo 正常');
+        socket.destroy();
+      }
+    } catch (e) {
+      assertSkip('HTTP - WebSocket DoS 防护测试', e.message);
+    } finally {
+      await new Promise(r => server5.close(r));
+      await closeLoggerStream(app5._logger);
+    }
+  }
+
   // 清理测试文件
   try {
     fs.unlinkSync(path.join(testDir, 'index.html'));

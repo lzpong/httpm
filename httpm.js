@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.4.5
+ * @version     1.4.6
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -1076,8 +1076,12 @@ class Response {
         const onDestError = () => { raw.destroy(); gzip.destroy(); };
         this._res.on('error', onDestError);
         this._res.on('close', onDestError);
-        // 流完成时回调
-        this._res.on('finish', () => doneOnce(null));
+        // 流完成时回调并移除监听器，避免 finish 后 close 事件重复触发 onDestError（幂等但不优雅）
+        this._res.on('finish', () => {
+          this._res.removeListener('error', onDestError);
+          this._res.removeListener('close', onDestError);
+          doneOnce(null);
+        });
         raw.pipe(gzip).pipe(this._res);
         return;
       }
@@ -1425,6 +1429,9 @@ class WebSocket {
     this._fragmented = false;
     this._fragmentOpcode = 0;
     this._fragmentPayloads = [];
+    // 分片累积总大小（防止分片累积绕过单帧 maxPayload 检查）
+    // 攻击者可发送大量小分片（每个 < maxPayload）累积成巨大消息，最后 concat 时耗尽内存
+    this._fragmentTotalSize = 0;
     // 防止 close 事件重复触发
     this._closed = false;
     // 关闭握手状态
@@ -1497,6 +1504,16 @@ class WebSocket {
       offset += 8;
     }
 
+    // 最大负载限制检查（必须在掩码解析和数据完整性检查之前，防止慢速大帧攻击）
+    // 慢速攻击场景：客户端声明 payloadLength=200MB（>maxPayload）但慢速发送，
+    // 若等数据完整再拒绝，缓冲区会持续增长到声明大小才拒绝，maxPayload 防护失效。
+    // 在掩码解析之前检查：payloadLength 已确定，无需等待掩码即可判断超限，提前短路减少计算。
+    // bytesConsumed=buf.length：数据可能不完整无法精确消费整个帧；连接即将 close(1009)，
+    // 消费整个缓冲区避免 _parseFrames 循环继续解析后续帧干扰关闭流程。
+    if (payloadLength > this._maxPayload) {
+      return { opcode: 0xFF, payload: Buffer.alloc(0), fin: true, bytesConsumed: buf.length, oversize: true };
+    }
+
     // 解析掩码
     let mask = null;
     if (isMasked) {
@@ -1507,11 +1524,6 @@ class WebSocket {
 
     // 检查负载数据是否完整
     if (buf.length < offset + payloadLength) return null;
-
-    // 最大负载限制检查，超限时返回错误标记
-    if (payloadLength > this._maxPayload) {
-      return { opcode: 0xFF, payload: Buffer.alloc(0), fin: true, bytesConsumed: offset + payloadLength, oversize: true };
-    }
 
     // 提取负载
     let payload = buf.subarray(offset, offset + payloadLength);
@@ -1596,13 +1608,28 @@ class WebSocket {
     if (opcode === 0x00) {
       // 分片续帧：必须有前导帧
       if (!this._fragmented) return;
+      // 累积分片总大小，超限时关闭连接（防止分片累积绕过单帧 maxPayload 检查）
+      // 单个分片已通过 _decodeFrame 的 maxPayload 检查，但累积总量可能远超 maxPayload
+      this._fragmentTotalSize += payload.length;
+      if (this._fragmentTotalSize > this._maxPayload) {
+        // 超限：清理分片状态（释放已累积的 payload 引用，避免内存泄漏），关闭连接
+        // RFC 6455 Section 7.4.1: 1009 Message Too Big
+        this._fragmented = false;
+        this._fragmentOpcode = 0;
+        this._fragmentPayloads = [];
+        this._fragmentTotalSize = 0;
+        this.close(1009, 'Fragmented message too large');
+        return;
+      }
       this._fragmentPayloads.push(payload);
       if (fin) {
         // 分片结束，合并并触发事件
         const fullPayload = Buffer.concat(this._fragmentPayloads);
         this._emitData(this._fragmentOpcode, fullPayload);
         this._fragmented = false;
+        this._fragmentOpcode = 0;
         this._fragmentPayloads = [];
+        this._fragmentTotalSize = 0;
       }
     } else {
       // 新消息帧（opcode=0x01/0x02）
@@ -1612,13 +1639,14 @@ class WebSocket {
         return;
       }
       if (fin) {
-        // 非分片：直接触发
+        // 非分片：直接触发（单帧已通过 _decodeFrame 的 maxPayload 检查，无需再校验）
         this._emitData(opcode, payload);
       } else {
-        // 分片开始
+        // 分片开始：初始化累积大小为首个分片大小
         this._fragmented = true;
         this._fragmentOpcode = opcode;
         this._fragmentPayloads = [payload];
+        this._fragmentTotalSize = payload.length;
       }
     }
   }
@@ -2029,9 +2057,16 @@ function bodyParser(options = {}) {
       if (boundary) {
         _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next);
         // 仅 multipart 需要临时文件清理（使用 res.on 保持封装一致性）
-        res.on('finish', () => {
+        // 同时监听 finish 和 close：finish 覆盖正常完成，close 覆盖客户端中途断开
+        // 用一次性标志避免重复清理（_cleanupTempFiles 对已删除文件幂等，但避免重复调用）
+        let tempCleaned = false;
+        const cleanupTemp = () => {
+          if (tempCleaned) return;
+          tempCleaned = true;
           _cleanupTempFiles(req._tempFiles);
-        });
+        };
+        res.on('finish', cleanupTemp);
+        res.on('close', cleanupTemp);
       } else {
         next();
       }
@@ -3220,16 +3255,16 @@ function _loadAppJson() {
     path.join(__dirname, 'app.json')
   ];
   for (const filePath of candidates) {
+    // 直接 try/catch readFileSync，替代已废弃的 existsSync + readFileSync 双次调用
+    // 文件不存在时 readFileSync 抛 ENOENT，由 catch 静默忽略，减少一次系统调用
     try {
-      if (fs.existsSync(filePath)) {
-        const content = fs.readFileSync(filePath, 'utf8');
-        const config = JSON.parse(content);
-        if (typeof config === 'object' && config !== null && !Array.isArray(config)) {
-          return config;
-        }
+      const content = fs.readFileSync(filePath, 'utf8');
+      const config = JSON.parse(content);
+      if (typeof config === 'object' && config !== null && !Array.isArray(config)) {
+        return config;
       }
     } catch (e) {
-      // 解析失败或读取失败，静默忽略
+      // 文件不存在、读取失败或解析失败，静默忽略
     }
   }
   return {};
@@ -3290,7 +3325,7 @@ const defaultConfig = {
  * 配置优先级（从低到高）：默认配置 < app.json < 代码参数 < app.set() 运行时配置
  *
  * @param {object} [options] - 初始化配置项（详见 defaultConfig）
- * @param {number} [options.svrPort=0] - 监听端口，0 表示随机分配
+ * @param {number} [options.svrPort=80] - 监听端口，0 表示随机分配
  * @param {string} [options.rootPath] - 静态文件根目录（默认 process.cwd()）
  * @param {string} [options.logLevel='info'] - 日志级别 debug/info/notice/warn/error/fatal
  * @param {string} [options.logDir='./log'] - 日志目录
@@ -3399,7 +3434,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.4.4';
+httpm.version = '1.4.6';
 
 /**
  * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）
