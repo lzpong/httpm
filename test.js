@@ -2563,6 +2563,86 @@ async function runTests() {
     }
   }
 
+  // --- P1-2 验证：WebSocket send 循环引用对象不崩溃 ---
+  // ws.send(循环引用对象) 时 JSON.stringify 抛 TypeError，应触发 error 事件而非进程崩溃
+  {
+    const PORT6 = PORT + 5;
+    const app6 = httpm({
+      svrPort: PORT6,
+      logLevel: 'error'
+    });
+    app6.ws('/ws-circular', (ws, req) => {
+      ws.on('text', (msg) => {
+        if (msg === 'send-circular') {
+          // 构造循环引用对象：JSON.stringify 会抛 TypeError
+          const circular = { a: 1 };
+          circular.self = circular;
+          ws.send(circular); // 应触发 error 事件而非崩溃
+        }
+      });
+      // error 事件被触发说明序列化失败被正确捕获
+      ws.on('error', () => {
+        // 连接仍可用，发送确认消息（字符串不会触发序列化异常）
+        ws.send('error-triggered');
+      });
+    });
+    const server6 = app6.listen(PORT6);
+    await new Promise(r => setTimeout(r, 300));
+
+    try {
+      const { socket } = await wsConnect('ws://localhost:' + PORT6 + '/ws-circular');
+      wsSendText(socket, 'send-circular');
+      // 等待服务端 error 事件触发后发送的确认消息
+      const reply = await wsReadText(socket);
+      assert(reply === 'error-triggered', 'HTTP - WebSocket send 循环引用对象触发 error 事件不崩溃');
+      socket.destroy();
+    } catch (e) {
+      assertSkip('HTTP - WebSocket send 循环引用对象测试', e.message);
+    } finally {
+      await new Promise(r => server6.close(r));
+      await closeLoggerStream(app6._logger);
+    }
+  }
+
+  // --- P2-1/P2-2 验证：res.append / res.type null 参数不抛异常 ---
+  // res.append(null, 'val') 和 res.type(null/undefined) 应静默返回 this，不抛 TypeError
+  {
+    const PORT7 = PORT + 6;
+    const app7 = httpm({
+      svrPort: PORT7,
+      logLevel: 'error'
+    });
+    app7.get('/append-null', (req, res) => {
+      res.append(null, 'val');   // P2-1: null field 不抛异常
+      res.append(undefined, 'x'); // undefined field 不抛异常
+      res.append('X-Test', 'ok'); // 正常设置仍有效
+      res.send('ok');
+    });
+    app7.get('/type-null', (req, res) => {
+      res.type(null);      // P2-2: null 不抛异常
+      res.type(undefined);  // undefined 不抛异常
+      res.type('json');     // 正常设置仍有效
+      res.send('ok');
+    });
+    const server7 = app7.listen(PORT7);
+    await new Promise(r => setTimeout(r, 300));
+
+    try {
+      const res1 = await httpGet('http://localhost:' + PORT7 + '/append-null');
+      const body1 = await readBodyStr(res1);
+      assert(res1.statusCode === 200 && body1 === 'ok', 'HTTP - res.append(null/undefined) 不抛异常');
+
+      const res2 = await httpGet('http://localhost:' + PORT7 + '/type-null');
+      const body2 = await readBodyStr(res2);
+      assert(res2.statusCode === 200 && body2 === 'ok', 'HTTP - res.type(null/undefined) 不抛异常');
+    } catch (e) {
+      assertSkip('HTTP - res.append/type 参数校验测试', e.message);
+    } finally {
+      await new Promise(r => server7.close(r));
+      await closeLoggerStream(app7._logger);
+    }
+  }
+
   // 清理测试文件
   try {
     fs.unlinkSync(path.join(testDir, 'index.html'));

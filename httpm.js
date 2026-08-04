@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.4.6
+ * @version     1.4.7
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -374,7 +374,9 @@ class Logger {
     if (this._stream) {
       const oldStream = this._stream;
       oldStream.end(() => {
-        oldStream.destroy();
+        // destroy 通常不抛异常，但流已损坏/fd 已释放时可能抛
+        // 跨日切换是日志核心路径，异常会导致后续日志全部丢失，用 try/catch 保护
+        try { oldStream.destroy(); } catch (e) { /* 忽略销毁错误 */ }
       });
       this._stream = null;
     }
@@ -754,7 +756,9 @@ class Response {
   }
 
   // 代理原生响应方法
-  get finished() { return this._res.finished; }
+  // 使用 writableEnded 替代废弃的 finished 属性（Node.js 16+ 推荐）
+  // destroyed 覆盖 socket 异常关闭场景（writableEnded 可能为 false 但连接已断开）
+  get finished() { return this._res.writableEnded || this._res.destroyed; }
   get headersSent() { return this._res.headersSent || this._headersSent; }
 
   setHeader(name, value) {
@@ -801,6 +805,8 @@ class Response {
    * 适用于 Set-Cookie、Link 等多值头场景
    */
   append(field, value) {
+    // 防御 null/undefined field，避免 getHeader(field) 抛 TypeError
+    if (!field) return this;
     // 防御 null/undefined value，避免写入无效头值
     if (value === null || value === undefined) return this;
     const prev = this.getHeader(field);
@@ -827,6 +833,8 @@ class Response {
    * res.type('text/html') → text/html
    */
   type(contentType) {
+    // 防御 null/undefined，避免 contentType.includes('/') 抛 TypeError
+    if (!contentType) return this;
     // 已是完整 MIME 类型，直接设置
     if (contentType.includes('/')) {
       this.setHeader('Content-Type', contentType);
@@ -935,7 +943,8 @@ class Response {
    * 内部发送方法
    */
   _send(data) {
-    if (this._res.finished) return;
+    // writableEnded 表示 end() 已调用，替代废弃的 finished 属性（Node.js 16+ 推荐）
+    if (this._res.writableEnded) return;
     this._res.statusCode = this.statusCode;
     this._headersSent = true;
     // HEAD 请求只发送头部，不发送响应体
@@ -1064,7 +1073,7 @@ class Response {
         const onError = (streamErr) => {
           raw.destroy();
           gzip.destroy();
-          if (!this._res.finished) {
+          if (!this._res.writableEnded) {
             this._res.statusCode = 500;
             this._res.end('Internal Server Error');
           }
@@ -1099,7 +1108,7 @@ class Response {
     const done = (err) => {
       if (callback && !called) { called = true; callback(err); }
     };
-    if (this._res.finished) {
+    if (this._res.writableEnded) {
       done(null);
       return;
     }
@@ -1115,7 +1124,7 @@ class Response {
     // 流错误处理：文件读取出错时返回 500
     stream.on('error', (err) => {
       stream.destroy();
-      if (!this._res.finished) {
+      if (!this._res.writableEnded) {
         this._res.statusCode = 500;
         this._res.end('Internal Server Error');
       }
@@ -1126,8 +1135,13 @@ class Response {
     const onDestError = () => { stream.destroy(); };
     this._res.on('error', onDestError);
     this._res.on('close', onDestError);
-    // 流完成时回调
-    this._res.on('finish', () => done(null));
+    // 流完成时移除监听器并回调，避免 close 事件重复触发 onDestError（与 Gzip 流处理一致）
+    // 不移除时 finish 后 close 仍会触发 onDestError 执行不必要的 destroy，且 res 上监听器累积
+    this._res.on('finish', () => {
+      this._res.removeListener('error', onDestError);
+      this._res.removeListener('close', onDestError);
+      done(null);
+    });
     stream.pipe(this._res);
   }
 
@@ -1391,8 +1405,9 @@ class SSE {
     if (this._req && typeof this._req.removeListener === 'function') {
       this._req.removeListener('aborted', this._onClose);
     }
-    // res 已 finished/writableEnded 时跳过 end，避免触发异步 'error' 事件
-    if (this._res.finished || this._res.writableEnded) return;
+    // res 已 writableEnded 时跳过 end，避免触发异步 'error' 事件
+    // 统一使用 writableEnded（Node.js 16+ 推荐），替代废弃的 finished 属性
+    if (this._res.writableEnded) return;
     try { this._res.end(); } catch (e) { /* socket 已销毁等异常，忽略 */ }
   }
 }
@@ -1672,7 +1687,14 @@ class WebSocket {
     if (!this.connected) return;
     if (typeof data === 'object' && !Buffer.isBuffer(data)) {
       // 普通对象 → JSON 文本帧
-      this._sendFrame(0x01, Buffer.from(JSON.stringify(data)));
+      // 循环引用等异常场景 JSON.stringify 抛 TypeError，触发 error 事件而非崩溃
+      // 调用方传入 req/res 等含自引用的对象时，未捕获异常会导致进程崩溃
+      let json;
+      try { json = JSON.stringify(data); } catch (e) {
+        this._emit('error', new Error('WebSocket send: object serialization failed', { cause: e }));
+        return;
+      }
+      this._sendFrame(0x01, Buffer.from(json));
     } else if (typeof data === 'string') {
       this._sendFrame(0x01, Buffer.from(data));
     } else if (Buffer.isBuffer(data)) {
@@ -2692,6 +2714,10 @@ class Application extends Router {
         serverResponse.statusCode = 500;
         // 显式设置 Content-Type，避免客户端 MIME 嗅探误判
         serverResponse.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        // 设置 Connection: close，确保出错连接不被复用
+        // 顶层 catch 意味着请求处理异常（req.body 可能部分解析、临时文件可能残留）
+        // 复用此连接的后续请求会在污染状态上执行，强制关闭让客户端新建连接
+        serverResponse.setHeader('Connection', 'close');
         // HEAD 请求只发送头部不发送响应体（与 send/response.end 行为一致）
         if (incomingMessage.method === 'HEAD') {
           serverResponse.end();
@@ -3434,7 +3460,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.4.6';
+httpm.version = '1.4.7';
 
 /**
  * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）

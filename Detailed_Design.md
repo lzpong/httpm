@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.4.6
+**文档版本**：V1.4.7
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -808,7 +808,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.4.6';
+httpm.version = '1.4.7';
 
 module.exports = httpm;
 ```
@@ -920,6 +920,12 @@ app.sse('/events', (sse, req) => {
 42. **_defaultHandler 405 响应补充 CORS 头**：`_defaultHandler` 对已知方法（POST/PUT/DELETE/PATCH）无匹配路由返回 405 时，除 RFC 7231 要求的 `Allow` 头外，当 `settings.cors` 启用时还须设置 `Access-Control-Allow-Methods` 头，使跨域浏览器能正确读取该路径允许的方法列表（与 OPTIONS 预检的 Allow-Methods 头保持一致）。
 43. **WebSocket maxPayload 超限检查前移**：`_decodeFrame` 中 `payloadLength > maxPayload` 检查必须在掩码解析和数据完整性检查之前执行，防止慢速大帧攻击。攻击者声明大 `payloadLength`（如 200MB）但慢速发送少量数据，若等数据完整再拒绝，缓冲区会持续增长到声明大小才拒绝，`maxPayload` 防护失效。检查前移后仅需解析长度字段即可短路，`bytesConsumed` 设为 `buf.length` 消费整个缓冲区避免循环继续解析干扰关闭流程，立即 `close(1009)`。
 44. **WebSocket 分片累积总量限制**：`_processFrame` 处理分片续帧时必须通过 `_fragmentTotalSize` 累积器校验累积总大小，超过 `maxPayload` 时清理分片状态（释放已累积的 payload 引用避免内存泄漏）并 `close(1009)`。单个分片虽通过 `_decodeFrame` 的单帧 `maxPayload` 检查，但攻击者可发送大量小分片（每个 < `maxPayload`）累积成巨大消息，最后 `Buffer.concat` 时耗尽内存。分片开始时初始化 `_fragmentTotalSize` 为首个分片大小，续帧时累加。
+45. **`_streamFile` 流完成时必须移除 error/close 监听器**：`_streamFile` 在 `this._res` 上注册 `error`、`close`、`finish` 监听器，`finish` 回调中必须 `removeListener` 移除 `error` 和 `close` 监听器。不移除时 `finish` 后 `close` 事件仍会触发 `onDestError` 执行不必要的 `stream.destroy()`，且 ServerResponse 上监听器引用累积导致内存泄漏。与 Gzip 流（`sendFile` 中的 Gzip 分支）处理方式保持一致，确保所有流式响应统一清理监听器。
+46. **WebSocket `send` 对象序列化必须 try/catch 保护**：`WebSocket.send(data)` 中对普通对象调用 `JSON.stringify(data)` 时，循环引用对象（如 `req`、`res`、含自引用的对象）会抛 `TypeError: Converting circular structure to JSON`。必须用 try/catch 包裹，失败时通过 `_emit('error', err)` 触发 error 事件让调用方感知，而非让异常冒泡导致进程崩溃。与 `Response.json` 的循环引用保护策略一致。
+47. **`res.append` / `res.type` 必须校验 null/undefined 参数**：`res.append(field, value)` 中 `field` 为 null/undefined 时 `this.getHeader(field)` 抛 TypeError；`res.type(contentType)` 中 `contentType` 为 null/undefined 时 `contentType.includes('/')` 抛 TypeError。两个方法开头必须添加 `if (!field) return this;` / `if (!contentType) return this;` 防御，与 `res.set` 的防御性编程风格一致，确保 null/undefined 入参静默返回而非抛异常。
+48. **`_handleRequest` 顶层 catch 必须设置 `Connection: close`**：顶层 catch 返回 500 响应时必须设置 `Connection: close` 头。顶层 catch 意味着请求处理异常（`req.body` 可能部分解析、临时文件可能残留、中间件状态可能不一致），复用此 keep-alive 连接的后续请求会在污染状态上执行。强制关闭连接让客户端新建连接，避免状态污染扩散。
+49. **Logger 跨日切换旧流 `destroy` 必须 try/catch 保护**：`_getLogStream` 跨日切换时 `oldStream.end(() => oldStream.destroy())` 中，`destroy()` 通常不抛异常，但流已损坏或 fd 已释放时可能抛。跨日切换是日志核心路径，异常会导致 `end` 回调中断、后续日志全部丢失。必须用 `try { oldStream.destroy(); } catch (e) { /* 忽略 */ }` 包裹，确保跨日切换健壮。
+50. **统一使用 `writableEnded` 替代废弃的 `finished` 属性**：Node.js 16+ 废弃了 `ServerResponse.finished`，推荐使用 `writableEnded`。`Response.finished` getter 应返回 `this._res.writableEnded || this._res.destroyed`（`destroyed` 覆盖 socket 异常关闭场景）；`Response._send` 和 `SSE.close` 中的 `this._res.finished` 检查统一改为 `this._res.writableEnded`。确保前向兼容 Node.js 未来版本。
 
 ---
 
@@ -931,7 +937,7 @@ app.sse('/events', (sse, req) => {
 ```json
 {
   "name": "@lzpong/httpm",
-  "version": "1.4.6",
+  "version": "1.4.7",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
   "engines": { "node": ">=18.0.0" },
