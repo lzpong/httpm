@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.4.7
+ * @version     1.4.8
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -1054,14 +1054,12 @@ class Response {
       }
 
       // Gzip 压缩（仅文本类文件）
+      // HEAD 请求不进入 Gzip 分支：HEAD 不传输实体无需压缩；且流式 Gzip 无法预知压缩后大小，
+      // 若 HEAD 进入此分支会因未移除 Content-Length 导致响应头与 GET 实际返回的压缩内容大小不一致。
+      // HEAD 走下方 _streamFile 快速路径（内部 HEAD 检查直接 end 不传输），
+      // 返回 Content-Length: stat.size（未压缩大小）且无 Content-Encoding 头，符合业界主流服务器行为
       const acceptEncoding = this._req?.headers?.['accept-encoding'] || '';
-      if (this._app.settings.enableGzip && isTextMime(mime) && acceptEncoding.includes('gzip')) {
-        // HEAD 请求不传输内容
-        if (this._isHead) {
-          this._send('');
-          doneOnce(null);
-          return;
-        }
+      if (this._app.settings.enableGzip && isTextMime(mime) && acceptEncoding.includes('gzip') && !this._isHead) {
         this.removeHeader('Content-Length');
         this.setHeader('Content-Encoding', 'gzip');
         // 直接写入底层响应对象的状态码（this.status() 是链式 getter/setter，赋值给自己是 no-op）
@@ -1456,6 +1454,15 @@ class WebSocket {
     // 监听底层 Pong 帧
     socket.on('pong', () => {
       this._lastHeartbeat = Date.now();
+    });
+
+    // 监听对端关闭发送方向（FIN）：主动销毁 socket 加速清理
+    // WebSocket 协议无半关闭语义，客户端 FIN 即视为断开连接，应立即清理
+    // 若仅监听 'close'，Windows 等 platform 上 socket 可能停留半开状态延迟触发 'close'，
+    // 导致 server._connections 不归零、server.close() 挂起（连接泄漏）
+    socket.on('end', () => {
+      this.connected = false;
+      try { socket.destroy(); } catch (e) { /* socket 已销毁则忽略 */ }
     });
 
     // 监听连接关闭
@@ -1904,6 +1911,13 @@ class WebSocketServer {
 
     // 创建 WebSocket 实例
     const ws = new WebSocket(socket, pathname, { maxPayload: this._maxPayload });
+    // 立即注册 close 监听器：WebSocket 构造函数内部已监听 socket 'close' 事件并触发 _emitClose，
+    // 虽 socket 'close' 为异步触发，但防御性前置注册可消除极端竞态下的连接泄漏
+    // （若延迟到 connections.set / _startHeartbeat 之后才注册，期间 socket 一旦进入关闭流程，
+    //  监听器将注册不上，导致连接永远滞留在 connections Map 中造成内存泄漏）
+    ws.on('close', () => {
+      this._removeConnection(ws);
+    });
     // 处理握手前客户端可能已发送的首帧数据（head）
     // Node.js upgrade 事件的 head 参数可能包含客户端在握手响应前发送的 WebSocket 帧
     // 若不喂给解析器，会导致首帧消息丢失（浏览器在握手后立即发送 subscribe 等场景）
@@ -1923,11 +1937,6 @@ class WebSocketServer {
 
     // 启动心跳
     this._startHeartbeat();
-
-    // 监听连接关闭，自动清理
-    ws.on('close', () => {
-      this._removeConnection(ws);
-    });
 
     // 触发 connection 事件
     this._emit('connection', ws, req);
@@ -1979,6 +1988,8 @@ class WebSocketServer {
         this._removeConnection(ws);
       }
     }, this._heartbeatInterval);
+    // unref 防止心跳定时器阻止进程退出
+    if (typeof this._timer.unref === 'function') this._timer.unref();
   }
 
   /**
@@ -2017,6 +2028,9 @@ class WebSocketServer {
 
   /**
    * 获取指定路径的所有连接
+   * 返回数组快照拷贝（Array.from），修改返回值不影响内部连接池状态
+   * @param {string} [pathStr] - 指定路径；不传则返回所有连接
+   * @returns {WebSocket[]} 连接数组快照（拷贝）
    */
   getConnections(pathStr) {
     if (pathStr) {
@@ -3460,7 +3474,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.4.7';
+httpm.version = '1.4.8';
 
 /**
  * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）

@@ -1648,6 +1648,23 @@ async function runTests() {
       }
     }
 
+    // --- V1.4.8 P2-3 验证：HEAD 请求 + Gzip 不进入压缩分支 ---
+    // HEAD 请求不传输实体，不应触发 Gzip 压缩；
+    // Content-Length 应为文件实际大小（未压缩），且无 Content-Encoding 头
+    {
+      const res = await httpRequest({
+        hostname: 'localhost', port: PORT, path: '/large.txt', method: 'HEAD',
+        headers: { 'Accept-Encoding': 'gzip' }
+      });
+      assert(res.statusCode === 200, 'HTTP - HEAD+Gzip status 200');
+      // HEAD 不应进入 Gzip 分支，无 Content-Encoding 头
+      assert(res.headers['content-encoding'] === undefined, 'HTTP - HEAD+Gzip no Content-Encoding header');
+      // Content-Length 应为文件实际大小（2048），而非压缩后大小
+      assert(res.headers['content-length'] === '2048', 'HTTP - HEAD+Gzip Content-Length is uncompressed size');
+      const body = await readBodyStr(res);
+      assert(body === '', 'HTTP - HEAD+Gzip no response body');
+    }
+
     // --- 路径遍历 403 ---
     {
       const res = await httpGet(BASE + '/%2e%2e/httpm.js');

@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.4.7
+**文档版本**：V1.4.8
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -319,7 +319,7 @@ class Request {
 2. **空文件特判**：`stat.size === 0` 时跳过 Range/缓存/Gzip 流程，直接 `res.end()` 返回空响应体（避免 `end = size - 1 = -1` 触发 `createReadStream({start:0, end:-1})` 的 RangeError）；
 3. **Range 断点续传**：识别请求 `Range` 头，返回 206 分段响应；
 4. **缓存校验**：通过 ETag、Last-Modified 校验，命中缓存返回 304；
-5. **Gzip 压缩**：对文本类文件，根据客户端 `Accept-Encoding` 自动开启压缩；
+5. **Gzip 压缩**：对文本类文件，根据客户端 `Accept-Encoding` 自动开启压缩；HEAD 请求不进入 Gzip 分支（HEAD 不传输实体无需压缩，且流式 Gzip 无法预知压缩后大小，进入此分支会导致 Content-Length 与 GET 实际返回的压缩内容不一致），HEAD 走 `_streamFile` 快速路径返回 `Content-Length: stat.size`（未压缩大小）且无 `Content-Encoding` 头；
 6. **HEAD 请求**：匹配 GET 路由但仅发送响应头，不发送响应体（Express 兼容行为）。
 
 ### 3.5 SSE 类
@@ -396,11 +396,17 @@ SSE 监听两类断开事件以兼容 HTTP/1.1 与 HTTP/2：
 4. Close 帧状态码：对端发送无状态码的 Close 帧时，默认为 1005（RFC 6455 规定的"无状态码"语义码），非法状态码（0-999）自动修正为 1005；
 5. RFC 6455 Section 7.4.1 规定：1005（无状态码）、1006（异常关闭）、1015（TLS 握手失败）不得在 Close 帧中发送，httpm 在回复 Close 帧时会自动将这三种状态码替换为不携带状态码的 Close 帧；
 6. 关闭握手期间（_closing=true）：忽略非控制帧，仅处理 Ping/Pong/Close 帧；
-7. RFC 6455 协议校验：客户端帧必须掩码（未掩码帧按协议错误关闭连接）；控制帧（Close/Ping/Pong）负载不得超过 125 字节且不可分片（FIN 必须为 1），违反时以 1002 关闭连接；
-8. 帧负载长度超过 `Number.MAX_SAFE_INTEGER` 时视为超限帧，拒绝处理；`maxPayload` 超限检查在掩码解析前执行，防止慢速大帧攻击（客户端声明大 `payloadLength` 但慢速发送，若等数据完整再拒绝缓冲区会持续增长，防护失效），超限时立即 `close(1009)`；
-9. 支持分片帧解析（continuation frame），多帧消息自动合并后触发事件；分片累积总大小通过 `_fragmentTotalSize` 累积器校验，超过 `maxPayload` 时清理分片状态并 `close(1009)`，防止攻击者用大量小分片（每个 < `maxPayload`）累积成巨大消息绕过单帧检查；
-10. 发送失败时触发 `error` 事件，便于用户感知和处理异常；
-11. 监听底层套接字事件，处理消息接收、连接断开。
+7. `close` 事件参数来源（RFC 6455 合规）：主动调用 `ws.close(code, reason)` 后，`close` 事件携带的 code/reason 按以下优先级确定：
+   - **对端回复 Close 帧** → 使用**对端** Close 帧中的 code/reason（RFC 6455 规定 close 事件应反映连接实际关闭状况）；
+   - **2 秒超时未收到对端 Close 帧** → 使用本地 `close()` 传入的 code/reason；
+   - **socket 异常断开（未走握手）** → socket `close` 事件触发，code/reason 为 undefined。
+   
+   业务方监听 `close` 事件时应处理 code 为 undefined 的情况（socket 异常断开场景）。
+8. RFC 6455 协议校验：客户端帧必须掩码（未掩码帧按协议错误关闭连接）；控制帧（Close/Ping/Pong）负载不得超过 125 字节且不可分片（FIN 必须为 1），违反时以 1002 关闭连接；
+9. 帧负载长度超过 `Number.MAX_SAFE_INTEGER` 时视为超限帧，拒绝处理；`maxPayload` 超限检查在掩码解析前执行，防止慢速大帧攻击（客户端声明大 `payloadLength` 但慢速发送，若等数据完整再拒绝缓冲区会持续增长，防护失效），超限时立即 `close(1009)`；
+10. 支持分片帧解析（continuation frame），多帧消息自动合并后触发事件；分片累积总大小通过 `_fragmentTotalSize` 累积器校验，超过 `maxPayload` 时清理分片状态并 `close(1009)`，防止攻击者用大量小分片（每个 < `maxPayload`）累积成巨大消息绕过单帧检查；
+11. 发送失败时触发 `error` 事件，便于用户感知和处理异常；
+12. 监听底层套接字事件，处理消息接收、连接断开：监听 `data` 接收帧、`pong` 更新心跳时间戳、`error` 透传错误、`end`（对端 FIN）主动销毁 socket 加速清理、`close` 触发 `_emitClose` 清理连接状态（详见设计规则 54）。
 
 #### 3.6.2 WebSocketServer 类
 
@@ -926,6 +932,10 @@ app.sse('/events', (sse, req) => {
 48. **`_handleRequest` 顶层 catch 必须设置 `Connection: close`**：顶层 catch 返回 500 响应时必须设置 `Connection: close` 头。顶层 catch 意味着请求处理异常（`req.body` 可能部分解析、临时文件可能残留、中间件状态可能不一致），复用此 keep-alive 连接的后续请求会在污染状态上执行。强制关闭连接让客户端新建连接，避免状态污染扩散。
 49. **Logger 跨日切换旧流 `destroy` 必须 try/catch 保护**：`_getLogStream` 跨日切换时 `oldStream.end(() => oldStream.destroy())` 中，`destroy()` 通常不抛异常，但流已损坏或 fd 已释放时可能抛。跨日切换是日志核心路径，异常会导致 `end` 回调中断、后续日志全部丢失。必须用 `try { oldStream.destroy(); } catch (e) { /* 忽略 */ }` 包裹，确保跨日切换健壮。
 50. **统一使用 `writableEnded` 替代废弃的 `finished` 属性**：Node.js 16+ 废弃了 `ServerResponse.finished`，推荐使用 `writableEnded`。`Response.finished` getter 应返回 `this._res.writableEnded || this._res.destroyed`（`destroyed` 覆盖 socket 异常关闭场景）；`Response._send` 和 `SSE.close` 中的 `this._res.finished` 检查统一改为 `this._res.writableEnded`。确保前向兼容 Node.js 未来版本。
+51. **WebSocketServer 心跳定时器必须 `unref`**：`_startHeartbeat` 中 `setInterval` 创建的定时器必须调用 `unref()`，防止定时器阻止进程退出。场景：测试中断开所有连接后未调用 `app.close()`，或异常退出时进程被心跳定时器"吊住"。与 `WebSocket._closeTimer` 的 `unref` 处理保持一致。
+52. **`handleUpgrade` 必须在 ws 创建后立即注册 `close` 监听器**：WebSocket 构造函数内部已监听 socket `close` 事件并触发 `_emitClose`，若 WebSocketServer 的 `ws.on('close', () => this._removeConnection(ws))` 注册过晚，极端竞态下（socket 在同步代码执行期间进入关闭流程）close 事件会丢失监听器，导致连接永远停留在 `connections` Map 中（内存泄漏）。必须在 `new WebSocket()` 之后立即注册 close 监听器，再做 head 处理、`connections.set`、分组、心跳。
+53. **`sendFile` HEAD 请求必须跳过 Gzip 分支**：HEAD 请求不传输实体无需压缩，且流式 Gzip 无法预知压缩后大小。若 HEAD 进入 Gzip 分支，会因未移除 `Content-Length` 导致响应头（`Content-Length: stat.size` 未压缩大小）与 GET 实际返回的压缩内容大小不一致，违反 HTTP 语义。Gzip 判断条件必须包含 `!this._isHead`，让 HEAD 走 `_streamFile` 快速路径返回 `Content-Length: stat.size` 且无 `Content-Encoding` 头，符合业界主流服务器行为。
+54. **WebSocket 必须监听 socket `end` 事件并主动销毁**：客户端正常断开（TCP FIN）时，服务端 socket 先触发 `end` 事件再触发 `close` 事件。若仅监听 `close`，Windows 等 platform 上 socket 可能停留半开状态延迟触发 `close`，导致 `server._connections` 不归零、`server.close()` 挂起（连接泄漏）。WebSocket 构造函数必须在 `socket.on('close')` 之外额外注册 `socket.on('end', () => { this.connected = false; socket.destroy(); })`，收到 FIN 立即销毁 socket 加速清理。WebSocket 协议无半关闭语义，客户端 FIN 即视为断开连接，主动销毁安全。与 ws 库等主流实现行为一致。
 
 ---
 
@@ -937,7 +947,7 @@ app.sse('/events', (sse, req) => {
 ```json
 {
   "name": "@lzpong/httpm",
-  "version": "1.4.7",
+  "version": "1.4.8",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
   "engines": { "node": ">=18.0.0" },
