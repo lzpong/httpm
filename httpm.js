@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.4.8
+ * @version     1.5.0
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -3167,7 +3167,7 @@ class Application extends Router {
   /**
    * 处理 WebSocket 升级请求
    */
-  _handleUpgrade(req, socket, head) {
+  _handleUpgrade(incomingMessage, socket, head) {
     // 防御性检查：_wss 在 listen() 中初始化，正常流程不会为 null
     if (!this._wss) {
       this._logger.warn('WebSocket server not initialized (call listen() first)');
@@ -3175,10 +3175,31 @@ class Application extends Router {
       return;
     }
     // 校验 Upgrade 头必须为 websocket
-    if (req.headers['upgrade']?.toLowerCase() !== 'websocket') {
-      this._logger.warn('Invalid upgrade header:', req.headers['upgrade'], 'expected: websocket');
+    if (incomingMessage.headers['upgrade']?.toLowerCase() !== 'websocket') {
+      this._logger.warn('Invalid upgrade header:', incomingMessage.headers['upgrade'], 'expected: websocket');
       socket.destroy();
       return;
+    }
+    // 包装为 httpm Request 实例，保持与普通路由 req 属性一致
+    // WebSocket 升级请求绕过 _handleRequest，原生 req 是 http.IncomingMessage，
+    // 缺少 query/cookies/ip/hostname/protocol/get 等便捷属性；
+    // 包装后 handler(ws, req) 可像普通路由一样使用 req，API 行为一致
+    // 注：底层 socket 通过 ws.socket 访问（符合 WebSocket 语义），req 不暴露 socket
+    const req = new Request(incomingMessage);
+    req._app = this;
+    const parsed = parseUrl(incomingMessage.url);
+    req.query = parsed.query;
+    try {
+      req.path = decodeURIComponent(parsed.pathname);
+    } catch (e) {
+      // 非法 URI 编码保留原始 pathname，避免抛异常中断握手
+      req.path = parsed.pathname;
+    }
+    // Cookie 解析：与普通路由一致，尊重 useCookieParser 配置
+    // WebSocket 升级请求常携带 Cookie 用于鉴权，解析后 handler 可直接用 req.cookies/signedCookies
+    // 复用 cookieParser 中间件逻辑，确保签名验证行为与普通路由完全一致
+    if (this.settings.useCookieParser !== false) {
+      cookieParser(this.settings.cookieParserSecret)(req, null, () => {});
     }
     const ws = this._wss.handleUpgrade(req, socket, head);
     if (!ws) return;
@@ -3186,7 +3207,7 @@ class Application extends Router {
     // 匹配 app.ws() 注册的处理器（支持动态参数路径）
     // _compilePath 始终返回 pattern，静态和动态路径均通过正则精确匹配
     if (this._wsHandlers && this._wsHandlers.length > 0) {
-      const pathname = parseUrl(req.url).pathname;
+      const pathname = parsed.pathname;
       let matchedEntry = null;
       let params = {};
       for (const entry of this._wsHandlers) {
@@ -3474,7 +3495,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.4.8';
+httpm.version = '1.5.0';
 
 /**
  * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）

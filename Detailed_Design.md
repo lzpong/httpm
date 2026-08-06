@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.4.8
+**文档版本**：V1.5.0
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -418,6 +418,7 @@ SSE 监听两类断开事件以兼容 HTTP/1.1 与 HTTP/2：
 4. 连接管理：新增 / 销毁连接时自动维护连接列表；
 5. Origin 校验：支持 `allowedOrigins` 配置，防止跨站 WebSocket 劫持（CSWSH）；
 6. 帧负载限制：支持 `maxPayload` 配置（默认 100MB），同时校验单帧负载和分片累积总大小，防止恶意超大帧和分片累积绕过攻击耗尽内存。
+7. **handler req 一致性**：`app.ws(path, handler)` 与 `wss.on('connection', (ws, req) => ...)` 的 `req` 均为 httpm `Request` 实例（与普通路由 `req` 同类型）。`_handleUpgrade` 在握手前将原生 `http.IncomingMessage` 包装为 `Request`，补全 `query`/`path`/`cookies`/`signedCookies`/`ip`/`hostname`/`protocol`/`get()` 等便捷属性，handler 可像普通路由一样使用 `req`。Cookie 解析复用 `cookieParser` 中间件逻辑（尊重 `useCookieParser` 配置）；底层 socket 通过 `ws.socket` 访问（符合 WebSocket 语义，`req` 不暴露 `socket`）；`body`/`files`/`formData` 保持初始值（升级请求无 body）。详见设计规则 55。
 
 #### 心跳机制
 
@@ -936,6 +937,7 @@ app.sse('/events', (sse, req) => {
 52. **`handleUpgrade` 必须在 ws 创建后立即注册 `close` 监听器**：WebSocket 构造函数内部已监听 socket `close` 事件并触发 `_emitClose`，若 WebSocketServer 的 `ws.on('close', () => this._removeConnection(ws))` 注册过晚，极端竞态下（socket 在同步代码执行期间进入关闭流程）close 事件会丢失监听器，导致连接永远停留在 `connections` Map 中（内存泄漏）。必须在 `new WebSocket()` 之后立即注册 close 监听器，再做 head 处理、`connections.set`、分组、心跳。
 53. **`sendFile` HEAD 请求必须跳过 Gzip 分支**：HEAD 请求不传输实体无需压缩，且流式 Gzip 无法预知压缩后大小。若 HEAD 进入 Gzip 分支，会因未移除 `Content-Length` 导致响应头（`Content-Length: stat.size` 未压缩大小）与 GET 实际返回的压缩内容大小不一致，违反 HTTP 语义。Gzip 判断条件必须包含 `!this._isHead`，让 HEAD 走 `_streamFile` 快速路径返回 `Content-Length: stat.size` 且无 `Content-Encoding` 头，符合业界主流服务器行为。
 54. **WebSocket 必须监听 socket `end` 事件并主动销毁**：客户端正常断开（TCP FIN）时，服务端 socket 先触发 `end` 事件再触发 `close` 事件。若仅监听 `close`，Windows 等 platform 上 socket 可能停留半开状态延迟触发 `close`，导致 `server._connections` 不归零、`server.close()` 挂起（连接泄漏）。WebSocket 构造函数必须在 `socket.on('close')` 之外额外注册 `socket.on('end', () => { this.connected = false; socket.destroy(); })`，收到 FIN 立即销毁 socket 加速清理。WebSocket 协议无半关闭语义，客户端 FIN 即视为断开连接，主动销毁安全。与 ws 库等主流实现行为一致。
+55. **WebSocket handler 的 req 必须为 httpm Request 实例**：`_handleUpgrade` 必须在握手前将原生 `http.IncomingMessage` 包装为 `new Request()`，设置 `req._app = this`，补全 `req.query`（parseUrl 解析）、`req.path`（decodeURIComponent 解码，非法编码保留原值），并在 `useCookieParser !== false` 时复用 `cookieParser` 中间件解析 `req.cookies`/`req.signedCookies`。确保 `app.ws` handler 与 `wss.on('connection')` 监听者收到的 req 和普通路由 req 属性一致。底层 socket 不通过 req 暴露（Request 无 socket getter），业务方应使用 `ws.socket` 访问（符合 WebSocket 语义）。`body`/`files`/`formData` 保持 Request 构造函数初始值（升级请求无 body，不走 bodyParser）。
 
 ---
 
@@ -947,7 +949,7 @@ app.sse('/events', (sse, req) => {
 ```json
 {
   "name": "@lzpong/httpm",
-  "version": "1.4.8",
+  "version": "1.5.0",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
   "engines": { "node": ">=18.0.0" },

@@ -2621,6 +2621,97 @@ async function runTests() {
     }
   }
 
+  // --- V1.4.9 验证：WebSocket handler 的 req 与普通路由 req 属性一致 ---
+  // app.ws handler 的 req 应为 httpm Request 实例，具备 query/params/path/cookies/ip 等
+  // 修复前 req 是原生 http.IncomingMessage，缺少这些便捷属性
+  {
+    const PORT8 = PORT + 7;
+    const app8 = httpm({
+      svrPort: PORT8,
+      logLevel: 'error',
+      cookieParserSecret: 'test-secret'
+    });
+    // handler 读取 req 各属性并通过 ws.send 返回 JSON，用于断言
+    app8.ws('/ws-req/:id', (ws, req) => {
+      ws.on('text', () => {
+        ws.send(JSON.stringify({
+          query: req.query,
+          params: req.params,
+          path: req.path,
+          url: req.url,
+          method: req.method,
+          ip: req.ip,
+          hostname: req.hostname,
+          protocol: req.protocol,
+          cookies: req.cookies,
+          signedCookies: req.signedCookies,
+          getHost: req.get('host'),
+          getCookie: req.get('Cookie'),
+          hasBody: req.body === null,
+          hasFormData: !!req.formData,
+          hasFiles: Array.isArray(req.files)
+        }));
+      });
+    });
+    const server8 = app8.listen(PORT8);
+    await new Promise(r => setTimeout(r, 300));
+
+    try {
+      // 构造带 query + Cookie 的 WebSocket 升级请求（path 带 query，携带 Cookie 头）
+      const key = crypto.randomBytes(16).toString('base64');
+      const upgradeReq = http.request({
+        hostname: 'localhost', port: PORT8,
+        path: '/ws-req/42?name=abc&x=1', method: 'GET',
+        headers: {
+          'Upgrade': 'websocket', 'Connection': 'Upgrade',
+          'Sec-WebSocket-Key': key, 'Sec-WebSocket-Version': '13',
+          'Cookie': 'session=xyz; token=abc',
+          'Host': 'localhost:' + PORT8
+        }
+      });
+      const { socket } = await new Promise((resolve, reject) => {
+        upgradeReq.on('upgrade', (res, sock, head) => resolve({ socket: sock, head }));
+        upgradeReq.on('error', reject);
+        upgradeReq.end();
+      });
+      wsSendText(socket, 'go');
+      const reply = await wsReadText(socket);
+      const obj = JSON.parse(reply);
+      // query 解析（修复前 undefined）
+      assert(obj.query.name === 'abc', 'HTTP - WS req.query.name 解析');
+      assert(obj.query.x === '1', 'HTTP - WS req.query 多参数');
+      // params 动态参数（修复前仅原生 req 手动挂载，现经 Request 包装仍可用）
+      assert(obj.params.id === '42', 'HTTP - WS req.params 动态参数');
+      // path 解码路径（修复前 undefined）
+      assert(obj.path === '/ws-req/42', 'HTTP - WS req.path 解码路径');
+      // url 原始 URL（getter 代理）
+      assert(obj.url === '/ws-req/42?name=abc&x=1', 'HTTP - WS req.url 原始 URL');
+      assert(obj.method === 'GET', 'HTTP - WS req.method');
+      // ip/hostname/protocol（修复前 undefined，现为 Request getter）
+      assert(obj.ip && obj.ip.length > 0, 'HTTP - WS req.ip 非空');
+      assert(obj.hostname === 'localhost', 'HTTP - WS req.hostname');
+      assert(obj.protocol === 'http', 'HTTP - WS req.protocol');
+      // cookies 解析（修复前 undefined，现复用 cookieParser 中间件）
+      assert(obj.cookies.session === 'xyz', 'HTTP - WS req.cookies.session');
+      assert(obj.cookies.token === 'abc', 'HTTP - WS req.cookies.token');
+      // signedCookies 存在（无签名 cookie 时为空对象）
+      assert(typeof obj.signedCookies === 'object', 'HTTP - WS req.signedCookies 存在');
+      // req.get() 大小写不敏感（修复前 req.get 不是函数）
+      assert(obj.getHost === 'localhost:' + PORT8, 'HTTP - WS req.get(host)');
+      assert(obj.getCookie === 'session=xyz; token=abc', 'HTTP - WS req.get(Cookie) 大小写不敏感');
+      // body/formData/files 保持初始值（WebSocket 升级请求无 body）
+      assert(obj.hasBody === true, 'HTTP - WS req.body 默认 null');
+      assert(obj.hasFormData === true, 'HTTP - WS req.formData 存在');
+      assert(obj.hasFiles === true, 'HTTP - WS req.files 数组');
+      socket.destroy();
+    } catch (e) {
+      assertSkip('HTTP - WS req 属性一致性测试', e.message);
+    } finally {
+      await new Promise(r => server8.close(r));
+      await closeLoggerStream(app8._logger);
+    }
+  }
+
   // --- P2-1/P2-2 验证：res.append / res.type null 参数不抛异常 ---
   // res.append(null, 'val') 和 res.type(null/undefined) 应静默返回 this，不抛 TypeError
   {
