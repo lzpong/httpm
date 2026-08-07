@@ -2751,6 +2751,360 @@ async function runTests() {
     }
   }
 
+  // ============================================================
+  // 第十二轮审查优化验证测试
+  // ============================================================
+  section('第十二轮优化 - P1/P2/P3 修复验证');
+
+  // --- P1-1 验证：json(undefined)/json(function)/json(Symbol) 不抛 TypeError ---
+  // 修复前：JSON.stringify(undefined) 返回 undefined，Buffer.byteLength(undefined) 抛 TypeError
+  // 修复后：body === undefined 时转为 'undefined' 字符串，正常返回 JSON 响应
+  {
+    const PORT10 = PORT + 10;
+    const app10 = httpm({ svrPort: PORT10, logLevel: 'error' });
+    app10.get('/json-undefined', (req, res) => res.json(undefined));
+    app10.get('/json-function', (req, res) => res.json(function() {}));
+    app10.get('/json-symbol', (req, res) => res.json(Symbol('test')));
+    app10.get('/json-normal', (req, res) => res.json({ ok: true }));
+    const server10 = app10.listen(PORT10);
+    await new Promise(r => setTimeout(r, 300));
+
+    try {
+      const r1 = await httpGet('http://localhost:' + PORT10 + '/json-undefined');
+      const b1 = await readBodyStr(r1);
+      assert(r1.statusCode === 200 && b1 === 'undefined', 'HTTP - json(undefined) 返回 "undefined" 不崩溃');
+      assert(r1.headers['content-type'].includes('application/json'), 'HTTP - json(undefined) Content-Type 正确');
+
+      const r2 = await httpGet('http://localhost:' + PORT10 + '/json-function');
+      const b2 = await readBodyStr(r2);
+      assert(r2.statusCode === 200 && b2 === 'undefined', 'HTTP - json(function) 返回 "undefined" 不崩溃');
+
+      const r3 = await httpGet('http://localhost:' + PORT10 + '/json-symbol');
+      const b3 = await readBodyStr(r3);
+      assert(r3.statusCode === 200 && b3 === 'undefined', 'HTTP - json(Symbol) 返回 "undefined" 不崩溃');
+
+      const r4 = await httpGet('http://localhost:' + PORT10 + '/json-normal');
+      const b4 = await readBodyStr(r4);
+      assert(r4.statusCode === 200 && b4 === '{"ok":true}', 'HTTP - json(normal) 正常工作无回归');
+    } catch (e) {
+      assertSkip('HTTP - json(undefined/function/Symbol) 测试', e.message);
+    } finally {
+      await new Promise(r => server10.close(r));
+      await closeLoggerStream(app10._logger);
+    }
+  }
+
+  // --- P2-5 验证：send(Buffer) 不覆盖用户设置的 Content-Type ---
+  // 修复前：Buffer 分支无条件设置 application/octet-stream，覆盖 res.type('image/png')
+  // 修复后：仅在未设置 Content-Type 时补充默认值
+  {
+    const PORT11 = PORT + 11;
+    const app11 = httpm({ svrPort: PORT11, logLevel: 'error' });
+    app11.get('/buf-with-type', (req, res) => {
+      res.type('image/png');
+      res.send(Buffer.from([0x89, 0x50, 0x4E, 0x47])); // PNG 文件头
+    });
+    app11.get('/buf-no-type', (req, res) => {
+      res.send(Buffer.from([0x89, 0x50, 0x4E, 0x47])); // 未设置 Content-Type
+    });
+    const server11 = app11.listen(PORT11);
+    await new Promise(r => setTimeout(r, 300));
+
+    try {
+      const r1 = await httpGet('http://localhost:' + PORT11 + '/buf-with-type');
+      assert(r1.headers['content-type'] === 'image/png', 'HTTP - send(Buffer) 保留用户设置的 Content-Type');
+
+      const r2 = await httpGet('http://localhost:' + PORT11 + '/buf-no-type');
+      assert(r2.headers['content-type'] === 'application/octet-stream', 'HTTP - send(Buffer) 未设置时用默认 octet-stream');
+    } catch (e) {
+      assertSkip('HTTP - send(Buffer) Content-Type 测试', e.message);
+    } finally {
+      await new Promise(r => server11.close(r));
+      await closeLoggerStream(app11._logger);
+    }
+  }
+
+  // --- P2-7 验证：res.sse() 沿用用户通过 res.status() 设置的状态码 ---
+  // 修复前：SSE 构造函数使用底层 res.statusCode（默认 200），用户 res.status(201) 被忽略
+  // 修复后：res.sse() 先同步 this.statusCode 到 this._res.statusCode
+  {
+    const PORT12 = PORT + 12;
+    const app12 = httpm({ svrPort: PORT12, logLevel: 'error' });
+    app12.get('/sse-201', (req, res) => {
+      res.status(201);
+      const sse = res.sse();
+      sse.send({ ok: true });
+      sse.close();
+    });
+    app12.get('/sse-default', (req, res) => {
+      const sse = res.sse();
+      sse.send('hello');
+      sse.close();
+    });
+    const server12 = app12.listen(PORT12);
+    await new Promise(r => setTimeout(r, 300));
+
+    try {
+      const r1 = await httpGet('http://localhost:' + PORT12 + '/sse-201');
+      // 消费响应体避免连接保持
+      await readBodyStr(r1);
+      assert(r1.statusCode === 201, 'HTTP - SSE 沿用用户设置的 201 状态码');
+
+      const r2 = await httpGet('http://localhost:' + PORT12 + '/sse-default');
+      await readBodyStr(r2);
+      assert(r2.statusCode === 200, 'HTTP - SSE 默认 200 状态码');
+    } catch (e) {
+      assertSkip('HTTP - SSE statusCode 测试', e.message);
+    } finally {
+      await new Promise(r => server12.close(r));
+      await closeLoggerStream(app12._logger);
+    }
+  }
+
+  // --- P2-11 验证：cookie(name, number/boolean, {signed:true}) 不抛 TypeError ---
+  // 修复前：update(rawValue) 要求 string/Buffer，number/boolean 抛 TypeError
+  // 修复后：update(String(rawValue)) 安全转换
+  {
+    const PORT13 = PORT + 13;
+    const app13 = httpm({
+      svrPort: PORT13,
+      logLevel: 'error',
+      cookieParserSecret: 'test-secret'
+    });
+    app13.get('/cookie-num', (req, res) => {
+      res.cookie('count', 123, { signed: true });
+      res.cookie('flag', true, { signed: true });
+      res.send('ok');
+    });
+    const server13 = app13.listen(PORT13);
+    await new Promise(r => setTimeout(r, 300));
+
+    try {
+      const r = await httpGet('http://localhost:' + PORT13 + '/cookie-num');
+      const body = await readBodyStr(r);
+      assert(r.statusCode === 200 && body === 'ok', 'HTTP - cookie(number/boolean, signed) 不抛 TypeError');
+      const setCookie = r.headers['set-cookie'];
+      assert(Array.isArray(setCookie) && setCookie.length === 2, 'HTTP - cookie 设置 2 个 Set-Cookie');
+      // 签名 cookie 应包含 s: 前缀
+      assert(setCookie.some(c => c.startsWith('count=s:')), 'HTTP - cookie(number) signed 带 s: 前缀');
+      assert(setCookie.some(c => c.startsWith('flag=s:')), 'HTTP - cookie(boolean) signed 带 s: 前缀');
+    } catch (e) {
+      assertSkip('HTTP - cookie 签名非字符串值测试', e.message);
+    } finally {
+      await new Promise(r => server13.close(r));
+      await closeLoggerStream(app13._logger);
+    }
+  }
+
+  // --- P2-12 验证：listen(0) 随机端口分配 ---
+  // 修复前：port=0 是 falsy，回退到 svrPort（默认 80），非 root 用户监听 80 失败
+  // 修复后：port=0 由操作系统随机分配端口
+  {
+    const app14 = httpm({ logLevel: 'error' });
+    app14.get('/', (req, res) => res.send('ok'));
+    let server14;
+    let actualPort = 0;
+    try {
+      server14 = app14.listen(0);
+      // listen(0) 后通过 server.address().port 获取实际分配的端口
+      await new Promise(r => setTimeout(r, 300));
+      const addr = server14.address();
+      actualPort = addr && addr.port;
+      assert(typeof actualPort === 'number' && actualPort > 0, 'HTTP - listen(0) 分配随机端口 > 0');
+
+      // 验证端口可用
+      const r = await httpGet('http://localhost:' + actualPort + '/');
+      const body = await readBodyStr(r);
+      assert(r.statusCode === 200 && body === 'ok', 'HTTP - listen(0) 端口可正常服务');
+    } catch (e) {
+      assertSkip('HTTP - listen(0) 随机端口测试', e.message);
+    } finally {
+      if (server14) await new Promise(r => server14.close(r));
+      await closeLoggerStream(app14._logger);
+    }
+  }
+
+  // --- P3-17 验证：cookie sameSite:true 等同 strict ---
+  // 修复前：sameSite:true 被 String(true).toLowerCase() = 'true'，不在白名单，不输出 SameSite
+  // 修复后：sameSite:true 映射为 'strict'
+  {
+    const PORT15 = PORT + 15;
+    const app15 = httpm({ svrPort: PORT15, logLevel: 'error' });
+    app15.get('/cookie-samesite', (req, res) => {
+      res.cookie('a', '1', { sameSite: true });
+      res.cookie('b', '2', { sameSite: 'lax' });
+      res.send('ok');
+    });
+    const server15 = app15.listen(PORT15);
+    await new Promise(r => setTimeout(r, 300));
+
+    try {
+      const r = await httpGet('http://localhost:' + PORT15 + '/cookie-samesite');
+      const setCookie = r.headers['set-cookie'];
+      assert(Array.isArray(setCookie) && setCookie.length === 2, 'HTTP - cookie sameSite 设置 2 个 Set-Cookie');
+      assert(setCookie.some(c => c.includes('SameSite=Strict')), 'HTTP - cookie sameSite:true 等同 Strict');
+      assert(setCookie.some(c => c.includes('SameSite=Lax')), 'HTTP - cookie sameSite:lax 正常');
+    } catch (e) {
+      assertSkip('HTTP - cookie sameSite:true 测试', e.message);
+    } finally {
+      await new Promise(r => server15.close(r));
+      await closeLoggerStream(app15._logger);
+    }
+  }
+
+  // --- P3-25 验证：redirect 状态码白名单 ---
+  // 修复前：所有 3xx 都被接受，包括 300/304/305/306 等非重定向码
+  // 修复后：仅 301/302/303/307/308 有效，其他回退 302
+  {
+    const PORT16 = PORT + 16;
+    const app16 = httpm({ svrPort: PORT16, logLevel: 'error' });
+    app16.get('/redir-301', (req, res) => res.redirect(301, '/foo'));
+    app16.get('/redir-308', (req, res) => res.redirect(308, '/foo'));
+    app16.get('/redir-300', (req, res) => res.redirect(300, '/foo')); // 非白名单，回退 302
+    app16.get('/redir-304', (req, res) => res.redirect(304, '/foo')); // 非白名单，回退 302
+    app16.get('/redir-999', (req, res) => res.redirect(999, '/foo')); // 非白名单，回退 302
+    const server16 = app16.listen(PORT16);
+    await new Promise(r => setTimeout(r, 300));
+
+    try {
+      const r1 = await httpGet('http://localhost:' + PORT16 + '/redir-301');
+      assert(r1.statusCode === 301, 'HTTP - redirect(301) 接受 301');
+      const r2 = await httpGet('http://localhost:' + PORT16 + '/redir-308');
+      assert(r2.statusCode === 308, 'HTTP - redirect(308) 接受 308');
+      const r3 = await httpGet('http://localhost:' + PORT16 + '/redir-300');
+      assert(r3.statusCode === 302, 'HTTP - redirect(300) 回退 302');
+      const r4 = await httpGet('http://localhost:' + PORT16 + '/redir-304');
+      assert(r4.statusCode === 302, 'HTTP - redirect(304) 回退 302');
+      const r5 = await httpGet('http://localhost:' + PORT16 + '/redir-999');
+      assert(r5.statusCode === 302, 'HTTP - redirect(999) 回退 302');
+    } catch (e) {
+      assertSkip('HTTP - redirect 状态码白名单测试', e.message);
+    } finally {
+      await new Promise(r => server16.close(r));
+      await closeLoggerStream(app16._logger);
+    }
+  }
+
+  // --- P3-27 验证：status 无效状态码保持默认 200 ---
+  // 修复前：status('abc') 直接设置 statusCode='abc'，HTTP 协议违规
+  // 修复后：非 100-599 整数保持 200
+  {
+    const PORT17 = PORT + 17;
+    const app17 = httpm({ svrPort: PORT17, logLevel: 'error' });
+    app17.get('/status-invalid', (req, res) => {
+      res.status('abc');
+      res.send('ok');
+    });
+    app17.get('/status-99', (req, res) => {
+      res.status(99);
+      res.send('ok');
+    });
+    app17.get('/status-600', (req, res) => {
+      res.status(600);
+      res.send('ok');
+    });
+    app17.get('/status-201', (req, res) => {
+      res.status(201);
+      res.send('ok');
+    });
+    const server17 = app17.listen(PORT17);
+    await new Promise(r => setTimeout(r, 300));
+
+    try {
+      const r1 = await httpGet('http://localhost:' + PORT17 + '/status-invalid');
+      assert(r1.statusCode === 200, 'HTTP - status("abc") 保持 200');
+      const r2 = await httpGet('http://localhost:' + PORT17 + '/status-99');
+      assert(r2.statusCode === 200, 'HTTP - status(99) 保持 200');
+      const r3 = await httpGet('http://localhost:' + PORT17 + '/status-600');
+      assert(r3.statusCode === 200, 'HTTP - status(600) 保持 200');
+      const r4 = await httpGet('http://localhost:' + PORT17 + '/status-201');
+      assert(r4.statusCode === 201, 'HTTP - status(201) 正常设置');
+    } catch (e) {
+      assertSkip('HTTP - status 状态码校验测试', e.message);
+    } finally {
+      await new Promise(r => server17.close(r));
+      await closeLoggerStream(app17._logger);
+    }
+  }
+
+  // --- P3-19 验证：sendFile If-None-Match: * 和多 ETag 支持 ---
+  // 修复前：仅支持 If-None-Match === etag 精确匹配
+  // 修复后：支持 * 和逗号分隔的多 ETag
+  // 注意：enableCache 默认 false，必须显式开启才会生成 ETag 头
+  {
+    const PORT18 = PORT + 18;
+    const app18 = httpm({ svrPort: PORT18, logLevel: 'error', enableCache: true });
+    const testFile18 = path.join(__dirname, 'test_etag_18.txt');
+    fs.writeFileSync(testFile18, 'etag-test-content');
+    app18.get('/file', (req, res) => res.sendFile(testFile18));
+    const server18 = app18.listen(PORT18);
+    await new Promise(r => setTimeout(r, 300));
+
+    try {
+      // 先获取 ETag
+      const r1 = await httpGet('http://localhost:' + PORT18 + '/file');
+      await readBodyStr(r1);
+      const etag = r1.headers['etag'];
+      assert(etag, 'HTTP - sendFile 返回 ETag 头');
+
+      // If-None-Match: * 应返回 304
+      const r2 = await httpGet('http://localhost:' + PORT18 + '/file', { 'If-None-Match': '*' });
+      assert(r2.statusCode === 304, 'HTTP - If-None-Match: * 返回 304');
+
+      // If-None-Match: "etag1", "etag2", <真实etag> 应返回 304
+      const r3 = await httpGet('http://localhost:' + PORT18 + '/file', {
+        'If-None-Match': `"fake-etag1", "fake-etag2", ${etag}`
+      });
+      assert(r3.statusCode === 304, 'HTTP - If-None-Match 多 ETag 匹配返回 304');
+
+      // If-None-Match: "fake" 不匹配，返回 200
+      const r4 = await httpGet('http://localhost:' + PORT18 + '/file', { 'If-None-Match': '"fake-etag"' });
+      assert(r4.statusCode === 200, 'HTTP - If-None-Match 不匹配返回 200');
+    } catch (e) {
+      assertSkip('HTTP - If-None-Match 多 ETag 测试', e.message);
+    } finally {
+      await new Promise(r => server18.close(r));
+      await closeLoggerStream(app18._logger);
+      try { fs.unlinkSync(testFile18); } catch (e) { /* 忽略 */ }
+    }
+  }
+
+  // --- P3-26 验证：sendFile Range 格式错误返回 200，范围不满足返回 416 ---
+  // 修复前：parseRange 返回 null 统一返回 416
+  // 修复后：格式错误忽略 Range 返回 200，范围不满足返回 416
+  {
+    const PORT19 = PORT + 19;
+    const app19 = httpm({ svrPort: PORT19, logLevel: 'error' });
+    const testFile19 = path.join(__dirname, 'test_range_19.txt');
+    fs.writeFileSync(testFile19, '0123456789'); // 10 字节文件
+    app19.get('/file', (req, res) => res.sendFile(testFile19));
+    const server19 = app19.listen(PORT19);
+    await new Promise(r => setTimeout(r, 300));
+
+    try {
+      // 正常 Range：bytes=0-4 返回 206
+      const r1 = await httpGet('http://localhost:' + PORT19 + '/file', { 'Range': 'bytes=0-4' });
+      const b1 = await readBodyStr(r1);
+      assert(r1.statusCode === 206 && b1 === '01234', 'HTTP - Range bytes=0-4 返回 206');
+
+      // 格式错误 Range：bytes=abc 应忽略 Range，返回 200 全文
+      const r2 = await httpGet('http://localhost:' + PORT19 + '/file', { 'Range': 'bytes=abc' });
+      const b2 = await readBodyStr(r2);
+      assert(r2.statusCode === 200 && b2 === '0123456789', 'HTTP - Range 格式错误返回 200 全文');
+
+      // 范围不满足：bytes=100- 文件只有 10 字节，返回 416
+      const r3 = await httpGet('http://localhost:' + PORT19 + '/file', { 'Range': 'bytes=100-' });
+      assert(r3.statusCode === 416, 'HTTP - Range 范围不满足返回 416');
+      assert(r3.headers['content-range'] === 'bytes */10', 'HTTP - 416 Content-Range 正确');
+    } catch (e) {
+      assertSkip('HTTP - Range 格式区分测试', e.message);
+    } finally {
+      await new Promise(r => server19.close(r));
+      await closeLoggerStream(app19._logger);
+      try { fs.unlinkSync(testFile19); } catch (e) { /* 忽略 */ }
+    }
+  }
+
   // 清理测试文件
   try {
     fs.unlinkSync(path.join(testDir, 'index.html'));

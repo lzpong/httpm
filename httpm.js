@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.5.0
+ * @version     1.5.1
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -869,7 +869,14 @@ class Response {
    * 设置 HTTP 状态码，支持链式调用
    */
   status(code) {
-    this.statusCode = code;
+    // 校验状态码为 100-599 范围内的整数，避免无效状态码（如 99/600/小数/非数字）
+    // 导致客户端解析失败或 HTTP 协议违规
+    // 无效时保持默认 200，并记录 warn 日志提示调用方
+    if (Number.isInteger(code) && code >= 100 && code <= 599) {
+      this.statusCode = code;
+    } else {
+      this._app?._logger?.warn(`[Response] invalid status code: ${code}, expected integer 100-599, fallback to 200`);
+    }
     return this;
   }
 
@@ -893,6 +900,10 @@ class Response {
       this._send(errBody);
       return;
     }
+    // JSON.stringify 对 undefined/function/Symbol 返回 undefined（既不抛异常也不是字符串）
+    // 随后 Buffer.byteLength(undefined) 会抛 TypeError，导致请求无法正常结束、连接挂起
+    // 与 Express 行为对齐：对 undefined 发送 'undefined' 字符串
+    if (body === undefined) body = 'undefined';
     this.setHeader('Content-Type', 'application/json; charset=utf-8');
     this.setHeader('Content-Length', Buffer.byteLength(body));
     this._send(body);
@@ -917,7 +928,12 @@ class Response {
       return;
     }
     if (Buffer.isBuffer(data)) {
-      this.setHeader('Content-Type', 'application/octet-stream');
+      // 仅在用户未设置 Content-Type 时补充默认值，与字符串分支行为一致
+      // 用户通过 res.type('image/png') 设置的 Content-Type 不应被 send(Buffer) 覆盖
+      // 对齐 Express 4.x 行为
+      if (!this.getHeader('Content-Type')) {
+        this.setHeader('Content-Type', 'application/octet-stream');
+      }
       this.setHeader('Content-Length', data.length);
       this._send(data);
       return;
@@ -984,9 +1000,21 @@ class Response {
     }
 
     fs.stat(fullPath, (err, stat) => {
-      if (err || !stat.isFile()) {
+      if (err) {
+        // 区分 ENOENT(404 文件不存在) 和 EACCES(403 权限不足)，HTTP 语义更准确
+        // EACCES 表示文件存在但无访问权限，ENOENT 表示路径不存在
+        // 其他错误（如 ENOTDIR、EMFILE）统一回退 404，保持兼容性
+        if (err.code === 'EACCES') {
+          this.status(403).send('Forbidden');
+        } else {
+          this.status(404).send('Not Found');
+        }
+        doneOnce(err);
+        return;
+      }
+      if (!stat.isFile()) {
         this.status(404).send('Not Found');
-        doneOnce(err || new Error('Not a file'));
+        doneOnce(new Error('Not a file'));
         return;
       }
 
@@ -1011,7 +1039,19 @@ class Response {
 
         const ifNoneMatch = this._req?.headers?.['if-none-match'];
         const ifModifiedSince = this._req?.headers?.['if-modified-since'];
-        if (ifNoneMatch === etag || (ifModifiedSince && new Date(ifModifiedSince) >= stat.mtime)) {
+        // RFC 7232 Section 3.2: If-None-Match 支持 * （匹配任意 ETag）和逗号分隔的多 ETag
+        // 客户端可能发送 If-None-Match: "etag1", "etag2" 或 If-None-Match: *
+        let etagMatch = false;
+        if (ifNoneMatch) {
+          if (ifNoneMatch.trim() === '*') {
+            etagMatch = true;
+          } else {
+            // 按逗号拆分，逐个比较（ETag 值已含引号，直接字符串比较）
+            const etags = ifNoneMatch.split(',').map(s => s.trim());
+            etagMatch = etags.includes(etag);
+          }
+        }
+        if (etagMatch || (ifModifiedSince && new Date(ifModifiedSince) >= stat.mtime)) {
           this.status(304);
           this.removeHeader('Content-Length');
           this._res.statusCode = 304;
@@ -1032,13 +1072,21 @@ class Response {
           this._streamFile(fullPath, range.start, range.end, doneOnce);
           return;
         }
-        // 无效 Range：RFC 7233 规定返回 416 Range Not Satisfiable
-        this.status(416);
-        this.setHeader('Content-Range', `bytes */${stat.size}`);
-        this.setHeader('Content-Length', 0);
-        this._send('');
-        doneOnce(null);
-        return;
+        // parseRange 返回 null 有两种情况，处理需符合 RFC 7233：
+        // 1. 格式错误（如 bytes=abc、bytes=-）：服务器应忽略 Range 头，返回 200 全文
+        // 2. 格式合法但范围不满足（如 bytes=1000- 但文件只有 500 字节）：返回 416 Range Not Satisfiable
+        // 通过重新校验格式区分两种情况，避免对格式错误的请求误返回 416
+        const formatValid = /^bytes=\d+-\d*$|^bytes=\d*-\d+$/.test(rangeHeader);
+        if (formatValid) {
+          // 格式合法但范围不满足：返回 416，并附带 Content-Range: bytes */size 告知实际大小
+          this.status(416);
+          this.setHeader('Content-Range', `bytes */${stat.size}`);
+          this.setHeader('Content-Length', 0);
+          this._send('');
+          doneOnce(null);
+          return;
+        }
+        // 格式错误：忽略 Range 头，继续走 200 全文流程（不 return）
       }
 
       this.setHeader('Content-Length', stat.size);
@@ -1171,9 +1219,12 @@ class Response {
     let url;
     if (typeof args[0] === 'number') {
       // redirect(status, url)
-      // 校验为有效的 3xx 重定向状态码，非法值回退 302（避免 Node 底层抛 RangeError）
+      // 严格白名单校验：仅 301/302/303/307/308 是真正的重定向状态码
+      // 300(Multiple Choices)/304(Not Modified)/305(已废弃)/306(未使用) 不是重定向语义
+      // 非白名单值回退 302，避免误用导致客户端行为异常
       const code = args[0];
-      this.status(code >= 300 && code < 400 ? code : 302);
+      const VALID_REDIRECT_CODES = [301, 302, 303, 307, 308];
+      this.status(VALID_REDIRECT_CODES.includes(code) ? code : 302);
       url = args[1];
     } else {
       // redirect(url) 默认 302
@@ -1204,6 +1255,10 @@ class Response {
    */
   sse() {
     if (this._sse) return this._sse;
+    // 同步 httpm Response 的 statusCode 到底层 ServerResponse
+    // 仅 _send/_sendFile 等输出方法会同步 statusCode，SSE 直接 writeHead 不会经过 _send
+    // 不同步会导致用户通过 res.status(201) 设置的状态码被 SSE 构造函数忽略（始终 200）
+    this._res.statusCode = this.statusCode || 200;
     // 传入底层 IncomingMessage（this._req._req）以便 SSE 监听 'aborted' 事件
     // ServerResponse 无 aborted 事件，必须监听 IncomingMessage
     const incomingMsg = this._req?._req;
@@ -1231,8 +1286,15 @@ class Response {
     if (opts.signed) {
       const secret = this._app && this._app.settings && this._app.settings.cookieParserSecret;
       if (secret) {
-        const sig = crypto.createHmac('sha256', secret).update(rawValue).digest('base64').replace(/=+$/, '');
+        // crypto.createHmac().update() 要求 string/Buffer/TypedArray 入参
+        // value 为 number/boolean/bigint 时 rawValue 是非字符串，update 会抛 TypeError
+        // 用 String() 转换确保安全传入 HMAC，且不改变签名语义（签名基于值的字符串表示）
+        const sig = crypto.createHmac('sha256', secret).update(String(rawValue)).digest('base64').replace(/=+$/, '');
         encodedValue = 's:' + encodedValue + '.' + sig;
+      } else {
+        // signed:true 但无 secret 配置时静默不签名，调用方可能误以为 cookie 已签名
+        // 安全敏感场景（如会话管理）下静默降级可能导致签名校验失效，记录 warn 日志提示
+        this._app?._logger?.warn('[Cookie] signed cookie requested but no secret configured (cookieParserSecret not set)');
       }
     }
     let str = `${encodeURIComponent(name)}=${encodedValue}`;
@@ -1254,7 +1316,8 @@ class Response {
     if (opts.sameSite) {
       // RFC 6265bis 规定 SameSite 值为 Strict/Lax/None 大小写敏感
       // 归一化为小写并仅接受白名单值，避免 'lax'/'NONE' 等非标准值被发送
-      const normalized = String(opts.sameSite).toLowerCase();
+      // Express 兼容：sameSite: true 等同于 'strict'（布尔值 true 是常见简写）
+      const normalized = opts.sameSite === true ? 'strict' : String(opts.sameSite).toLowerCase();
       if (['strict', 'lax', 'none'].includes(normalized)) {
         // SameSite=None 必须配合 Secure，否则浏览器会拒绝该 Cookie（Chrome 80+ 强制）
         // 此处仅记录警告日志，不强制阻断，保持调用方灵活性
@@ -1296,8 +1359,11 @@ class SSE {
     // 沿用 res 当前状态码（默认 200），避免覆盖用户主动设置的状态码
     // CORS 头由 _applyCORSHeaders 在 _handleRequest 中统一设置，此处不硬编码 ACAO
     // 避免覆盖用户的 cors.origin 配置（如 credentials=true 场景）
+    // 校验状态码：SSE 必须是 2xx 成功响应，204(No Content)/304(Not Modified) 等无实体状态码
+    // 会导致 writeHead 后 write 抛 ERR_STREAM_WRITE_AFTER_END 或客户端不读取实体
     if (!res.headersSent) {
-      res.writeHead(res.statusCode || 200, {
+      const code = (res.statusCode >= 200 && res.statusCode <= 299) ? res.statusCode : 200;
+      res.writeHead(code, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive'
@@ -1337,12 +1403,28 @@ class SSE {
   /**
    * 发送普通消息，自动兼容字符串/JSON 对象
    * SSE 规范：data 中含换行符时需拆成多行 data: 前缀，接收端用 \n 拼回
+   * 与 WebSocket.send 对齐：JSON.stringify 失败（循环引用/BigInt）时记录日志并跳过本次发送，
+   * 避免异常冒泡中断 SSE 处理器
    */
   send(data) {
     if (!this.connected) return this;
     // 防御：data 为 null/undefined 时 JSON.stringify 返回 undefined，split 会抛 TypeError
     // 转为 'null' 符合 JSON 语义（JSON.stringify(null) = 'null'）
-    const msg = data == null ? 'null' : (typeof data === 'string' ? data : JSON.stringify(data));
+    let msg;
+    if (data == null) {
+      msg = 'null';
+    } else if (typeof data === 'string') {
+      msg = data;
+    } else {
+      // 循环引用/BigInt 会抛 TypeError，与 WebSocket.send 行为对齐
+      try {
+        msg = JSON.stringify(data);
+      } catch (e) {
+        // 序列化失败：跳过本次发送，避免异常冒泡中断 SSE 处理器
+        // 不发送错误占位符，避免污染事件流（客户端无法区分业务消息与错误提示）
+        return this;
+      }
+    }
     // 按行拆分，每行加 data: 前缀，确保多行消息不破坏 SSE 协议
     const lines = msg.split('\n');
     this._write(lines.map(l => `data: ${l}`).join('\n') + '\n\n');
@@ -1352,12 +1434,25 @@ class SSE {
   /**
    * 发送自定义命名事件
    * event name 中含换行符属于协议违规，直接忽略该事件避免破坏流
+   * 与 WebSocket.send 对齐：JSON.stringify 失败（循环引用/BigInt）时跳过本次发送
    */
   event(name, data) {
     if (!this.connected) return this;
     if (typeof name !== 'string' || name.includes('\n')) return this;
     // 防御：data 为 null/undefined 时 JSON.stringify 返回 undefined，split 会抛 TypeError
-    const msg = data == null ? 'null' : (typeof data === 'string' ? data : JSON.stringify(data));
+    let msg;
+    if (data == null) {
+      msg = 'null';
+    } else if (typeof data === 'string') {
+      msg = data;
+    } else {
+      try {
+        msg = JSON.stringify(data);
+      } catch (e) {
+        // 序列化失败：跳过本次发送，避免异常冒泡
+        return this;
+      }
+    }
     const lines = msg.split('\n');
     this._write(`event: ${name}\n` + lines.map(l => `data: ${l}`).join('\n') + '\n\n');
     return this;
@@ -1562,6 +1657,9 @@ class WebSocket {
    * 处理解码后的帧，支持分片帧（continuation frame, opcode=0x00）
    */
   _processFrame(opcode, payload, fin, oversize, isMasked) {
+    // 已关闭连接：忽略后续帧，避免在 _closed 状态下处理数据触发异常
+    // 场景：socket close 事件触发后，缓冲区仍可能有未消费的帧数据
+    if (this._closed) return;
     // 超限帧：直接关闭连接
     if (oversize) {
       this.close(1009, 'Frame payload too large');
@@ -1596,7 +1694,9 @@ class WebSocket {
       if (payload.length >= 2) {
         code = payload.readUInt16BE(0);
         // RFC 6455 Section 7.4: 状态码 0-999 为非法，1005 表示无状态码
-        if (code < 1000) code = 1005;
+        // RFC 6455 Section 7.4.1: 1004/1005/1006/1015 为"不得在 Close 帧中发送"的保留码
+        // 对端违规发送这些码时，统一修正为 1005（无状态码语义），避免误导用户态
+        if (code < 1000 || code === 1004 || code === 1005 || code === 1006 || code === 1015) code = 1005;
         reason = payload.length > 2 ? payload.subarray(2).toString('utf8') : '';
       }
       // 如果正在关闭握手中，对端已回复 Close 帧，完成握手
@@ -1604,7 +1704,10 @@ class WebSocket {
         clearTimeout(this._closeTimer);
         this._closeTimer = null;
         try { this.socket.end(); } catch (e) { /* 忽略 */ }
-        this._emitClose(code, reason);
+        // 优先使用本地主动 close() 时传入的 code/reason，保证用户态事件参数可预测
+        // 场景：本地 ws.close(4000, 'custom')，对端回复 1000，用户期待收到 (4000, 'custom')
+        // 若对端先于本地发起 Close（_localCloseCode 为 undefined），则用对端值
+        this._emitClose(this._localCloseCode ?? code, this._localCloseReason ?? reason);
         return;
       }
       // 非关闭握手状态：回复 Close 帧后关闭 socket
@@ -1626,10 +1729,22 @@ class WebSocket {
       return;
     }
 
+    // RFC 6455 Section 5.2: opcode 0x03-0x07、0x0B-0x0F 为保留 opcode，未定义语义
+    // 收到保留 opcode 必须以 1002 协议错误关闭连接，避免恶意客户端探测服务端行为
+    // 此时已处理完所有合法控制帧（0x08/0x09/0x0A），剩余合法数据帧为 0x00/0x01/0x02
+    if (opcode !== 0x00 && opcode !== 0x01 && opcode !== 0x02) {
+      this.close(1002, 'Protocol error: reserved opcode');
+      return;
+    }
+
     // 数据帧：处理分片
     if (opcode === 0x00) {
       // 分片续帧：必须有前导帧
-      if (!this._fragmented) return;
+      // RFC 6455 Section 5.4: 收到续帧但无前导分片属于协议错误，应关闭连接(1002)
+      if (!this._fragmented) {
+        this.close(1002, 'Protocol error: continuation without fragment start');
+        return;
+      }
       // 累积分片总大小，超限时关闭连接（防止分片累积绕过单帧 maxPayload 检查）
       // 单个分片已通过 _decodeFrame 的 maxPayload 检查，但累积总量可能远超 maxPayload
       this._fragmentTotalSize += payload.length;
@@ -1789,9 +1904,19 @@ class WebSocket {
   close(code = 1000, reason = '') {
     // 防重复：已关闭或关闭握手中再次调用，避免发送多个 Close 帧
     if (this._closed || this._closing) return;
+    // RFC 6455 Section 7.4.1: 1005/1006/1015 状态码不得在 Close 帧中发送
+    // 1005 = 无状态码语义、1006 = 异常关闭语义、1015 = TLS 握手失败语义
+    // 这些码仅用于 close 事件传给用户态，不能在网络上发送
+    // 用户调用 ws.close(1005) 等时，发送侧传 undefined（不带状态码），事件侧仍保留原始 code
+    const sendCode = (code === 1005 || code === 1006 || code === 1015) ? undefined : code;
+    // 保存本地传入的 code/reason，用于关闭握手完成时 close 事件优先使用
+    // 场景：本地主动 close(4000, 'custom') 后对端回复 Close 帧，
+    // _emitClose 优先用本地值，保证用户态事件参数可预测（与 ws 库行为对齐）
+    this._localCloseCode = code;
+    this._localCloseReason = reason;
     // 重要：必须先发送 Close 帧再设 connected=false
     // _sendFrame 内部检查 this.connected，若先断开则 Close 帧无法发出
-    this._sendCloseFrame(code, reason);
+    this._sendCloseFrame(sendCode, reason);
     // 标记为关闭中，拒绝后续数据帧发送和 _sendFrame 写入
     this.connected = false;
     this._closing = true;
@@ -2174,8 +2299,11 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
   const tempDir = req._app?.settings?.tempDir || 'tempupdir';
   const delimiter = Buffer.from('--' + boundary);
   const endDelimiter = Buffer.from('--' + boundary + '--');
-  // 回看长度：分隔符最大可能被截断的字节数
-  const lookBehind = delimiter.length - 1;
+  // 回看长度：multipart 文件数据结尾为 [文件数据]\r\n--boundary
+  // 需保留 \r\n 前缀以应对跨 chunk 分隔点落在 \r 之后的情况
+  // 否则 \r 会被写入文件，破坏二进制文件完整性（图片/视频等末尾多出 \r\n）
+  // ('\r\n' + delimiter).length - 1 = delimiter.length + 1
+  const lookBehind = delimiter.length + 1;
   let state = 'INIT'; // INIT, HEADERS, BODY_FIELD, BODY_FILE
   let partHeadersBuf = Buffer.alloc(0);
   let currentField = { name: '', value: '', decoder: null };
@@ -2583,9 +2711,13 @@ class Application extends Router {
 
   /**
    * 启动网络服务，监听端口
+   * @param {number} [port] 监听端口，省略时使用 settings.svrPort；0 表示由操作系统随机分配
+   * @param {Function} [callback] 启动成功回调，签名 (err) => void
    */
   listen(port, callback) {
-    const listenPort = port || this.settings.svrPort;
+    // 注意：port=0 是 Node.js 约定的"随机端口"语义（falsy），不能用 || 短路
+    // 否则 listen(0) 会回退到 svrPort（默认 80），非 root 用户监听 80 会 EACCES 失败
+    const listenPort = (port !== undefined && port !== null) ? port : this.settings.svrPort;
     const ip = this.settings.svrIP;
 
     // 创建服务器
@@ -2662,6 +2794,15 @@ class Application extends Router {
       }
       this._wss._stopHeartbeat();
     }
+    // 统一的清理函数：释放 Logger 写入流，避免文件描述符泄漏
+    // Windows 上 stream.end() 是异步的，destroy() 立即释放句柄
+    // 放在 server.close 回调中执行，确保关闭过程中的日志仍能正常写入
+    const cleanupLogger = () => {
+      if (this._logger && this._logger._stream) {
+        try { this._logger._stream.destroy(); } catch (e) { /* 忽略销毁错误 */ }
+        this._logger._stream = null;
+      }
+    };
     if (this.server) {
       // 强制关闭所有现有 HTTP 连接（含 keep-alive 空闲连接），
       // 避免 server.close() 等待 keepAliveTimeout 导致关闭延迟（Node.js 18.2+）
@@ -2675,14 +2816,17 @@ class Application extends Router {
         if (called) return;
         called = true;
         clearTimeout(timer);
+        cleanupLogger();
         if (callback) callback();
       };
       this.server.close(done);
       const timer = setTimeout(done, 2000);
       // unref 防止 timer 阻止进程退出（测试场景下 app.close 后进程应能正常退出）
       if (typeof timer.unref === 'function') timer.unref();
-    } else if (callback) {
-      callback();
+    } else {
+      // 无 server 实例（如未调用 listen）：直接清理 Logger 并回调
+      cleanupLogger();
+      if (callback) callback();
     }
   }
 
@@ -2886,7 +3030,16 @@ class Application extends Router {
       }
     }
     // 没有错误处理中间件，使用默认错误响应
-    const status = err.status || 500;
+    // 校验 err.status 为有效 HTTP 状态码（100-599 整数），避免非数字/越界值导致协议违规
+    // 常见错误：err.status = '500'（字符串）、err.status = 999（越界）、err.status = 'InternalServerError'
+    let status = err.status;
+    if (!Number.isInteger(status) || status < 100 || status > 599) {
+      // 兼容 err.statusCode（部分库使用该字段，如 http-errors）
+      status = err.statusCode;
+      if (!Number.isInteger(status) || status < 100 || status > 599) {
+        status = 500;
+      }
+    }
     const msg = err.message || 'Internal Server Error';
     this._logger.error(`[${status}] ${req.method} ${req.path} - ${msg}`);
     if (!res.headersSent) {
@@ -3057,8 +3210,9 @@ class Application extends Router {
         fs.stat(indexPath, (idxErr) => {
           if (!idxErr) {
             // 传递错误回调，与 staticMiddleware 保持一致，避免 sendFile 异常冒泡
+            // 传入完整 middlewareStack 而非空数组，确保用户注册的错误处理中间件能被正确调用
             res.sendFile(path.relative(rootPath, indexPath), { root: rootPath }, (err) => {
-              if (err) this._handleError(err, req, res, [], 0);
+              if (err) this._handleError(err, req, res, this.middlewareStack, 0);
             });
             return;
           }
@@ -3073,8 +3227,9 @@ class Application extends Router {
       }
 
       // 文件：发送（传递错误回调，与 staticMiddleware 保持一致）
+      // 传入完整 middlewareStack 而非空数组，确保用户注册的错误处理中间件能被正确调用
       res.sendFile(requestPath, { root: rootPath }, (err) => {
-        if (err) this._handleError(err, req, res, [], 0);
+        if (err) this._handleError(err, req, res, this.middlewareStack, 0);
       });
     });
   }
@@ -3256,6 +3411,13 @@ class Application extends Router {
         // 立即从连接池移除，避免依赖 close 事件异步清理的短暂内存占用
         this._wss._removeConnection(ws);
       }
+    } else {
+      // _wsHandlers 为空（未调用过 app.ws()）或为空数组时，handleUpgrade 已建立 WebSocket 连接
+      // 但无处理器可执行，连接会成为孤儿连接直到心跳超时或客户端断开，造成资源泄漏
+      // 显式关闭并从连接池移除，与"无匹配路由"分支行为一致
+      this._logger.warn(`No ws handler registered for: ${parsed.pathname}`);
+      ws.close(1000, 'No handler');
+      this._wss._removeConnection(ws);
     }
   }
 
@@ -3495,7 +3657,7 @@ httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
 httpm.WebSocketHandShak = WebSocketHandShak;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.5.0';
+httpm.version = '1.5.1';
 
 /**
  * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）

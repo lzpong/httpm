@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.5.0
+**文档版本**：V1.5.1
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -949,7 +949,7 @@ app.sse('/events', (sse, req) => {
 ```json
 {
   "name": "@lzpong/httpm",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
   "engines": { "node": ">=18.0.0" },
