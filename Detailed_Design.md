@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.5.1
+**文档版本**：V1.5.3
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -303,13 +303,13 @@ class Request {
 | removeHeader(name) | 移除已设置的响应头 |
 | status(code) | 设置 HTTP 状态码，支持链式调用 |
 | json(data) | 输出 JSON 格式响应，自动补充对应 Content-Type |
-| send(data) | 通用输出，支持字符串、HTML、Buffer、对象；`null` 序列化为 `"null"`（Express 兼容），`undefined` 返回空响应 |
+| send(data) | 通用输出，支持字符串、HTML、Buffer、对象；`null` 返回空响应（Express 4.x 兼容），`undefined` 返回空响应 |
 | sendFile(path, options, [callback]) | 发送本地文件，内置断点续传、缓存、Gzip 能力；options 支持 `{ root, contentType }`；callback(err) 在完成/出错时调用 |
 | download(path, [filename], [options]) | 触发浏览器文件下载，支持断点续传；兼容 Express 签名，options 传递给 sendFile |
 | redirect([code,] url) | 重定向响应，兼容 Express 签名：`redirect(url)` 默认 302，`redirect(status, url)` 指定状态码；url 为 null/undefined 时回退到 '/'（避免 encodeURI(undefined)='undefined'）；url='back' 时取 Referer 头回退到上一页 |
 | location(url) | 设置 Location 响应头（不发送响应，常与 send 配合） |
 | sse() | 创建 SSE 推送实例 |
-| cookie(name, value, opts) | 设置响应 Cookie；opts 支持 `maxAge`（秒，写入 Max-Age）、`expires`（Date 对象，写入 Expires）、`domain`、`path`、`secure`、`httpOnly`、`sameSite`、`signed`；对象 value 自动 JSON 序列化，signed 启用 HMAC-SHA256 签名（`s:` 前缀）；value 为 null/undefined 时回退空字符串（避免 encodeURIComponent(undefined)='undefined'） |
+| cookie(name, value, opts) | 设置响应 Cookie；opts 支持 `maxAge`（**单位秒，与 Express 毫秒不同**，写入 Max-Age）、`expires`（Date 对象，写入 Expires）、`domain`、`path`、`secure`、`httpOnly`、`sameSite`、`signed`；对象 value 自动 JSON 序列化，signed 启用 HMAC-SHA256 签名（`s:` 前缀）；value 为 null/undefined 时回退空字符串（避免 encodeURIComponent(undefined)='undefined'） |
 | append(field, value) | 追加响应头值（不覆盖已有值，适用于 Set-Cookie 等多值头） |
 | locals | 请求级数据传递对象（中间件间共享数据），初始为 `Object.create(null)` |
 
@@ -399,9 +399,9 @@ SSE 监听两类断开事件以兼容 HTTP/1.1 与 HTTP/2：
 7. `close` 事件参数来源（RFC 6455 合规）：主动调用 `ws.close(code, reason)` 后，`close` 事件携带的 code/reason 按以下优先级确定：
    - **对端回复 Close 帧** → 使用**对端** Close 帧中的 code/reason（RFC 6455 规定 close 事件应反映连接实际关闭状况）；
    - **2 秒超时未收到对端 Close 帧** → 使用本地 `close()` 传入的 code/reason；
-   - **socket 异常断开（未走握手）** → socket `close` 事件触发，code/reason 为 undefined。
+   - **socket 异常断开（未走握手）** → socket `close` 事件触发，code 为 1006（RFC 6455 规定的"异常关闭"语义码，仅用于 close 事件，不得在 Close 帧中发送）。
    
-   业务方监听 `close` 事件时应处理 code 为 undefined 的情况（socket 异常断开场景）。
+   业务方监听 `close` 事件时，code=1006 表示异常断开（非正常关闭握手）。
 8. RFC 6455 协议校验：客户端帧必须掩码（未掩码帧按协议错误关闭连接）；控制帧（Close/Ping/Pong）负载不得超过 125 字节且不可分片（FIN 必须为 1），违反时以 1002 关闭连接；
 9. 帧负载长度超过 `Number.MAX_SAFE_INTEGER` 时视为超限帧，拒绝处理；`maxPayload` 超限检查在掩码解析前执行，防止慢速大帧攻击（客户端声明大 `payloadLength` 但慢速发送，若等数据完整再拒绝缓冲区会持续增长，防护失效），超限时立即 `close(1009)`；
 10. 支持分片帧解析（continuation frame），多帧消息自动合并后触发事件；分片累积总大小通过 `_fragmentTotalSize` 累积器校验，超过 `maxPayload` 时清理分片状态并 `close(1009)`，防止攻击者用大量小分片（每个 < `maxPayload`）累积成巨大消息绕过单帧检查；
@@ -412,9 +412,9 @@ SSE 监听两类断开事件以兼容 HTTP/1.1 与 HTTP/2：
 
 全局 WebSocket 服务管理类，统一管理所有长连接：
 
-1. 连接分组：按请求路径对连接分组，支持按路径广播消息；
+1. 连接分组：按请求的**原始路径**对连接分组（静态分组），如 `/chat/room1` 和 `/chat/room2` 是不同分组；
 2. 统一心跳：全局唯一心跳定时器，有连接则启动，无连接则停止，减少资源占用；
-3. 广播能力：支持**按路径广播**、**全局广播**，支持排除指定连接；
+3. 广播能力：支持**按路径广播**（层级广播）、**全局广播**，支持排除指定连接（单个ws或ws数组）；层级广播规则：`broadcast('/chat')` 匹配 `/chat` 及所有 `/chat/*` 子路径（前缀匹配 `key === pathStr || key.startsWith(pathStr + '/')`），`broadcast('/chat')` 不会误匹配 `/chatone`；`getConnections` 同理支持层级查询；
 4. 连接管理：新增 / 销毁连接时自动维护连接列表；
 5. Origin 校验：支持 `allowedOrigins` 配置，防止跨站 WebSocket 劫持（CSWSH）；
 6. 帧负载限制：支持 `maxPayload` 配置（默认 100MB），同时校验单帧负载和分片累积总大小，防止恶意超大帧和分片累积绕过攻击耗尽内存。
@@ -577,7 +577,7 @@ const defaultConfig = {
   exitOnDiskFull: false,             // 日志写入失败时是否退出进程（false=仅控制台打印，true=退出）
 
   // 跨域配置
-  cors: { origin: '*', headers: 'Content-Type, Authorization', maxAge: 86400 },
+  cors: { origin: '*', headers: 'Content-Type, Authorization', maxAge: 86400, credentials: false },
 
   // 内置中间件开关
   useBodyParser: true,
@@ -813,9 +813,9 @@ httpm.fmtTime = fmtTime;
 httpm.isPathSafe = isPathSafe;
 httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
-httpm.WebSocketHandShak = WebSocketHandShak;
+httpm.WebSocketHandshake = WebSocketHandshake;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.4.7';
+httpm.version = 'X.Y.Z'; // X.Y.Z 为实际版本号
 
 module.exports = httpm;
 ```
@@ -949,7 +949,7 @@ app.sse('/events', (sse, req) => {
 ```json
 {
   "name": "@lzpong/httpm",
-  "version": "1.5.1",
+  "version": "X.Y.Z", // X.Y.Z 为实际版本号
   "main": "httpm.js",
   "keywords": ["http", "server", "websocket", "sse", "middleware", "single-file"],
   "engines": { "node": ">=18.0.0" },

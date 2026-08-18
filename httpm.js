@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.5.2
+ * @version     1.5.3
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -15,10 +15,11 @@
  *   - 单文件架构，零第三方依赖
  *   - Express 兼容：路由、中间件、请求/响应 API
  *   - 静态文件服务：Range 断点续传、ETag/Last-Modified 缓存、Gzip 压缩
- *   - WebSocket：路径分组、心跳保活、广播、文本/二进制子事件
+ *   - WebSocket：路径分组、心跳保活、广播、文本/二进制子事件、动态参数路由
  *   - SSE：服务端推送事件，支持 event/data/retry/comment
  *   - 流式文件上传：multipart/form-data 解析，内存零占用
  *   - 日志系统：彩色控制台输出 + 文件持久化，按级别过滤
+ *   - CORS：内置跨域支持，预检缓存、凭证、自定义头
  *   - Cookie 签名：HMAC-SHA256 签名与验证
  *   - 配置管理：默认配置 → app.json → 代码参数 → 运行时 app.set()
  */
@@ -38,6 +39,8 @@ const { StringDecoder } = require('string_decoder');
 // ============================================================
 // 工具函数层
 // ============================================================
+
+const _EMPTY_ARRAY = Object.freeze([]);
 
 /**
  * 解析 URL，拆分路径与 Query 参数
@@ -2130,13 +2133,19 @@ class WebSocketServer {
   }
 
   /**
-   * 按路径广播消息
+   * 按路径广播消息（支持层级广播）
+   * 精确匹配：broadcast('/chat/room1') → 仅发送 /chat/room1 组的连接
+   * 层级广播：broadcast('/chat') → 发送 /chat 及所有 /chat/* 子路径的连接
+   * 前缀匹配规则：key === pathStr || key.startsWith(pathStr + '/')
+   * 避免误匹配：broadcast('/chat') 不会匹配 /chatone（因为 /chatone 不以 /chat/ 开头）
+   * @param {string} pathStr 广播路径
+   * @param {*} data 广播数据
+   * @param {WebSocket|WebSocket[]|null} exclude 排除的连接，支持单个ws或ws数组
    */
   broadcast(pathStr, data, exclude = null) {
-    const group = this.groups.get(pathStr);
-    if (!group) return;
-    for (const ws of group) {
-      if (ws.connected && ws !== exclude) {
+    const excluded = Array.isArray(exclude) ? exclude : exclude ? [exclude] : _EMPTY_ARRAY;
+    for (const ws of this.getConnections(pathStr)) {
+      if (ws.connected && !excluded.includes(ws)) {
         ws.send(data);
       }
     }
@@ -2144,24 +2153,37 @@ class WebSocketServer {
 
   /**
    * 全局广播消息
+   * @param {*} data 广播数据
+   * @param {WebSocket|WebSocket[]|null} exclude 排除的连接，支持单个ws或ws数组
    */
   broadcastAll(data, exclude = null) {
+    const excluded = Array.isArray(exclude) ? exclude : exclude ? [exclude] : _EMPTY_ARRAY;
     for (const ws of this.connections.values()) {
-      if (ws.connected && ws !== exclude) {
+      if (ws.connected && !excluded.includes(ws)) {
         ws.send(data);
       }
     }
   }
 
   /**
-   * 获取指定路径的所有连接
+   * 获取指定路径的所有连接（支持层级查询）
    * 返回数组快照拷贝（Array.from），修改返回值不影响内部连接池状态
    * @param {string} [pathStr] - 指定路径；不传则返回所有连接
+   *   精确匹配 + 层级匹配：getConnections('/chat') 返回 /chat 及 /chat/* 子路径的所有连接
    * @returns {WebSocket[]} 连接数组快照（拷贝）
    */
   getConnections(pathStr) {
     if (pathStr) {
-      return Array.from(this.groups.get(pathStr) || []);
+      const result = [];
+      const group = this.groups.get(pathStr);
+      if (group) result.push(...group);
+      const prefix = pathStr + '/';
+      for (const [key, grp] of this.groups) {
+        if (key.startsWith(prefix)) {
+          result.push(...grp);
+        }
+      }
+      return result;
     }
     return Array.from(this.connections.values());
   }
@@ -3662,7 +3684,7 @@ httpm.WebSocketHandshake = WebSocketHandshake;
 // 旧名保留，向后兼容（deprecated）
 httpm.WebSocketHandShak = WebSocketHandshake;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.5.2';
+httpm.version = '1.5.3';
 
 
 module.exports = httpm;

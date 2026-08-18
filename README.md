@@ -246,16 +246,23 @@ app.ws('/chat', (ws, req) => {
 app.ws('/chat/:room', (ws, req) => {
   console.log('Room:', req.params.room);
   ws.send(`Welcome to room ${req.params.room}!`);
+  // 分组按原始路径（如 /chat/room1），广播时需传实际路径
+  app.wss.broadcast('/chat/room1', msg, ws);
 });
 ```
 
 ### WebSocketServer API
 
 ```javascript
-app.wss.broadcast('/chat', 'Hello everyone');       // 按路径分组广播
-app.wss.broadcast('/chat', 'Hello', ws);            // 排除指定连接（传 ws 对象）
+app.wss.broadcast('/chat', 'Hello everyone');       // 层级广播：发送 /chat 及 /chat/* 子路径的所有连接
+app.wss.broadcast('/chat/room1', 'Hello');          // 精确广播：仅发送 /chat/room1 组的连接
+app.wss.broadcast('/chat', 'Hello', ws);            // 排除指定连接（传 ws 对象或 ws 数组）
 app.wss.broadcastAll('Hello everyone');              // 全局广播
 app.wss.getConnections();                            // 获取所有连接
+app.wss.getConnections('/chat');                     // 获取 /chat 及 /chat/* 子路径的所有连接
+```
+
+> **层级广播**：`broadcast` 和 `getConnections` 支持层级匹配，传入父路径会匹配自身及所有子路径。前缀匹配规则：`key === pathStr || key.startsWith(pathStr + '/')`，如 `broadcast('/chat')` 匹配 `/chat`、`/chat/room1`、`/chat/room2`，但不会误匹配 `/chatone`。
 ```
 
 ### WebSocket 事件

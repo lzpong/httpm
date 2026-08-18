@@ -2715,6 +2715,106 @@ async function runTests() {
     }
   }
 
+  // --- 验证：WebSocket 层级广播 ---
+  // broadcast('/chat') 应匹配 /chat 及 /chat/* 子路径，不误匹配 /chatone
+  {
+    const PORT9 = PORT + 8;
+    const app9 = httpm({
+      svrPort: PORT9,
+      logLevel: 'error'
+    });
+    // 注册多个 WebSocket 路径，模拟层级分组
+    app9.ws('/ws-hier/room1', (ws, req) => {
+      ws.on('text', (msg) => { ws.send('room1:' + msg); });
+    });
+    app9.ws('/ws-hier/room2', (ws, req) => {
+      ws.on('text', (msg) => { ws.send('room2:' + msg); });
+    });
+    app9.ws('/ws-hier/room1/vip', (ws, req) => {
+      ws.on('text', (msg) => { ws.send('vip:' + msg); });
+    });
+    app9.ws('/ws-hierone', (ws, req) => {
+      ws.on('text', (msg) => { ws.send('other:' + msg); });
+    });
+    const server9 = app9.listen(PORT9);
+    await new Promise(r => setTimeout(r, 300));
+
+    try {
+      // 连接 /ws-hier/room1
+      const s1 = await wsConnect('ws://localhost:' + PORT9 + '/ws-hier/room1');
+      // 连接 /ws-hier/room2
+      const s2 = await wsConnect('ws://localhost:' + PORT9 + '/ws-hier/room2');
+      // 连接 /ws-hierone（不应被层级广播匹配）
+      const s3 = await wsConnect('ws://localhost:' + PORT9 + '/ws-hierone');
+
+      // getConnections 层级查询
+      const hierConns = app9.wss.getConnections('/ws-hier');
+      const room1Conns = app9.wss.getConnections('/ws-hier/room1');
+      const otherConns = app9.wss.getConnections('/ws-hierone');
+      assert(hierConns.length >= 2, 'HTTP - WS 层级 getConnections("/ws-hier") 包含子路径连接');
+      assert(room1Conns.length >= 1, 'HTTP - WS 精确 getConnections("/ws-hier/room1")');
+      assert(otherConns.length >= 1, 'HTTP - WS 精确 getConnections("/ws-hierone")');
+      // 层级查询不应包含 /ws-hierone 的连接
+      const hierPaths = hierConns.map(ws => ws.path);
+      assert(!hierPaths.includes('/ws-hierone'), 'HTTP - WS 层级查询不误匹配 /ws-hierone');
+
+      // broadcast 层级广播
+      // 给 /ws-hier/room1 发送消息，验证精确广播
+      app9.wss.broadcast('/ws-hier/room1', 'exact');
+      const r1 = await wsReadText(s1.socket);
+      assert(r1 === 'exact', 'HTTP - WS 精确广播 /ws-hier/room1');
+
+      // 给 /ws-hier 层级广播，room1 和 room2 都应收到
+      app9.wss.broadcast('/ws-hier', 'hier');
+      const r2a = await wsReadText(s1.socket);
+      const r2b = await wsReadText(s2.socket);
+      assert(r2a === 'hier', 'HTTP - WS 层级广播 room1 收到');
+      assert(r2b === 'hier', 'HTTP - WS 层级广播 room2 收到');
+
+      // /ws-hierone 不应收到 /ws-hier 的层级广播
+      // 验证方法：发送层级广播后 s3 不应收到消息（设置短超时）
+      let s3Received = false;
+      s3.socket.setTimeout(300);
+      try {
+        await wsReadText(s3.socket);
+        s3Received = true;
+      } catch (e) {
+        // 超时说明没收到，符合预期
+      }
+      assert(!s3Received, 'HTTP - WS 层级广播不误匹配 /ws-hierone');
+
+      // broadcast exclude 数组：排除多个连接
+      // exclude 需要传服务端 ws 对象，通过 getConnections 获取
+      const hierWsList = app9.wss.getConnections('/ws-hier');
+      const ws1 = hierWsList.find(w => w.path === '/ws-hier/room1');
+      const ws2 = hierWsList.find(w => w.path === '/ws-hier/room2');
+      app9.wss.broadcast('/ws-hier', 'exclude-array', [ws1, ws2]);
+      // ws1 和 ws2 被排除，s1 和 s2 不应收到
+      let s1Excluded = false;
+      s1.socket.setTimeout(300);
+      try {
+        await wsReadText(s1.socket);
+        s1Excluded = true;
+      } catch (e) { /* 超时说明被排除，符合预期 */ }
+      assert(!s1Excluded, 'HTTP - WS broadcast exclude数组 s1被排除');
+
+      // broadcastAll exclude 数组
+      app9.wss.broadcastAll('all-exclude-array', [ws1]);
+      // ws1 被排除，s2 应收到
+      const rAll = await wsReadText(s2.socket);
+      assert(rAll === 'all-exclude-array', 'HTTP - WS broadcastAll exclude数组 s2收到');
+
+      s1.socket.destroy();
+      s2.socket.destroy();
+      s3.socket.destroy();
+    } catch (e) {
+      assertSkip('HTTP - WS 层级广播测试', e.message);
+    } finally {
+      await new Promise(r => server9.close(r));
+      await closeLoggerStream(app9._logger);
+    }
+  }
+
   // --- P2-1/P2-2 验证：res.append / res.type null 参数不抛异常 ---
   // res.append(null, 'val') 和 res.type(null/undefined) 应静默返回 this，不抛 TypeError
   {
