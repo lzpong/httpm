@@ -522,22 +522,25 @@ async function runTests() {
   }
 
   // ============================================================
-  // 1c. WebSocketHandShak 工具函数 - 正向测试
+  // 1c. WebSocketHandshake 工具函数 - 正向测试
   // ============================================================
-  section('WebSocketHandShak');
+  section('WebSocketHandshake');
 
   {
     // 正向：已知 key 的 accept 值
-    const accept = httpm.WebSocketHandShak('dGhlIHNhbXBsZSBub25jZQ==');
-    assert(accept === 's3pPLMBiTxaQ9kYGzzhZRbK+xOo=', 'WebSocketHandShak - RFC 6455 example');
+    const accept = httpm.WebSocketHandshake('dGhlIHNhbXBsZSBub25jZQ==');
+    assert(accept === 's3pPLMBiTxaQ9kYGzzhZRbK+xOo=', 'WebSocketHandshake - RFC 6455 example');
 
     // 正向：函数存在性
-    assert(typeof httpm.WebSocketHandShak === 'function', 'WebSocketHandShak - is function');
+    assert(typeof httpm.WebSocketHandshake === 'function', 'WebSocketHandshake - is function');
 
     // 正向：返回字符串
-    const accept2 = httpm.WebSocketHandShak('testkey123');
-    assert(typeof accept2 === 'string', 'WebSocketHandShak - returns string');
-    assert(accept2.length > 0, 'WebSocketHandShak - non-empty result');
+    const accept2 = httpm.WebSocketHandshake('testkey123');
+    assert(typeof accept2 === 'string', 'WebSocketHandshake - returns string');
+    assert(accept2.length > 0, 'WebSocketHandshake - non-empty result');
+
+    // 向后兼容：旧名 WebSocketHandShak 仍可用
+    assert(httpm.WebSocketHandShak === httpm.WebSocketHandshake, 'WebSocketHandShak - backward compat alias');
   }
 
   // ============================================================

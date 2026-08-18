@@ -136,12 +136,12 @@ app.use((err, req, res, next) => {
 |------|------|
 | `res.status(code)` | 设置状态码，链式调用 |
 | `res.json(obj)` | 发送 JSON 响应 |
-| `res.send(data)` | 发送响应（自动识别类型；`null`→`"null"`，`undefined`→空响应） |
+| `res.send(data)` | 发送响应（自动识别类型；`null`→空响应，`undefined`→空响应） |
 | `res.sendFile(path, opts, [callback])` | 发送文件，opts 支持 `{ root, contentType }`；callback(err) 在完成/出错时调用 |
 | `res.download(path, [name], [opts])` | 下载文件，兼容 Express 签名：opts 传递给 sendFile |
 | `res.redirect([code,] url)` | 重定向，兼容 Express 签名：`redirect(url)` 默认 302，`redirect(status, url)` 指定状态码；url='back' 时取 Referer 回退到上一页 |
 | `res.location(url)` | 设置 Location 响应头（不发送响应，常与 send 配合） |
-| `res.cookie(name, value, opts)` | 设置 Cookie，opts 支持 `maxAge`（单位秒，直接写入 Max-Age）、`expires`（Date 对象）、`domain`、`path`、`secure`、`httpOnly`、`sameSite`、`signed`；`sameSite=None` 需配 `secure`，否则记录警告 |
+| `res.cookie(name, value, opts)` | 设置 Cookie，opts 支持 `maxAge`（**单位秒，与 Express 毫秒不同**）、`expires`（Date 对象）、`domain`、`path`、`secure`、`httpOnly`、`sameSite`、`signed`；`sameSite=None` 需配 `secure`，否则记录警告 |
 | `res.clearCookie(name, opts)` | 清除 Cookie，同时设置 `maxAge=0` 和 `expires=epoch`（1970-01-01），兼容不支持 Max-Age 的旧浏览器 |
 | `res.set(name, value)` / `res.setHeader()` | 设置响应头（set 支持对象批量；setHeader 为底层方法，功能相同） |
 | `res.get(name)` / `res.getHeader()` | 获取响应头（get 为 Express 兼容方法，功能相同） |
@@ -265,7 +265,7 @@ app.wss.getConnections();                            // 获取所有连接
 | `data` | 接收消息（`{ type: 'text'/'binary', data }`） |
 | `text` | 接收文本消息 |
 | `binary` | 接收二进制消息 |
-| `close` | 连接关闭，回调参数 `(code, reason)` |
+| `close` | 连接关闭，回调参数 `(code, reason)`；socket 异常断开时 code 为 `1006`（RFC 6455 Abnormal Closure） |
 | `error` | 连接错误 |
 
 ### WebSocket 方法
@@ -483,7 +483,7 @@ httpm.isPathSafe
 httpm.generateETag
 httpm.parseRange
 httpm.escapeHtml
-httpm.WebSocketHandShak
+httpm.WebSocketHandshake
 ```
 
 ## 运行要求

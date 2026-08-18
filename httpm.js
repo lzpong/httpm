@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.5.1
+ * @version     1.5.2
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -53,13 +53,13 @@ function parseUrl(urlStr) {
   if (qIdx === -1) {
     return { pathname: urlStr, query: {} };
   }
-  return { pathname: urlStr.substring(0, qIdx), query: _parseQueryString(urlStr.substring(qIdx + 1)) };
+  return { pathname: urlStr.substring(0, qIdx), query: parseQuery(urlStr.substring(qIdx + 1)) };
 }
 
 /**
  * 解析查询字符串为键值对象
  */
-function _parseQueryString(qs, plusAsSpace = false) {
+function parseQuery(qs, plusAsSpace = false) {
   const query = {};
   if (!qs) return query;
   qs.split('&').forEach(pair => {
@@ -1561,9 +1561,11 @@ class WebSocket {
     });
 
     // 监听连接关闭
+    // socket 异常断开（未走 WebSocket Close 帧握手）时，_emitClose 无参数
+    // 按 RFC 6455 Section 7.4.1，异常关闭应使用 1006 状态码（仅用于 close 事件，不得在 Close 帧中发送）
     socket.on('close', () => {
       this.connected = false;
-      this._emitClose();
+      this._emitClose(1006, '');
     });
 
     // 监听数据帧
@@ -1973,7 +1975,7 @@ class WebSocket {
 /**
  * WebSocket 握手辅助函数：计算 Sec-WebSocket-Accept 值
  */
-function WebSocketHandShak(key) {
+function WebSocketHandshake(key) {
   return crypto.createHash('sha1')
     .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
     .digest('base64');
@@ -2016,7 +2018,7 @@ class WebSocketServer {
       }
     }
 
-    const accept = WebSocketHandShak(key);
+    const accept = WebSocketHandshake(key);
 
     // 发送握手响应
     const responseHeaders = [
@@ -2276,7 +2278,7 @@ function _parseUrlencoded(req, maxSize, next) {
       next(err);
       return;
     }
-    const parsed = _parseQueryString(buf.toString('utf8'), true);
+    const parsed = parseQuery(buf.toString('utf8'), true);
     req.body = parsed;
     Object.assign(req.formData.fields, parsed);
     next();
@@ -3525,7 +3527,7 @@ const defaultConfig = {
   // 注：配置项名取最常见场景（磁盘满 disk full），实际任何写入错误都会触发退出
   exitOnDiskFull: false,
 
-  cors: { origin: '*', headers: 'Content-Type, Authorization', maxAge: 86400 },
+  cors: { origin: '*', headers: 'Content-Type, Authorization', maxAge: 86400, credentials: false },
 
   useBodyParser: true,
   useCookieParser: true,
@@ -3650,21 +3652,17 @@ httpm.static = staticMiddleware;
 httpm.parseUrl = parseUrl;
 httpm.parseCookies = parseCookies;
 httpm.getMimeType = getMimeType;
+httpm.parseQuery = parseQuery;
 httpm.fmtSize = fmtSize;
 httpm.fmtTime = fmtTime;
 httpm.isPathSafe = isPathSafe;
 httpm.generateETag = generateETag;
 httpm.parseRange = parseRange;
-httpm.WebSocketHandShak = WebSocketHandShak;
+httpm.WebSocketHandshake = WebSocketHandshake;
+// 旧名保留，向后兼容（deprecated）
+httpm.WebSocketHandShak = WebSocketHandshake;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.5.1';
+httpm.version = '1.5.2';
 
-/**
- * parseQuery：独立导出的 Query 解析函数（复用内部 _parseQueryString）
- */
-function parseQuery(qs) {
-  return _parseQueryString(qs);
-}
-httpm.parseQuery = parseQuery;
 
 module.exports = httpm;
