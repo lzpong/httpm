@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.5.3
+ * @version     1.5.4
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -40,7 +40,7 @@ const { StringDecoder } = require('string_decoder');
 // 工具函数层
 // ============================================================
 
-const _EMPTY_ARRAY = Object.freeze([]);
+
 
 /**
  * 解析 URL，拆分路径与 Query 参数
@@ -2010,9 +2010,11 @@ class WebSocketServer {
     }
 
     // Origin 校验（防止跨站 WebSocket 劫持 CSWSH）
+    // RFC 6455: 同源请求（如浏览器同页面发起的 ws 连接）不发送 Origin 头，不应拒绝
+    // 仅当客户端携带 Origin 头且不在白名单中时才拒绝
     if (this._allowedOrigins) {
       const origin = req.headers['origin'];
-      if (!origin || !this._allowedOrigins.includes(origin)) {
+      if (origin && !this._allowedOrigins.includes(origin)) {
         // 用 socket.end 替代 write+destroy：end 会在数据刷出后自动关闭 socket，
         // 避免 destroy 立即关闭导致客户端收不到 403 响应
         // socket 已关闭/已销毁时 end 可能抛 ERR_STREAM_WRITE_AFTER_END，需 try/catch
@@ -2107,9 +2109,9 @@ class WebSocketServer {
           continue;
         }
         // 检查心跳超时
+        // ws.close() 异步触发 close 事件 → _removeConnection，无需再 push toRemove
         if (now - ws._lastHeartbeat > this._heartbeatInterval + this._heartbeatTimeout) {
           ws.close();
-          toRemove.push(ws);
           continue;
         }
         ws._sendPing();
@@ -2143,9 +2145,9 @@ class WebSocketServer {
    * @param {WebSocket|WebSocket[]|null} exclude 排除的连接，支持单个ws或ws数组
    */
   broadcast(pathStr, data, exclude = null) {
-    const excluded = Array.isArray(exclude) ? exclude : exclude ? [exclude] : _EMPTY_ARRAY;
+    const excluded = Array.isArray(exclude) ? new Set(exclude) : exclude ? new Set([exclude]) : null;
     for (const ws of this.getConnections(pathStr)) {
-      if (ws.connected && !excluded.includes(ws)) {
+      if (ws.connected && (!excluded || !excluded.has(ws))) {
         ws.send(data);
       }
     }
@@ -2157,9 +2159,9 @@ class WebSocketServer {
    * @param {WebSocket|WebSocket[]|null} exclude 排除的连接，支持单个ws或ws数组
    */
   broadcastAll(data, exclude = null) {
-    const excluded = Array.isArray(exclude) ? exclude : exclude ? [exclude] : _EMPTY_ARRAY;
+    const excluded = Array.isArray(exclude) ? new Set(exclude) : exclude ? new Set([exclude]) : null;
     for (const ws of this.connections.values()) {
-      if (ws.connected && !excluded.includes(ws)) {
+      if (ws.connected && (!excluded || !excluded.has(ws))) {
         ws.send(data);
       }
     }
@@ -2167,10 +2169,10 @@ class WebSocketServer {
 
   /**
    * 获取指定路径的所有连接（支持层级查询）
-   * 返回数组快照拷贝（Array.from），修改返回值不影响内部连接池状态
+   * 返回新数组（修改数组不影响内部连接池），但数组元素为 ws 对象引用（修改 ws 属性会影响内部状态）
    * @param {string} [pathStr] - 指定路径；不传则返回所有连接
    *   精确匹配 + 层级匹配：getConnections('/chat') 返回 /chat 及 /chat/* 子路径的所有连接
-   * @returns {WebSocket[]} 连接数组快照（拷贝）
+   * @returns {WebSocket[]} 连接数组（新数组，元素为引用）
    */
   getConnections(pathStr) {
     if (pathStr) {
@@ -2213,8 +2215,8 @@ class WebSocketServer {
  * bodyParser 中间件：解析各类请求体
  */
 function bodyParser(options = {}) {
-  const maxFileSize = options.maxFileSize || 128 * 1024 * 1024;
-  const maxFieldSize = options.maxFieldSize || 1024 * 1024;
+  const maxFileSize = options.maxFileSize || 128 * 1024 * 1024; // 字节
+  const maxFieldSize = options.maxFieldSize || 1024 * 1024; // 字节（原始字节大小，非字符数）
   // JSON/urlencoded 请求体大小限制（语义区别于 maxFieldSize 表单字段）
   const maxBodySize = options.maxBodySize || 128 * 1024 * 1024;
 
@@ -3386,7 +3388,9 @@ class Application extends Router {
     // 匹配 app.ws() 注册的处理器（支持动态参数路径）
     // _compilePath 始终返回 pattern，静态和动态路径均通过正则精确匹配
     if (this._wsHandlers && this._wsHandlers.length > 0) {
-      const pathname = parsed.pathname;
+      // 使用已解码的 req.path 进行路由匹配，与 _handleRequest 行为一致
+      // decoded pathname 确保动态参数提取正确（如 /chat/%E4%B8%AD → /chat/中文）
+      const pathname = req.path;
       let matchedEntry = null;
       let params = {};
       for (const entry of this._wsHandlers) {
@@ -3580,7 +3584,7 @@ const defaultConfig = {
  * @param {object} [options.cors] - CORS 配置 { origin, headers, maxAge, credentials }
  * @param {boolean} [options.useBodyParser=true] - 是否自动注册 bodyParser 中间件
  * @param {boolean} [options.useCookieParser=true] - 是否自动注册 cookieParser 中间件
- * @param {object} [options.bodyParserOptions] - bodyParser 选项 { maxBodySize, maxFieldSize, maxFileSize }
+ * @param {object} [options.bodyParserOptions] - bodyParser 选项 { maxBodySize, maxFieldSize, maxFileSize }（字节单位）
  * @param {string} [options.cookieParserSecret] - cookie 签名密钥（null = 不签名）
  * @param {number} [options.wsHeartbeatInterval=30000] - WebSocket 心跳间隔（ms）
  * @param {number} [options.wsHeartbeatTimeout=30000] - WebSocket 心跳超时（ms）
@@ -3684,7 +3688,7 @@ httpm.WebSocketHandshake = WebSocketHandshake;
 // 旧名保留，向后兼容（deprecated）
 httpm.WebSocketHandShak = WebSocketHandshake;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.5.3';
+httpm.version = '1.5.4';
 
 
 module.exports = httpm;
