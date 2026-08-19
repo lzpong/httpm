@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.5.4
+ * @version     1.5.5
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -85,6 +85,8 @@ function parseQuery(qs, plusAsSpace = false) {
       if (!key) return;
       const decodedKey = plusAsSpace ? key.replace(/\+/g, ' ') : key;
       const decodedVal = plusAsSpace ? val.replace(/\+/g, ' ') : val;
+      // 防御原型污染：拒绝 __proto__/constructor/prototype 等危险键（攻击者可借此覆盖对象原型）
+      if (decodedKey === '__proto__' || decodedKey === 'constructor' || decodedKey === 'prototype') return;
       try {
         query[decodeURIComponent(decodedKey)] = decodeURIComponent(decodedVal);
       } catch (e) {
@@ -117,6 +119,8 @@ function parseCookies(cookieStr) {
     } catch (e) {
       val = rawVal;
     }
+    // 防御原型污染：拒绝 __proto__/constructor/prototype 等危险键
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') return;
     cookies[key] = val;
   });
   return cookies;
@@ -536,14 +540,16 @@ class Router {
     const methods = [m];
     if (m === 'HEAD') methods.push('GET');
 
-    // 检查 ALL 路由
-    const allRoutes = this.routes['ALL'] || [];
-    // 检查对应方法路由
-    let methodRoutes = [...allRoutes];
+    // 对应方法路由优先（GET/HEAD 等）
+    let methodRoutes = [];
     for (const meth of methods) {
       const routes = this.routes[meth] || [];
       methodRoutes = methodRoutes.concat(routes);
     }
+    // ALL 通用路由优先级恒最低：追加到特定方法路由之后
+    // （README 声明：精准静态路由 > 动态参数路由 > ALL 通用路由 > 静态文件服务）
+    const allRoutes = this.routes['ALL'] || [];
+    methodRoutes = methodRoutes.concat(allRoutes);
 
     for (const route of methodRoutes) {
       const match = route.pattern.exec(pathname);
@@ -1248,6 +1254,8 @@ class Response {
     } catch (e) {
       // 已编码的 URL 再 encodeURI 可能抛 URIError，忽略保持原值
     }
+    // 防御头注入：Location 头不允许 CR/LF（Node setHeader 遇换行会抛 TypeError）
+    if (/[\r\n\v\b\t]/.test(url)) url = url.replace(/[\r\n\v\b\t]/g, '');
     this.setHeader('Location', url);
     this.setHeader('Content-Length', 0);
     this._send('');
@@ -1284,7 +1292,8 @@ class Response {
     } else {
       rawValue = value;
     }
-    let encodedValue = encodeURIComponent(rawValue);
+    // String() 统一转换，避免 Symbol 等类型导致 encodeURIComponent 抛 TypeError
+    let encodedValue = encodeURIComponent(String(rawValue));
     // 签名 Cookie：s:value.signature（s: 前缀不参与编码，签名基于原始值）
     if (opts.signed) {
       const secret = this._app && this._app.settings && this._app.settings.cookieParserSecret;
@@ -2014,7 +2023,10 @@ class WebSocketServer {
     // 仅当客户端携带 Origin 头且不在白名单中时才拒绝
     if (this._allowedOrigins) {
       const origin = req.headers['origin'];
-      if (origin && !this._allowedOrigins.includes(origin)) {
+      // 归一化为数组做精确匹配：防止配置为字符串时 includes 子串误匹配
+      // （如白名单 https://a.com，恶意站点 https://a.com.evil.com 也满足 includes）
+      const allowedList = Array.isArray(this._allowedOrigins) ? this._allowedOrigins : [this._allowedOrigins];
+      if (origin && !allowedList.includes(origin)) {
         // 用 socket.end 替代 write+destroy：end 会在数据刷出后自动关闭 socket，
         // 避免 destroy 立即关闭导致客户端收不到 403 响应
         // socket 已关闭/已销毁时 end 可能抛 ERR_STREAM_WRITE_AFTER_END，需 try/catch
@@ -2280,9 +2292,12 @@ function _parseJSON(req, maxSize, next) {
     }
     try {
       req.body = JSON.parse(buf.toString('utf8'));
-      // 合并到 formData.fields
+      // 合并到 formData.fields（跳过危险键，防御原型污染）
       if (typeof req.body === 'object' && req.body !== null) {
-        Object.assign(req.formData.fields, req.body);
+        for (const [k, v] of Object.entries(req.body)) {
+          if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+          req.formData.fields[k] = v;
+        }
       }
     } catch (e) {
       req.body = null;
@@ -2304,7 +2319,11 @@ function _parseUrlencoded(req, maxSize, next) {
     }
     const parsed = parseQuery(buf.toString('utf8'), true);
     req.body = parsed;
-    Object.assign(req.formData.fields, parsed);
+    // 合并到 formData.fields（parseQuery 已过滤危险键，此处合并安全；若 URL 编码含 __proto__ 也已被 parseQuery 跳过）
+    for (const [k, v] of Object.entries(parsed)) {
+      if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+      req.formData.fields[k] = v;
+    }
     next();
   }).catch(next);
 }
@@ -2324,7 +2343,6 @@ function _extractBoundary(contentType) {
 function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
   const tempDir = req._app?.settings?.tempDir || 'tempupdir';
   const delimiter = Buffer.from('--' + boundary);
-  const endDelimiter = Buffer.from('--' + boundary + '--');
   // 回看长度：multipart 文件数据结尾为 [文件数据]\r\n--boundary
   // 需保留 \r\n 前缀以应对跨 chunk 分隔点落在 \r 之后的情况
   // 否则 \r 会被写入文件，破坏二进制文件完整性（图片/视频等末尾多出 \r\n）
@@ -2504,12 +2522,17 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
         }
         // 防御空字段名：nameMatch 未匹配时 name 为空字符串，跳过赋值避免污染 formData.fields['']
         if (currentField.name) {
-          // 同名字段聚合为数组（Express 兼容）
-          const existingField = req.formData.fields[currentField.name];
-          if (existingField !== undefined) {
-            req.formData.fields[currentField.name] = Array.isArray(existingField) ? [...existingField, currentField.value] : [existingField, currentField.value];
+          // 防御原型污染：拒绝 __proto__/constructor/prototype 等危险键
+          if (currentField.name === '__proto__' || currentField.name === 'constructor' || currentField.name === 'prototype') {
+            // 跳过该字段，不写入 formData.fields
           } else {
-            req.formData.fields[currentField.name] = currentField.value;
+            // 同名字段聚合为数组（Express 兼容）
+            const existingField = req.formData.fields[currentField.name];
+            if (existingField !== undefined) {
+              req.formData.fields[currentField.name] = Array.isArray(existingField) ? [...existingField, currentField.value] : [existingField, currentField.value];
+            } else {
+              req.formData.fields[currentField.name] = currentField.value;
+            }
           }
         }
         buffer = buffer.subarray(idx + delimiter.length);
@@ -2747,26 +2770,28 @@ class Application extends Router {
     const ip = this.settings.svrIP;
 
     // 创建服务器
+    // key/cert/ca/pfx 支持两种形式：文件路径字符串 或 已读取的 Buffer（README 示例传入 fs.readFileSync 结果）
+    const loadCredential = (v) => Buffer.isBuffer(v) ? v : fs.readFileSync(v);
     if (this.settings.http2) {
       // HTTP2 模式
       if (!this.settings.https || !this.settings.https.key || !this.settings.https.cert) {
         throw new Error('HTTP2 requires HTTPS configuration (key and cert)', { cause: { https: !!this.settings.https, hasKey: !!(this.settings.https && this.settings.https.key), hasCert: !!(this.settings.https && this.settings.https.cert) } });
       }
       const opts = {
-        key: fs.readFileSync(this.settings.https.key),
-        cert: fs.readFileSync(this.settings.https.cert),
+        key: loadCredential(this.settings.https.key),
+        cert: loadCredential(this.settings.https.cert),
         allowHTTP1: true
       };
-      if (this.settings.https.ca) opts.ca = fs.readFileSync(this.settings.https.ca);
+      if (this.settings.https.ca) opts.ca = loadCredential(this.settings.https.ca);
       this.server = http2.createSecureServer(opts, this._handleRequest.bind(this));
     } else if (this.settings.https && this.settings.https.key && this.settings.https.cert) {
       // HTTPS 模式
       const opts = {
-        key: fs.readFileSync(this.settings.https.key),
-        cert: fs.readFileSync(this.settings.https.cert)
+        key: loadCredential(this.settings.https.key),
+        cert: loadCredential(this.settings.https.cert)
       };
-      if (this.settings.https.ca) opts.ca = fs.readFileSync(this.settings.https.ca);
-      if (this.settings.https.pfx) opts.pfx = fs.readFileSync(this.settings.https.pfx);
+      if (this.settings.https.ca) opts.ca = loadCredential(this.settings.https.ca);
+      if (this.settings.https.pfx) opts.pfx = loadCredential(this.settings.https.pfx);
       this.server = https.createServer(opts, this._handleRequest.bind(this));
     } else {
       // HTTP 模式
@@ -3046,7 +3071,12 @@ class Application extends Router {
       if (item.isErrorHandler) {
         try {
           item.handler(err, req, res, (e) => {
-            this._handleError(e || null, req, res, stack, i + 1);
+            // 有错误：继续向后传递
+            if (e) { this._handleError(e, req, res, stack, i + 1); return; }
+            // next() 无参：错误已处理（Express 语义）——继续向后查找下一个错误处理中间件
+            // 通过递归复用 _handleError 实现完整链式传递（skip to next error handler）
+            // 若后续没有错误处理中间件，_handleError 内部会用默认错误响应兜底，避免请求挂起
+            this._handleError(err, req, res, stack, i + 1);
           });
           return;
         } catch (e) {
@@ -3056,7 +3086,14 @@ class Application extends Router {
       }
     }
     // 没有错误处理中间件，使用默认错误响应
-    // 校验 err.status 为有效 HTTP 状态码（100-599 整数），避免非数字/越界值导致协议违规
+    this._defaultErrorResponse(err, req, res);
+  }
+
+  /**
+   * 默认错误响应（错误处理中间件缺失/未消费错误时兜底）
+   * 校验 err.status 为有效 HTTP 状态码（100-599 整数），避免非数字/越界值导致协议违规
+   */
+  _defaultErrorResponse(err, req, res) {
     // 常见错误：err.status = '500'（字符串）、err.status = 999（越界）、err.status = 'InternalServerError'
     let status = err.status;
     if (!Number.isInteger(status) || status < 100 || status > 599) {
@@ -3688,7 +3725,7 @@ httpm.WebSocketHandshake = WebSocketHandshake;
 // 旧名保留，向后兼容（deprecated）
 httpm.WebSocketHandShak = WebSocketHandshake;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.5.4';
+httpm.version = '1.5.5';
 
 
 module.exports = httpm;

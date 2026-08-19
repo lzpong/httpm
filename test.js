@@ -342,6 +342,13 @@ async function runTests() {
     const c5 = httpm.parseCookies('novalue; key=val');
     assert(c5.key === 'val', 'parseCookies - skip no-equal pair');
     assert(c5.novalue === undefined, 'parseCookies - no-equal pair ignored');
+
+    // 反向：原型污染防护（__proto__/constructor/prototype 危险键被拒绝）
+    const c6 = httpm.parseCookies('__proto__=evil; constructor=x; normal=ok');
+    assert(c6.normal === 'ok', 'parseCookies - normal key still parsed');
+    // 危险键不应成为自身属性（用 Object.hasOwn 判断，obj.__proto__ 访问的是原型链访问器）
+    assert(Object.hasOwn(c6, '__proto__') === false, 'parseCookies - __proto__ key rejected');
+    assert(Object.hasOwn(c6, 'constructor') === false, 'parseCookies - constructor key rejected');
   }
 
   section('工具函数 - getMimeType');
@@ -519,6 +526,16 @@ async function runTests() {
     // 正向：+ 号不转空格（parseQuery 用于 URL query，+ 号保持原样）
     const q6 = httpm.parseQuery('name=hello+world');
     assert(q6.name === 'hello+world', 'parseQuery - plus not converted to space');
+
+    // 反向：原型污染防护（__proto__/constructor/prototype 危险键被拒绝）
+    const q7 = httpm.parseQuery('__proto__=evil&constructor=x&prototype=y&normal=ok');
+    assert(q7.normal === 'ok', 'parseQuery - normal key still parsed');
+    // 危险键不应成为自身属性（用 Object.hasOwn 判断，obj.__proto__ 访问的是原型链访问器）
+    assert(Object.hasOwn(q7, '__proto__') === false, 'parseQuery - __proto__ key rejected');
+    assert(Object.hasOwn(q7, 'constructor') === false, 'parseQuery - constructor key rejected');
+    assert(Object.hasOwn(q7, 'prototype') === false, 'parseQuery - prototype key rejected');
+    // 解析结果的原型不应被污染（Object.prototype 不受影响）
+    assert({}.evil === undefined && {}.x === undefined && {}.y === undefined, 'parseQuery - Object.prototype not polluted');
   }
 
   // ============================================================
@@ -686,6 +703,17 @@ async function runTests() {
     const allPostMatch = router.match('POST', '/any');
     assert(allGetMatch.length === 1, 'Router - ALL route GET match');
     assert(allPostMatch.length === 1, 'Router - ALL route POST match');
+
+    // 正向：ALL 路由优先级恒最低——特定方法路由优先于 ALL（README 声明）
+    // 场景：同路径先注册 ALL 再注册 GET，GET 命中时 ALL 路由排在结果末尾
+    const router4 = new httpm.Router();
+    router4.all('/prio', () => 'any');
+    router4.get('/prio', () => 'get');
+    const prioMatches = router4.match('GET', '/prio');
+    assert(prioMatches.length === 2, 'Router - ALL + GET both match same path');
+    // 结果顺序：GET 路由在前，ALL 路由恒在最后
+    assert(prioMatches[0].route.method === 'GET', 'Router - method route before ALL');
+    assert(prioMatches[prioMatches.length - 1].route.method === 'ALL', 'Router - ALL route always last');
 
     // 正向：不同 HTTP 方法注册
     router.post('/submit', (req, res) => 'submit');
@@ -2292,6 +2320,69 @@ async function runTests() {
         assert(reply === 'echo:hi', 'HTTP - WebSocket head frame not lost (pipeline client)');
       } catch (wsErr) {
         assertSkip('HTTP - WebSocket head frame test', wsErr.message);
+      }
+    }
+
+    // --- 修复验证：错误处理中间件调用 next() 无参时不挂起，默认错误响应兜底 ---
+    {
+      // 该 app 已注册错误处理中间件（返回 handled:true），此处用独立 app 验证"错误处理中间件调用 next() 无参"场景
+      const PORT_ER = PORT + 20;
+      const appER = httpm({ svrPort: PORT_ER, logLevel: 'error' });
+      let nextCalled = false;
+      appER.use((err, req, res, next) => {
+        // 错误处理中间件调用 next() 无参（Express 语义：错误已处理）
+        nextCalled = true;
+        next();
+      });
+      appER.get('/boom', (req, res) => { throw new Error('boom'); });
+      const serverER = appER.listen(PORT_ER);
+      await new Promise(r => setTimeout(r, 300));
+      try {
+        const res = await httpGet('http://localhost:' + PORT_ER + '/boom');
+        const body = await readBodyStr(res);
+        assert(res.statusCode === 500, 'HTTP - error handler next() no-arg fallback status 500');
+        assert(body.includes('boom'), 'HTTP - error handler next() no-arg fallback body contains error');
+        assert(nextCalled === true, 'HTTP - error handler next() no-arg was called');
+      } catch (e) {
+        assertSkip('HTTP - error handler next() no-arg test', e.message);
+      } finally {
+        await new Promise(r => serverER.close(r));
+        await closeLoggerStream(appER._logger);
+      }
+    }
+
+    // --- 修复验证：JSON body 原型污染防护（__proto__ 键被拒绝） ---
+    {
+      const PORT_PP = PORT + 21;
+      const appPP = httpm({ svrPort: PORT_PP, logLevel: 'error' });
+      appPP.post('/proto', (req, res) => {
+        res.json({
+          fieldsKeys: Object.keys(req.formData.fields),
+          hasProto: Object.hasOwn(req.formData.fields, '__proto__'),
+          polluted: req.formData.fields.polluted
+        });
+      });
+      const serverPP = appPP.listen(PORT_PP);
+      await new Promise(r => setTimeout(r, 300));
+      try {
+        // 注意：不能用 JSON.stringify({ '__proto__': ... })，对象字面量的 __proto__ 键是原型 setter 会被吞掉
+        // 必须用字符串拼接构造含 __proto__ 键的原始 JSON
+        const postBody = '{"__proto__":{"polluted":true},"normal":"ok"}';
+        const res = await httpRequest({
+          hostname: 'localhost', port: PORT_PP, path: '/proto', method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(postBody)) }
+        }, postBody);
+        const body = await readBodyStr(res);
+        const obj = JSON.parse(body);
+        // fieldsKeys 应包含正常键 normal，且不含 __proto__
+        assert(obj.fieldsKeys.includes('normal') === true, 'HTTP - JSON __proto__ pollution: normal key parsed');
+        assert(obj.hasProto === false, 'HTTP - JSON __proto__ pollution: __proto__ key rejected');
+        assert(obj.polluted === undefined, 'HTTP - JSON __proto__ pollution: prototype not polluted');
+      } catch (e) {
+        assertSkip('HTTP - JSON __proto__ pollution test', e.message);
+      } finally {
+        await new Promise(r => serverPP.close(r));
+        await closeLoggerStream(appPP._logger);
       }
     }
 

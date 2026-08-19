@@ -68,6 +68,8 @@ app.all('/any', (req, res) => res.json({ method: req.method }));
 
 路由匹配优先级：精准静态路由 > 动态参数路由 > ALL 通用路由 > 静态文件服务。同方法同级别路由按注册顺序匹配（先注册先匹配）。
 
+> **ALL 路由优先级说明**：同一路径同时注册 ALL 与特定方法路由时，**特定方法路由始终先执行，ALL 路由恒最后执行**（即使 ALL 注册在前）。ALL 路由之间仍按注册顺序匹配。
+
 - **HEAD 请求**：自动匹配 GET 路由，仅返回响应头（Express 兼容）
 - **OPTIONS 请求**：自动返回 `Allow` 头和 CORS 预检响应，动态查询该路径支持的方法
 
@@ -265,7 +267,6 @@ app.wss.getConnections('/chat');                     // 获取 /chat 及 /chat/*
 ```
 
 > **层级广播**：`broadcast` 和 `getConnections` 支持层级匹配，传入父路径会匹配自身及所有子路径。前缀匹配规则：`key === pathStr || key.startsWith(pathStr + '/')`，如 `broadcast('/chat')` 匹配 `/chat`、`/chat/room1`、`/chat/room2`，但不会误匹配 `/chatone`。
-```
 
 ### WebSocket 事件
 
@@ -435,6 +436,7 @@ const app = httpm({ svrPort: 3000 }); // svrPort=3000, enableGzip=true(来自app
 
 ```javascript
 // HTTPS
+// https.key/cert/ca/pfx 支持两种形式：文件路径字符串 或 fs.readFileSync 读取后的 Buffer
 const app = httpm({
   https: {
     key: fs.readFileSync('server.key'),
