@@ -536,6 +536,13 @@ async function runTests() {
     assert(Object.hasOwn(q7, 'prototype') === false, 'parseQuery - prototype key rejected');
     // 解析结果的原型不应被污染（Object.prototype 不受影响）
     assert({}.evil === undefined && {}.x === undefined && {}.y === undefined, 'parseQuery - Object.prototype not polluted');
+
+    // 反向：无等号形式的危险键同样被拒绝（?__proto__ 无等号分支）
+    const q8 = httpm.parseQuery('__proto__&constructor&prototype&flag');
+    assert(q8.flag === '', 'parseQuery - no-equal normal key parsed');
+    assert(Object.hasOwn(q8, '__proto__') === false, 'parseQuery - no-equal __proto__ key rejected');
+    assert(Object.hasOwn(q8, 'constructor') === false, 'parseQuery - no-equal constructor key rejected');
+    assert(Object.hasOwn(q8, 'prototype') === false, 'parseQuery - no-equal prototype key rejected');
   }
 
   // ============================================================

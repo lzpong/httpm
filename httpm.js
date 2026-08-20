@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.5.5
+ * @version     1.5.6
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -72,6 +72,8 @@ function parseQuery(qs, plusAsSpace = false) {
       const key = plusAsSpace ? pair.replace(/\+/g, ' ') : pair;
       // 跳过空 key（如 "?&foo=bar" 中的空段），避免污染 query 对象
       if (!key) return;
+      // 防御原型污染：与有等号分支保持一致，拒绝 __proto__/constructor/prototype 等危险键
+      if (key === '__proto__' || key === 'constructor' || key === 'prototype') return;
       try {
         query[decodeURIComponent(key)] = '';
       } catch (e) {
@@ -715,17 +717,25 @@ class Request {
       let totalSize = 0;
       const limit = maxSize || (this._app?.settings?.maxBodySize) || 128 * 1024 * 1024;
       let timedOut = false;
+      // 命名监听器：超时/超限/错误路径显式移除，避免 destroy 后残留监听器（轻微资源残留）
+      const cleanupListeners = () => {
+        this._req.removeListener('data', onData);
+        this._req.removeListener('end', onEnd);
+        this._req.removeListener('error', onError);
+      };
       // 超时定时器
       const timer = setTimeout(() => {
         timedOut = true;
+        cleanupListeners();
         this._req.destroy();
         reject(new Error('Request body read timeout', { cause: { timeoutMs } }));
       }, timeoutMs);
-      this._req.on('data', chunk => {
+      const onData = (chunk) => {
         totalSize += chunk.length;
         // 流式大小检查，超限时立即中断
         if (totalSize > limit) {
           clearTimeout(timer);
+          cleanupListeners();
           this._req.destroy();
           const err = new Error(`Request body exceeds maximum size of ${fmtSize(limit)}`, { cause: { actual: totalSize, maxSize: limit } });
           err.status = 413;
@@ -733,17 +743,23 @@ class Request {
           return;
         }
         chunks.push(chunk);
-      });
-      this._req.on('end', () => {
+      };
+      const onEnd = () => {
         clearTimeout(timer);
+        // 正常完成后移除监听器，与超时/超限/错误路径保持一致
+        cleanupListeners();
         this._rawBody = Buffer.concat(chunks);
         this._bodyParsed = true;
         resolve(this._rawBody);
-      });
-      this._req.on('error', (err) => {
+      };
+      const onError = (err) => {
         clearTimeout(timer);
+        cleanupListeners();
         if (!timedOut) reject(err);
-      });
+      };
+      this._req.on('data', onData);
+      this._req.on('end', onEnd);
+      this._req.on('error', onError);
     });
   }
 }
@@ -2319,9 +2335,8 @@ function _parseUrlencoded(req, maxSize, next) {
     }
     const parsed = parseQuery(buf.toString('utf8'), true);
     req.body = parsed;
-    // 合并到 formData.fields（parseQuery 已过滤危险键，此处合并安全；若 URL 编码含 __proto__ 也已被 parseQuery 跳过）
+    // 合并到 formData.fields（parseQuery 已过滤 __proto__/constructor/prototype 危险键，直接合并安全）
     for (const [k, v] of Object.entries(parsed)) {
-      if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
       req.formData.fields[k] = v;
     }
     next();
@@ -2522,10 +2537,9 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
         }
         // 防御空字段名：nameMatch 未匹配时 name 为空字符串，跳过赋值避免污染 formData.fields['']
         if (currentField.name) {
-          // 防御原型污染：拒绝 __proto__/constructor/prototype 等危险键
-          if (currentField.name === '__proto__' || currentField.name === 'constructor' || currentField.name === 'prototype') {
-            // 跳过该字段，不写入 formData.fields
-          } else {
+          // 防御原型污染：拒绝 __proto__/constructor/prototype 等危险键（提前跳过，减少嵌套）
+          const isDangerKey = currentField.name === '__proto__' || currentField.name === 'constructor' || currentField.name === 'prototype';
+          if (!isDangerKey) {
             // 同名字段聚合为数组（Express 兼容）
             const existingField = req.formData.fields[currentField.name];
             if (existingField !== undefined) {
@@ -3230,13 +3244,11 @@ class Application extends Router {
         }
       }
     }
-    // 检查 ALL 中间件路由
+    // 检查 ALL 中间件路由（任一命中即代表该路径支持所有方法，结果集相同无需 break）
     const allRoutes = this.routes['ALL'] || [];
-    for (const route of allRoutes) {
-      if (route.pattern.exec(pathname)) {
-        ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'].forEach(m => methods.add(m));
-        break;
-      }
+    const allMatched = allRoutes.some(route => route.pattern.exec(pathname));
+    if (allMatched) {
+      ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'].forEach(m => methods.add(m));
     }
     // GET 路由隐式支持 HEAD
     if (methods.has('GET')) methods.add('HEAD');
@@ -3725,7 +3737,7 @@ httpm.WebSocketHandshake = WebSocketHandshake;
 // 旧名保留，向后兼容（deprecated）
 httpm.WebSocketHandShak = WebSocketHandshake;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.5.5';
+httpm.version = '1.5.6';
 
 
 module.exports = httpm;

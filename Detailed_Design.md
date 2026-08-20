@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.5.5
+**文档版本**：V1.5.6
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -941,10 +941,12 @@ app.sse('/events', (sse, req) => {
 55. **WebSocket handler 的 req 必须为 httpm Request 实例**：`_handleUpgrade` 必须在握手前将原生 `http.IncomingMessage` 包装为 `new Request()`，设置 `req._app = this`，补全 `req.query`（parseUrl 解析）、`req.path`（decodeURIComponent 解码，非法编码保留原值），并在 `useCookieParser !== false` 时复用 `cookieParser` 中间件解析 `req.cookies`/`req.signedCookies`。确保 `app.ws` handler 与 `wss.on('connection')` 监听者收到的 req 和普通路由 req 属性一致。底层 socket 不通过 req 暴露（Request 无 socket getter），业务方应使用 `ws.socket` 访问（符合 WebSocket 语义）。`body`/`files`/`formData` 保持 Request 构造函数初始值（升级请求无 body，不走 bodyParser）。
 56. **ALL 路由优先级恒最低**：`Router.match()` 中 ALL 路由必须追加在特定方法路由（GET/HEAD 等）之后，确保同一路径同时注册 ALL 与特定方法路由时，特定方法路由始终先执行（即使 ALL 注册在前）；ALL 路由之间仍按注册顺序匹配。对齐 README 声明"精准静态路由 > 动态参数路由 > ALL 通用路由 > 静态文件服务"。
 57. **错误处理中间件 `next()` 无参必须链式传递**：错误处理中间件调用 `next()` 无参（Express 语义：错误已处理）时，必须通过递归调用 `_handleError(err, req, res, stack, i+1)` 向后查找下一个错误处理中间件；若后续无错误处理中间件，由 `_defaultErrorResponse` 兜底返回默认错误响应，避免请求挂起（早先实现直接 return 导致客户端永久等待）。
-58. **原型污染防护**：`parseQuery`/`parseCookies`/multipart 字段赋值/JSON 与 urlencoded 合并到 `formData.fields` 时，必须拒绝 `__proto__`/`constructor`/`prototype` 危险键（跳过不写入），防止攻击者通过请求参数覆盖对象原型导致越权访问。测试断言须用 `Object.hasOwn()` 判断（`obj.__proto__` 访问的是原型链访问器，永远非 undefined）。
+58. **原型污染防护**：`parseQuery`（**有等号与无等号两个分支均须过滤**）/`parseCookies`/multipart 字段赋值/JSON 与 urlencoded 合并到 `formData.fields` 时，必须拒绝 `__proto__`/`constructor`/`prototype` 危险键（跳过不写入），防止攻击者通过请求参数覆盖对象原型导致越权访问。测试断言须用 `Object.hasOwn()` 判断（`obj.__proto__` 访问的是原型链访问器，永远非 undefined）。
 59. **HTTPS 证书支持 Buffer 与路径两种形式**：`listen()` 中 `https.key/cert/ca/pfx` 必须兼容 `fs.readFileSync` 读取后的 Buffer 与文件路径字符串两种配置（README 示例传入 Buffer），通过 `loadCredential(v) => Buffer.isBuffer(v) ? v : fs.readFileSync(v)` 统一处理，避免将 Buffer 当作路径二次读取抛 ENOENT。
 60. **WebSocket allowedOrigins 必须精确匹配**：`handleUpgrade` 中 Origin 校验必须将 `wsAllowedOrigins` 归一化为数组后做精确匹配（`includes`），配置为字符串时直接 `includes` 会因子串匹配被恶意站点绕过（如白名单 `https://a.com`，`https://a.com.evil.com` 也通过）。
 61. **redirect/cookie 特殊类型防御**：`res.redirect()` 的 url 必须剔除 `\r`/`\n`（Node `setHeader` 遇换行抛 TypeError）；`res.cookie()` 的 value 必须经 `String()` 转换后再 `encodeURIComponent`，避免 Symbol 类型抛 TypeError。
+62. **_readBody 监听器显式清理**：`_readBody` 的 `data`/`end`/`error` 监听器必须使用命名回调并在正常完成/超时/超限/错误四条路径统一移除（`cleanupListeners`），避免请求流 destroy 后残留监听器。
+63. **_getAllowedMethods ALL 路由用 some**：ALL 路由集合用 `some()` 判断任一命中即代表该路径支持所有方法（结果集相同），替代逐个 `exec` + `break`，语义更清晰。
 
 ---
 
