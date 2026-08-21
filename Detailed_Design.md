@@ -2,7 +2,7 @@
 
 **文档类型**：软件开发详细设计文档
 
-**文档版本**：V1.5.6
+**文档版本**：V1.5.7
 
 **定位说明**：本文档聚焦功能设计、模块架构、类设计、业务逻辑、接口规则、数据流转，面向开发实现，不含运维、部署、集群、监控等工程运维类内容。
 
@@ -777,7 +777,7 @@ const safeNext = (e) => {
 };
 ```
 
-> 注：早先实现 `if (handlerCalledNext && !e) return` 允许先 `next()` 再 `next(err)`，会导致重复进入错误链，已修复为无条件去重。
+> safeNext 无条件去重：无论是否携带 err，仅首次调用 `next()` 生效，防止重复进入错误链。
 
 ---
 
@@ -920,7 +920,7 @@ app.sse('/events', (sse, req) => {
 34. **cookie 头注入防护**：`res.cookie()` 的 `path`/`domain` 必须拒绝含 `;`、`,`、空白字符的值，这些字符会破坏 Set-Cookie 头结构（攻击者可通过 `path="/foo;Domain=evil.com"` 污染其他域名 Cookie），违规时仅打印警告日志不输出头。
 35. **multipart fileInfo 时序**：`_parseMultipart` 在 `stream.end()` 前后同步 push fileInfo 是有意的设计决策，原因是 `res.on('finish', () => _cleanupTempFiles(req._tempFiles))` 需要完整列表；极端 race（end 后立即磁盘满）通过 ensureFileStream 的 error handler 缓解（safeNext → 500 响应，handler 不会执行）。
 36. **sendFile 错误回调统一传递**：`httpm.static()` 中间件与 `Application._serveStatic` 兜底处理中调用 `res.sendFile()` 时必须传递错误回调。`staticMiddleware` 错误回调调用 `next(err)` 进入中间件错误链；`_serveStatic` 错误回调调用 `this._handleError(err, req, res, [], 0)` 进入应用级错误处理。两者均避免 sendFile 内部异常（路径遍历校验、同步抛错等）冒泡到上层导致未捕获异常。
-37. **目录列表父目录链接尾斜杠**：`_renderDirectoryHTML` 生成的父目录链接 `parentHref = prefix + '../'` 必须以 `/` 结尾，与子目录链接（V1.4.0 第 20 条规则）保持一致，避免浏览器多一次重定向往返。
+37. **目录列表父目录链接尾斜杠**：`_renderDirectoryHTML` 生成的父目录链接 `parentHref = prefix + '../'` 必须以 `/` 结尾，与子目录链接保持一致，避免浏览器多一次重定向往返。
 38. **_handleRequest 顶层 catch 响应规范化**：`_handleRequest` 顶层 catch 块在响应头未发送时除设置 500 状态码外，还应显式设置 `Content-Type: text/plain; charset=utf-8` 避免客户端 MIME 嗅探误判，HEAD 请求只发头部不发送响应体（与 `response.end()` 在 HEAD 路径下的行为一致）。
 39. **httpm 入口 JSDoc 完整**：`httpm` 入口函数必须有完整 JSDoc 文档，包括所有配置项（svrPort/logLevel/cors/useBodyParser/cookieParserSecret/wsHeartbeatInterval/trustProxy/http2 等）、配置优先级、返回值类型与示例代码，支撑 IDE 智能提示和 TypeScript 类型推导。
 40. **Request.protocol HTTP/2 兼容**：`Request.protocol` getter 必须与 `Request.ip` 保持一致的 HTTP/2 兼容回退，通过 `req.stream?.session?.socket` 获取底层 TCP socket 判断 `encrypted` 属性。HTTP/2 模式下 `IncomingMessage.socket` 为 `undefined`，直接访问会导致 protocol 永远返回 `'http'`（即使 HTTP/2 over TLS）。
@@ -940,7 +940,7 @@ app.sse('/events', (sse, req) => {
 54. **WebSocket 必须监听 socket `end` 事件并主动销毁**：客户端正常断开（TCP FIN）时，服务端 socket 先触发 `end` 事件再触发 `close` 事件。若仅监听 `close`，Windows 等 platform 上 socket 可能停留半开状态延迟触发 `close`，导致 `server._connections` 不归零、`server.close()` 挂起（连接泄漏）。WebSocket 构造函数必须在 `socket.on('close')` 之外额外注册 `socket.on('end', () => { this.connected = false; socket.destroy(); })`，收到 FIN 立即销毁 socket 加速清理。WebSocket 协议无半关闭语义，客户端 FIN 即视为断开连接，主动销毁安全。与 ws 库等主流实现行为一致。
 55. **WebSocket handler 的 req 必须为 httpm Request 实例**：`_handleUpgrade` 必须在握手前将原生 `http.IncomingMessage` 包装为 `new Request()`，设置 `req._app = this`，补全 `req.query`（parseUrl 解析）、`req.path`（decodeURIComponent 解码，非法编码保留原值），并在 `useCookieParser !== false` 时复用 `cookieParser` 中间件解析 `req.cookies`/`req.signedCookies`。确保 `app.ws` handler 与 `wss.on('connection')` 监听者收到的 req 和普通路由 req 属性一致。底层 socket 不通过 req 暴露（Request 无 socket getter），业务方应使用 `ws.socket` 访问（符合 WebSocket 语义）。`body`/`files`/`formData` 保持 Request 构造函数初始值（升级请求无 body，不走 bodyParser）。
 56. **ALL 路由优先级恒最低**：`Router.match()` 中 ALL 路由必须追加在特定方法路由（GET/HEAD 等）之后，确保同一路径同时注册 ALL 与特定方法路由时，特定方法路由始终先执行（即使 ALL 注册在前）；ALL 路由之间仍按注册顺序匹配。对齐 README 声明"精准静态路由 > 动态参数路由 > ALL 通用路由 > 静态文件服务"。
-57. **错误处理中间件 `next()` 无参必须链式传递**：错误处理中间件调用 `next()` 无参（Express 语义：错误已处理）时，必须通过递归调用 `_handleError(err, req, res, stack, i+1)` 向后查找下一个错误处理中间件；若后续无错误处理中间件，由 `_defaultErrorResponse` 兜底返回默认错误响应，避免请求挂起（早先实现直接 return 导致客户端永久等待）。
+57. **错误处理中间件 `next()` 无参必须链式传递**：错误处理中间件调用 `next()` 无参（Express 语义：错误已处理）时，必须通过递归调用 `_handleError(err, req, res, stack, i+1)` 向后查找下一个错误处理中间件；若后续无错误处理中间件，由 `_defaultErrorResponse` 兜底返回默认错误响应，避免请求挂起。
 58. **原型污染防护**：`parseQuery`（**有等号与无等号两个分支均须过滤**）/`parseCookies`/multipart 字段赋值/JSON 与 urlencoded 合并到 `formData.fields` 时，必须拒绝 `__proto__`/`constructor`/`prototype` 危险键（跳过不写入），防止攻击者通过请求参数覆盖对象原型导致越权访问。测试断言须用 `Object.hasOwn()` 判断（`obj.__proto__` 访问的是原型链访问器，永远非 undefined）。
 59. **HTTPS 证书支持 Buffer 与路径两种形式**：`listen()` 中 `https.key/cert/ca/pfx` 必须兼容 `fs.readFileSync` 读取后的 Buffer 与文件路径字符串两种配置（README 示例传入 Buffer），通过 `loadCredential(v) => Buffer.isBuffer(v) ? v : fs.readFileSync(v)` 统一处理，避免将 Buffer 当作路径二次读取抛 ENOENT。
 60. **WebSocket allowedOrigins 必须精确匹配**：`handleUpgrade` 中 Origin 校验必须将 `wsAllowedOrigins` 归一化为数组后做精确匹配（`includes`），配置为字符串时直接 `includes` 会因子串匹配被恶意站点绕过（如白名单 `https://a.com`，`https://a.com.evil.com` 也通过）。

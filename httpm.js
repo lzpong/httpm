@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.5.6
+ * @version     1.5.7
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -556,19 +556,30 @@ class Router {
     for (const route of methodRoutes) {
       const match = route.pattern.exec(pathname);
       if (match) {
-        const params = {};
-        route.params.forEach((name, i) => {
-          try {
-            params[name] = decodeURIComponent(match[i + 1]);
-          } catch (e) {
-            // 非法 URI 编码，保留原始值
-            params[name] = match[i + 1];
-          }
-        });
-        results.push({ route, params, handlers: route.handlers });
+        results.push({ route, params: this._extractParams(route.params, match), handlers: route.handlers });
       }
     }
     return results;
+  }
+
+  /**
+   * 提取路由参数：decodeURIComponent 解码 + 非法编码降级保留原始值
+   * Router.match / matchMiddleware / _handleUpgrade 三处复用
+   * @param {string[]} paramNames - 参数名数组
+   * @param {RegExpExecArray} match - 正则匹配结果（match[i+1] 为第 i 个参数值）
+   * @returns {Object} 参数键值对象
+   */
+  _extractParams(paramNames, match) {
+    const params = {};
+    paramNames.forEach((name, i) => {
+      try {
+        params[name] = decodeURIComponent(match[i + 1]);
+      } catch (e) {
+        // 非法 URI 编码，保留原始值
+        params[name] = match[i + 1];
+      }
+    });
+    return params;
   }
 
   /**
@@ -588,16 +599,7 @@ class Router {
       //   - use('/api/:version') 命中 /api/v1 及其子路径，并提取 version 参数
       const match = mw.prefixPattern.exec(pathname);
       if (match) {
-        const params = {};
-        mw.params.forEach((name, i) => {
-          try {
-            params[name] = decodeURIComponent(match[i + 1]);
-          } catch (e) {
-            // 非法 URI 编码，保留原始值
-            params[name] = match[i + 1];
-          }
-        });
-        results.push({ middleware: mw, params });
+        results.push({ middleware: mw, params: this._extractParams(mw.params, match) });
       }
     }
     return results;
@@ -1429,30 +1431,31 @@ class SSE {
   }
 
   /**
+   * 序列化 SSE 消息体（send/event 共用）：
+   * - null/undefined → 'null'（避免 JSON.stringify 返回 undefined 导致 split 抛 TypeError）
+   * - 字符串 → 原样
+   * - 其他 → JSON.stringify，循环引用/BigInt 失败时返回 null 表示跳过本次发送
+   * @returns {string|null} 序列化结果；null 表示序列化失败应跳过
+   */
+  _serializeData(data) {
+    if (data == null) return 'null';
+    if (typeof data === 'string') return data;
+    try {
+      return JSON.stringify(data);
+    } catch (e) {
+      // 循环引用/BigInt 序列化失败：跳过本次发送，避免污染事件流
+      return null;
+    }
+  }
+
+  /**
    * 发送普通消息，自动兼容字符串/JSON 对象
    * SSE 规范：data 中含换行符时需拆成多行 data: 前缀，接收端用 \n 拼回
-   * 与 WebSocket.send 对齐：JSON.stringify 失败（循环引用/BigInt）时记录日志并跳过本次发送，
-   * 避免异常冒泡中断 SSE 处理器
    */
   send(data) {
     if (!this.connected) return this;
-    // 防御：data 为 null/undefined 时 JSON.stringify 返回 undefined，split 会抛 TypeError
-    // 转为 'null' 符合 JSON 语义（JSON.stringify(null) = 'null'）
-    let msg;
-    if (data == null) {
-      msg = 'null';
-    } else if (typeof data === 'string') {
-      msg = data;
-    } else {
-      // 循环引用/BigInt 会抛 TypeError，与 WebSocket.send 行为对齐
-      try {
-        msg = JSON.stringify(data);
-      } catch (e) {
-        // 序列化失败：跳过本次发送，避免异常冒泡中断 SSE 处理器
-        // 不发送错误占位符，避免污染事件流（客户端无法区分业务消息与错误提示）
-        return this;
-      }
-    }
+    const msg = this._serializeData(data);
+    if (msg === null) return this;
     // 按行拆分，每行加 data: 前缀，确保多行消息不破坏 SSE 协议
     const lines = msg.split('\n');
     this._write(lines.map(l => `data: ${l}`).join('\n') + '\n\n');
@@ -1462,25 +1465,12 @@ class SSE {
   /**
    * 发送自定义命名事件
    * event name 中含换行符属于协议违规，直接忽略该事件避免破坏流
-   * 与 WebSocket.send 对齐：JSON.stringify 失败（循环引用/BigInt）时跳过本次发送
    */
   event(name, data) {
     if (!this.connected) return this;
     if (typeof name !== 'string' || name.includes('\n')) return this;
-    // 防御：data 为 null/undefined 时 JSON.stringify 返回 undefined，split 会抛 TypeError
-    let msg;
-    if (data == null) {
-      msg = 'null';
-    } else if (typeof data === 'string') {
-      msg = data;
-    } else {
-      try {
-        msg = JSON.stringify(data);
-      } catch (e) {
-        // 序列化失败：跳过本次发送，避免异常冒泡
-        return this;
-      }
-    }
+    const msg = this._serializeData(data);
+    if (msg === null) return this;
     const lines = msg.split('\n');
     this._write(`event: ${name}\n` + lines.map(l => `data: ${l}`).join('\n') + '\n\n');
     return this;
@@ -3085,12 +3075,9 @@ class Application extends Router {
       if (item.isErrorHandler) {
         try {
           item.handler(err, req, res, (e) => {
-            // 有错误：继续向后传递
-            if (e) { this._handleError(e, req, res, stack, i + 1); return; }
-            // next() 无参：错误已处理（Express 语义）——继续向后查找下一个错误处理中间件
-            // 通过递归复用 _handleError 实现完整链式传递（skip to next error handler）
-            // 若后续没有错误处理中间件，_handleError 内部会用默认错误响应兜底，避免请求挂起
-            this._handleError(err, req, res, stack, i + 1);
+            // 有错误用新错误继续传递；next() 无参（e 为空）用原错误继续链式传递
+            // 递归复用 _handleError：向后查找下一个错误处理中间件，无后续时默认响应兜底避免挂起
+            this._handleError(e || err, req, res, stack, i + 1);
           });
           return;
         } catch (e) {
@@ -3446,14 +3433,7 @@ class Application extends Router {
         const m = entry.pattern.exec(pathname);
         if (m) {
           matchedEntry = entry;
-          entry.params.forEach((name, i) => {
-            try {
-              params[name] = decodeURIComponent(m[i + 1]);
-            } catch (e) {
-              // 非法 URI 编码，保留原始值
-              params[name] = m[i + 1];
-            }
-          });
+          params = this._extractParams(entry.params, m);
           break;
         }
       }
@@ -3737,7 +3717,7 @@ httpm.WebSocketHandshake = WebSocketHandshake;
 // 旧名保留，向后兼容（deprecated）
 httpm.WebSocketHandShak = WebSocketHandshake;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.5.6';
+httpm.version = '1.5.7';
 
 
 module.exports = httpm;
