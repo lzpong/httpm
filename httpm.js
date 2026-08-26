@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.5.7
+ * @version     1.5.8
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -2348,11 +2348,15 @@ function _extractBoundary(contentType) {
 function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
   const tempDir = req._app?.settings?.tempDir || 'tempupdir';
   const delimiter = Buffer.from('--' + boundary);
+  // RFC 2046 分隔符：part 数据之后必须以 CRLF 前置的 \r\n--boundary 结束
+  // 查找 CRLF+delimiter 而非裸 delimiter，防止文件/字段内容中出现的 --boundary 子串被误判为分隔符
+  // （此前 BODY_FIELD/BODY_FILE 用 indexOf(delimiter) 查找，内容含 --boundary 会截断数据）
+  const crlfDelimiter = Buffer.concat([Buffer.from('\r\n'), delimiter]);
   // 回看长度：multipart 文件数据结尾为 [文件数据]\r\n--boundary
   // 需保留 \r\n 前缀以应对跨 chunk 分隔点落在 \r 之后的情况
   // 否则 \r 会被写入文件，破坏二进制文件完整性（图片/视频等末尾多出 \r\n）
-  // ('\r\n' + delimiter).length - 1 = delimiter.length + 1
-  const lookBehind = delimiter.length + 1;
+  // crlfDelimiter.length - 1 = delimiter.length + 1
+  const lookBehind = crlfDelimiter.length - 1;
   let state = 'INIT'; // INIT, HEADERS, BODY_FIELD, BODY_FILE
   let partHeadersBuf = Buffer.alloc(0);
   let currentField = { name: '', value: '', decoder: null };
@@ -2386,6 +2390,9 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
 
   // 标志位：文件写入流出错时防止 next 重复调用
   let streamErrored = false;
+  // 跟踪所有已创建的文件写入流：on('end') 时等待全部 flush 完成再 next()
+  // 防止业务 handler 同步读取 file.path 时读到空/部分数据（BUG-2 修复）
+  const pendingStreams = new Set();
   // 惰性创建文件写入流，统一绑定 drain/error 事件（DRY：两处创建点共用）
   function ensureFileStream() {
     if (currentFile.stream) return currentFile.stream;
@@ -2406,6 +2413,7 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
       safeNext(streamErr);
     });
     currentFile.stream = stream;
+    pendingStreams.add(stream);
     return stream;
   }
 
@@ -2490,8 +2498,8 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
           state = 'BODY_FIELD';
         }
       } else if (state === 'BODY_FIELD') {
-        // 查找分隔符（字段结束）
-        const idx = buffer.indexOf(delimiter);
+        // 查找分隔符（字段结束）：CRLF+delimiter 整体消费，数据不含前导 \r\n
+        const idx = buffer.indexOf(crlfDelimiter);
         if (idx === -1) {
           // 还没结束，缓存数据（但检查大小限制）
           // 保留尾部回看字节，防止分隔符跨 chunk 截断
@@ -2509,7 +2517,7 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
           buffer = buffer.subarray(safeLen);
           break;
         }
-        // 字段结束
+        // 字段结束：数据为 [0, idx)，\r\n--boundary 由 idx 处整体消费
         const chunk = currentField.decoder.write(buffer.subarray(0, idx));
         fieldSize += idx;
         if (fieldSize > maxFieldSize) {
@@ -2521,10 +2529,6 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
         currentField.value += chunk;
         // 刷新 decoder 中残留的未完成字符（末尾不完整字节会用 U+FFFD 替换）
         currentField.value += currentField.decoder.end();
-        // 去掉末尾的 \r\n
-        if (currentField.value.endsWith('\r\n')) {
-          currentField.value = currentField.value.slice(0, -2);
-        }
         // 防御空字段名：nameMatch 未匹配时 name 为空字符串，跳过赋值避免污染 formData.fields['']
         if (currentField.name) {
           // 防御原型污染：拒绝 __proto__/constructor/prototype 等危险键（提前跳过，减少嵌套）
@@ -2539,16 +2543,19 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
             }
           }
         }
-        buffer = buffer.subarray(idx + delimiter.length);
-        // 跳过 \r\n
-        if (buffer.length >= 2 && buffer[0] === 0x0D && buffer[1] === 0x0A) {
+        buffer = buffer.subarray(idx + crlfDelimiter.length);
+        // 分隔符后若跟 --（最后一个 part），则 body 结束；否则跳过 \r\n 进入下一 part 头部
+        if (buffer.length >= 2 && buffer[0] === 0x2D && buffer[1] === 0x2D) {
+          // 结尾 --boundary--，无后续 part，置空等待结束
+          buffer = Buffer.alloc(0);
+        } else if (buffer.length >= 2 && buffer[0] === 0x0D && buffer[1] === 0x0A) {
           buffer = buffer.subarray(2);
         }
         state = 'HEADERS';
         partHeadersBuf = Buffer.alloc(0);
       } else if (state === 'BODY_FILE') {
-        // 查找分隔符（文件结束）
-        const idx = buffer.indexOf(delimiter);
+        // 查找分隔符（文件结束）：CRLF+delimiter 整体消费，数据不含前导 \r\n
+        const idx = buffer.indexOf(crlfDelimiter);
         if (idx === -1) {
           // 还没结束，写入临时文件
           // 保留尾部回看字节，防止分隔符跨 chunk 截断
@@ -2573,22 +2580,20 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
           buffer = buffer.subarray(safeLen);
           break;
         }
-        // 文件结束
+        // 文件结束：数据为 [0, idx)，前导 \r\n 属于分隔符前缀不属于文件内容
         const fileData = buffer.subarray(0, idx);
-        // 去掉文件数据前的 \r\n
-        const trimmedData = fileData.length >= 2 && fileData.at(-2) === 0x0D && fileData.at(-1) === 0x0A
-          ? fileData.subarray(0, -2)
-          : fileData;
 
         ensureFileStream();
-        currentFile.stream.write(trimmedData);
+        currentFile.stream.write(fileData);
         // 结束写入：end() 是异步的，但此处保持同步 push fileInfo 以确保
         // _tempFiles 列表完整（res.on('finish') 清理时不会遗漏）
         // 极端 race：end() 后立即磁盘满导致写入不完整，error 事件触发时
         // fileInfo 已被 push 记录。缓解：error 处理器已通过 safeNext 销毁
         // 请求流（_handleError → 500 响应），后续 handler 不会执行。
+        // 注意：end() 后必须等待 'finish' 事件才能安全读取文件内容，
+        // 业务 handler 若同步 fs.readFileSync 可能读到空数据（见 on('end') 的 finish 等待）
         currentFile.stream.end();
-        fileSize += trimmedData.length;
+        fileSize += fileData.length;
         currentFile.size = fileSize;
 
         // 保存文件信息
@@ -2606,9 +2611,12 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
 
         // 清理上传进度条目
         cleanupOnError = false;
-        buffer = buffer.subarray(idx + delimiter.length);
-        // 跳过 \r\n
-        if (buffer.length >= 2 && buffer[0] === 0x0D && buffer[1] === 0x0A) {
+        buffer = buffer.subarray(idx + crlfDelimiter.length);
+        // 分隔符后若跟 --（最后一个 part），则 body 结束；否则跳过 \r\n 进入下一 part 头部
+        if (buffer.length >= 2 && buffer[0] === 0x2D && buffer[1] === 0x2D) {
+          // 结尾 --boundary--，无后续 part，置空等待结束
+          buffer = Buffer.alloc(0);
+        } else if (buffer.length >= 2 && buffer[0] === 0x0D && buffer[1] === 0x0A) {
           buffer = buffer.subarray(2);
         }
         state = 'HEADERS';
@@ -2617,8 +2625,20 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
     }
   }
 
+  // multipart 请求体总大小限制（复用 maxBodySize 语义，防止无限多个小文件累积超大 body）
+  // 与 JSON/urlencoded 路径的 maxBodySize 检查保持一致，补齐 multipart 资源限制缺口
+  const maxBodySize = req._app?.settings?.maxBodySize || 128 * 1024 * 1024;
+  let totalBodySize = 0;
+
   // 监听请求数据流
   req._req.on('data', chunk => {
+    totalBodySize += chunk.length;
+    if (totalBodySize > maxBodySize) {
+      const err = new Error(`Body exceeds maximum size of ${fmtSize(maxBodySize)}`, { cause: { actual: totalBodySize, maxSize: maxBodySize } });
+      err.status = 413;
+      safeNext(err);
+      return;
+    }
     buffer = Buffer.concat([buffer, chunk]);
     processBuffer();
   });
@@ -2635,7 +2655,25 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
       _cleanupTempFiles(req._tempFiles);
     }
     req.body = req.formData.fields;
-    next();
+    // 等待所有已结束的文件写入流 flush 完成后调用 next()，否则业务 handler 同步
+    // 读取 file.path 可能拿到空/部分数据（stream.end() 是异步 flush，立即读有竞态）
+    // 已结束的流收集在 req._tempFiles 对应的流对象（currentFile.stream 已随状态切换变更，
+    // 需在解析期间记录所有创建的流），此处通过 _pendingStreams 追踪
+    if (pendingStreams.size > 0) {
+      let pending = pendingStreams.size;
+      const onFinish = () => {
+        pending--;
+        if (pending === 0) next();
+      };
+      // 每个流注册 finish 监听；error 已由 ensureFileStream 的 error handler 通过 safeNext 处理
+      // （safeNext 置位 nextCalled 后此处不再重复调用 next）
+      for (const stream of pendingStreams) {
+        if (stream.writableFinished) { onFinish(); continue; }
+        stream.once('finish', onFinish);
+      }
+    } else {
+      next();
+    }
   });
 
   req._req.on('error', (err) => {
@@ -3717,7 +3755,7 @@ httpm.WebSocketHandshake = WebSocketHandshake;
 // 旧名保留，向后兼容（deprecated）
 httpm.WebSocketHandShak = WebSocketHandshake;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.5.7';
+httpm.version = '1.5.8';
 
 
 module.exports = httpm;
