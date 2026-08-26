@@ -2,7 +2,7 @@
  * httpm - 基于 Node.js 原生模块的单文件、零依赖 HTTP 服务库
  *
  * @name        httpm
- * @version     1.5.8
+ * @version     1.5.9
  * @description 兼容 Express API，内置路由、中间件、静态文件服务、
  *              WebSocket、SSE、流式上传、日志系统等功能
  * @license     MIT
@@ -2233,10 +2233,15 @@ class WebSocketServer {
  * bodyParser 中间件：解析各类请求体
  */
 function bodyParser(options = {}) {
-  const maxFileSize = options.maxFileSize || 128 * 1024 * 1024; // 字节
-  const maxFieldSize = options.maxFieldSize || 1024 * 1024; // 字节（原始字节大小，非字符数）
   // JSON/urlencoded 请求体大小限制（语义区别于 maxFieldSize 表单字段）
+  // 注意：闭包默认值仅用于 JSON/urlencoded 路径，multipart 的限制需区分"显式配置"与"默认值"
   const maxBodySize = options.maxBodySize || 128 * 1024 * 1024;
+  // multipart 单文件/单字段/总大小限制：仅当 bodyParserOptions 显式配置时传入，
+  // 否则传 undefined 让 _parseMultipart 回退到 settings.maxFileSize/maxFieldSize/maxBodySize
+  // （避免闭包默认值掩盖用户通过 httpm({ maxFileSize }) 等顶层配置设置的限制）
+  const multipartMaxFileSize = options.maxFileSize !== undefined ? options.maxFileSize : undefined;
+  const multipartMaxFieldSize = options.maxFieldSize !== undefined ? options.maxFieldSize : undefined;
+  const multipartMaxBodySize = options.maxBodySize !== undefined ? options.maxBodySize : undefined;
 
   return function bodyParserMiddleware(req, res, next) {
     // 初始化 formData
@@ -2260,7 +2265,7 @@ function bodyParser(options = {}) {
     } else if (contentType.includes('multipart/form-data')) {
       const boundary = _extractBoundary(contentType);
       if (boundary) {
-        _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next);
+        _parseMultipart(req, boundary, multipartMaxFileSize, multipartMaxFieldSize, multipartMaxBodySize, next);
         // 仅 multipart 需要临时文件清理（使用 res.on 保持封装一致性）
         // 同时监听 finish 和 close：finish 覆盖正常完成，close 覆盖客户端中途断开
         // 用一次性标志避免重复清理（_cleanupTempFiles 对已删除文件幂等，但避免重复调用）
@@ -2277,7 +2282,7 @@ function bodyParser(options = {}) {
       }
     } else {
       // 其他类型：原始 Buffer 存储
-      req._readBody().then(buf => {
+      req._readBody(30000, maxBodySize).then(buf => {
         req.body = buf.length > 0 ? buf : null;
         next();
       }).catch(next);
@@ -2289,7 +2294,9 @@ function bodyParser(options = {}) {
  * 解析 JSON 请求体
  */
 function _parseJSON(req, maxSize, next) {
-  req._readBody().then(buf => {
+  // 传入 maxSize 使 _readBody 流式检查生效（不传时用 settings.maxBodySize，
+  // 会导致 bodyParserOptions.maxBodySize 在数据完整读入后才检查，内存峰值可能超限）
+  req._readBody(30000, maxSize).then(buf => {
     if (buf.length > maxSize) {
       const err = new Error(`Body exceeds maximum size of ${fmtSize(maxSize)}`, { cause: { actual: buf.length, maxSize } });
       err.status = 413;
@@ -2316,7 +2323,8 @@ function _parseJSON(req, maxSize, next) {
  * 解析 URL 编码请求体
  */
 function _parseUrlencoded(req, maxSize, next) {
-  req._readBody().then(buf => {
+  // 同 _parseJSON：传入 maxSize 使流式大小检查生效，避免超限数据先完整读入内存
+  req._readBody(30000, maxSize).then(buf => {
     if (buf.length > maxSize) {
       const err = new Error(`Body exceeds maximum size of ${fmtSize(maxSize)}`, { cause: { actual: buf.length, maxSize } });
       err.status = 413;
@@ -2345,8 +2353,16 @@ function _extractBoundary(contentType) {
  * 流式解析 multipart/form-data
  * 基于状态机实现，边接收边解析边写入临时文件
  */
-function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
+function _parseMultipart(req, boundary, multipartMaxFileSize, multipartMaxFieldSize, multipartMaxBodySize, next) {
   const tempDir = req._app?.settings?.tempDir || 'tempupdir';
+  // 单文件/单字段大小限制：优先级 bodyParserOptions 显式配置 > settings 顶层配置 > 默认值
+  const maxFileSize = multipartMaxFileSize || req._app?.settings?.maxFileSize || 128 * 1024 * 1024;
+  const maxFieldSize = multipartMaxFieldSize || req._app?.settings?.maxFieldSize || 1024 * 1024;
+  // part 头部大小上限（DoS 防护）：独立于 maxFieldSize（表单字段值大小限制）。
+  // 此前复用 maxFieldSize 会导致用户调小 maxFieldSize 限制字段值时，
+  // 合法请求的 part 头部（Content-Disposition 等，约 70+ 字节）也被拒绝。
+  // 优先取 bodyParserOptions.maxFieldSize 显式值，否则默认 1MB（正常 part 头部远小于此值）。
+  const partHeaderMaxSize = multipartMaxFieldSize || 1024 * 1024;
   const delimiter = Buffer.from('--' + boundary);
   // RFC 2046 分隔符：part 数据之后必须以 CRLF 前置的 \r\n--boundary 结束
   // 查找 CRLF+delimiter 而非裸 delimiter，防止文件/字段内容中出现的 --boundary 子串被误判为分隔符
@@ -2443,9 +2459,9 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
           // 累积 Buffer 避免多字节截断
           partHeadersBuf = Buffer.concat([partHeadersBuf, buffer]);
           // 校验 part 头部大小，防止恶意客户端发送超大单个 part 头部（永不结束）导致 DoS
-          // 复用 maxFieldSize 作为上限，正常 part 头部远小于此值
-          if (partHeadersBuf.length > maxFieldSize) {
-            const err = new Error(`Part header exceeds maximum size of ${fmtSize(maxFieldSize)}`, { cause: { actual: partHeadersBuf.length, maxSize: maxFieldSize } });
+          // 用独立 partHeaderMaxSize（默认 1MB），不随 maxFieldSize 字段值限制联动
+          if (partHeadersBuf.length > partHeaderMaxSize) {
+            const err = new Error(`Part header exceeds maximum size of ${fmtSize(partHeaderMaxSize)}`, { cause: { actual: partHeadersBuf.length, maxSize: partHeaderMaxSize } });
             err.status = 413;
             safeNext(err);
             return;
@@ -2455,8 +2471,8 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
         }
         // 找到结束标记时也校验累积总大小（极端情况下单个 chunk 可能含超大头部）
         partHeadersBuf = Buffer.concat([partHeadersBuf, buffer.subarray(0, headerEnd)]);
-        if (partHeadersBuf.length > maxFieldSize) {
-          const err = new Error(`Part header exceeds maximum size of ${fmtSize(maxFieldSize)}`, { cause: { actual: partHeadersBuf.length, maxSize: maxFieldSize } });
+        if (partHeadersBuf.length > partHeaderMaxSize) {
+          const err = new Error(`Part header exceeds maximum size of ${fmtSize(partHeaderMaxSize)}`, { cause: { actual: partHeadersBuf.length, maxSize: partHeaderMaxSize } });
           err.status = 413;
           safeNext(err);
           return;
@@ -2582,6 +2598,16 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
         }
         // 文件结束：数据为 [0, idx)，前导 \r\n 属于分隔符前缀不属于文件内容
         const fileData = buffer.subarray(0, idx);
+        // 超限检查：文件结束分支同样校验（分块分支已校验，但单 chunk 含完整文件时走此分支，
+        // 此前缺少检查导致超过 maxFileSize 的文件被完整写入磁盘）
+        fileSize += fileData.length;
+        if (fileSize > maxFileSize) {
+          if (currentFile.stream) currentFile.stream.destroy();
+          const err = new Error(`File exceeds maximum size of ${fmtSize(maxFileSize)}`, { cause: { actual: fileSize, maxSize: maxFileSize, filename: currentFile.filename } });
+          err.status = 413;
+          safeNext(err);
+          return;
+        }
 
         ensureFileStream();
         currentFile.stream.write(fileData);
@@ -2593,7 +2619,6 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
         // 注意：end() 后必须等待 'finish' 事件才能安全读取文件内容，
         // 业务 handler 若同步 fs.readFileSync 可能读到空数据（见 on('end') 的 finish 等待）
         currentFile.stream.end();
-        fileSize += fileData.length;
         currentFile.size = fileSize;
 
         // 保存文件信息
@@ -2626,8 +2651,8 @@ function _parseMultipart(req, boundary, maxFileSize, maxFieldSize, next) {
   }
 
   // multipart 请求体总大小限制（复用 maxBodySize 语义，防止无限多个小文件累积超大 body）
-  // 与 JSON/urlencoded 路径的 maxBodySize 检查保持一致，补齐 multipart 资源限制缺口
-  const maxBodySize = req._app?.settings?.maxBodySize || 128 * 1024 * 1024;
+  // 优先级：bodyParserOptions.maxBodySize（显式配置）> settings.maxBodySize（顶层）> 默认 128MB
+  const maxBodySize = multipartMaxBodySize || req._app?.settings?.maxBodySize || 128 * 1024 * 1024;
   let totalBodySize = 0;
 
   // 监听请求数据流
@@ -3755,7 +3780,7 @@ httpm.WebSocketHandshake = WebSocketHandshake;
 // 旧名保留，向后兼容（deprecated）
 httpm.WebSocketHandShak = WebSocketHandshake;
 httpm.escapeHtml = escapeHtml;
-httpm.version = '1.5.8';
+httpm.version = '1.5.9';
 
 
 module.exports = httpm;

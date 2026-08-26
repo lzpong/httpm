@@ -1142,6 +1142,16 @@ async function runTests() {
     res.download(path.join(testDir, 'test.txt'));
   });
 
+  // --- 新增：上传文件内容验证路由（BUG-1/BUG-2 修复验证用） ---
+  // 同步读取文件内容：修复前（BUG-2）流未 flush 完成会读到空，修复后应读到完整内容
+  app.post('/api/upload-verify', (req, res) => {
+    const file = req.formData.files[0];
+    if (!file) { res.json({ error: 'no file' }); return; }
+    let content = '';
+    try { content = fs.readFileSync(file.path, 'utf8'); } catch (e) { content = 'ERR:' + e.code; }
+    res.json({ size: file.size, content, fields: req.formData.fields });
+  });
+
   // bodyParser 413 超限测试路由
   // O6 修复后：JSON/urlencoded 请求体大小受 maxBodySize 限制，maxFieldSize 仅用于 multipart 表单字段
   app.post('/api/limited-body', httpm.bodyParser({ maxBodySize: 50 }), (req, res) => {
@@ -1917,6 +1927,83 @@ async function runTests() {
       try { fs.unlinkSync(filePath); } catch (e) { /* ignore */ }
     }
 
+    // --- BUG-1 验证：multipart 文件内容含 boundary 子串不被误判截断 ---
+    // 修复前：BODY_FILE 用 indexOf(裸 --boundary) 查找分隔符，文件内容含 --boundary 子串时被截断
+    // 修复后：查找 CRLF+delimiter，内容中无前导 CRLF 的 --boundary 子串不被误判
+    {
+      const boundary = 'Bug1Boundary';
+      const fileContent = 'PREFIX--Bug1BoundarySUFFIX';
+      const bodyBuf = Buffer.concat([
+        Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="f"; filename="a.txt"\r\nContent-Type: text/plain\r\n\r\n`, 'utf8'),
+        Buffer.from(fileContent, 'utf8'),
+        Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8')
+      ]);
+
+      const res = await httpRequest({
+        hostname: 'localhost', port: PORT, path: '/api/upload-verify', method: 'POST',
+        headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Content-Length': bodyBuf.length }
+      }, bodyBuf);
+      const obj = JSON.parse(await readBodyStr(res));
+      assert(obj.content === fileContent, 'HTTP - BUG-1 文件内容含 boundary 子串不被截断');
+      assert(obj.size === fileContent.length, 'HTTP - BUG-1 文件 size 正确');
+    }
+
+    // --- BUG-1 字段值验证：multipart 字段值含 boundary 子串不被误判截断 ---
+    {
+      const boundary = 'Bug1Field';
+      const fieldVal = 'AAA--Bug1FieldBBB';
+      const bodyBuf = Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="note"\r\n\r\n${fieldVal}\r\n--${boundary}--\r\n`,
+        'utf8'
+      );
+
+      const res = await httpRequest({
+        hostname: 'localhost', port: PORT, path: '/api/echo', method: 'POST',
+        headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Content-Length': bodyBuf.length }
+      }, bodyBuf);
+      const obj = JSON.parse(await readBodyStr(res));
+      assert(obj.formData && obj.formData.fields && obj.formData.fields.note === fieldVal, 'HTTP - BUG-1 字段值含 boundary 子串不被截断');
+    }
+
+    // --- BUG-1 边界验证：文件内容恰以 \r\n 结尾不误删 CRLF ---
+    {
+      const boundary = 'Bug1Crlf';
+      const fileContent = 'HELLO\r\n';
+      const bodyBuf = Buffer.concat([
+        Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="f"; filename="a.txt"\r\n\r\n`, 'utf8'),
+        Buffer.from(fileContent, 'utf8'),
+        Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8')
+      ]);
+
+      const res = await httpRequest({
+        hostname: 'localhost', port: PORT, path: '/api/upload-verify', method: 'POST',
+        headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Content-Length': bodyBuf.length }
+      }, bodyBuf);
+      const obj = JSON.parse(await readBodyStr(res));
+      assert(obj.content === fileContent, 'HTTP - BUG-1 文件内容末尾 CRLF 不误删');
+    }
+
+    // --- BUG-2 验证：handler 同步读取上传文件内容完整（写盘竞态修复） ---
+    // 修复前：next() 在文件流 end() 后立即调用，stream 异步 flush 未完成，
+    //         handler 同步 fs.readFileSync 读到空内容
+    // 修复后：on('end') 等待所有文件流 finish 事件后再 next()
+    {
+      const boundary = 'Bug2Boundary';
+      const fileContent = 'HELLO-WORLD-CONTENT';
+      const bodyBuf = Buffer.concat([
+        Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="f"; filename="a.txt"\r\n\r\n`, 'utf8'),
+        Buffer.from(fileContent, 'utf8'),
+        Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8')
+      ]);
+
+      const res = await httpRequest({
+        hostname: 'localhost', port: PORT, path: '/api/upload-verify', method: 'POST',
+        headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Content-Length': bodyBuf.length }
+      }, bodyBuf);
+      const obj = JSON.parse(await readBodyStr(res));
+      assert(obj.content === fileContent, 'HTTP - BUG-2 handler 同步读取上传文件内容完整');
+    }
+
     // --- P1-1 验证：hostname IPv6 解析（修复 host.split(':') 对 IPv6 误切） ---
     {
       // IPv6 带端口 [::1]:PORT → ::1
@@ -2464,6 +2551,163 @@ async function runTests() {
     } finally {
       await new Promise(r => server2.close(r));
       await closeLoggerStream(app2._logger);
+    }
+  }
+
+  // --- BUG-3 验证：multipart 请求总 body 大小受 maxBodySize 限制 ---
+  // 修复前：maxBodySize 仅用于 JSON/urlencoded，multipart 只限制单文件/单字段，
+  //         攻击者可发送无限多个小文件累积超大 body 消耗磁盘/CPU
+  // 修复后：data 事件累计总大小，超过 maxBodySize 时 safeNext(413) 终止
+  {
+    const PORT_B3 = PORT + 30;
+    const appB3 = httpm({
+      svrPort: PORT_B3,
+      logLevel: 'error',
+      maxBodySize: 500, // 总 body 上限 500 字节
+      tempDir: path.join(__dirname, 'test_temp_upload_b3')
+    });
+    appB3.post('/upload', (req, res) => res.json({ ok: true }));
+    const serverB3 = appB3.listen(PORT_B3);
+    await new Promise(r => setTimeout(r, 300));
+
+    try {
+      // 构造 3 个各 300 字节的文件，总 900+ 字节 > maxBodySize=500
+      const boundary = 'Bug3Boundary';
+      const fileContent = Buffer.alloc(300, 0x41).toString();
+      let body = Buffer.from(`--${boundary}\r\n`);
+      for (let i = 0; i < 3; i++) {
+        body = Buffer.concat([body, Buffer.from(`Content-Disposition: form-data; name="f${i}"; filename="f${i}.txt"\r\nContent-Type: text/plain\r\n\r\n`)]);
+        body = Buffer.concat([body, Buffer.from(fileContent)]);
+        body = Buffer.concat([body, Buffer.from(`\r\n--${boundary}\r\n`)]);
+      }
+      body = Buffer.concat([body, Buffer.from('--\r\n')]);
+
+      // 超限时 safeNext 会销毁请求流，客户端可能收到 socket hang up / ECONNRESET
+      // 这是预期安全行为（与 part 头 DoS 防护一致），捕获错误视为超限被阻断
+      let bodyLimitBlocked = false;
+      let statusCode = null;
+      try {
+        const res = await httpRequest({
+          hostname: 'localhost', port: PORT_B3, path: '/upload', method: 'POST',
+          headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Content-Length': body.length }
+        }, body);
+        statusCode = res.statusCode;
+        await readBodyStr(res);
+      } catch (e) {
+        bodyLimitBlocked = true;
+      }
+      assert(bodyLimitBlocked === true || statusCode === 413, 'HTTP - BUG-3 multipart 总 body 超限被阻断');
+
+      // 对照组：总 body 在限制内应正常处理
+      const smallBody = Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="f"; filename="a.txt"\r\n\r\n` +
+        'SMALL-CONTENT' +
+        `\r\n--${boundary}--\r\n`,
+        'utf8'
+      );
+      const resOk = await httpRequest({
+        hostname: 'localhost', port: PORT_B3, path: '/upload', method: 'POST',
+        headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Content-Length': smallBody.length }
+      }, smallBody);
+      await readBodyStr(resOk);
+      assert(resOk.statusCode === 200, 'HTTP - BUG-3 限制内 multipart 正常处理');
+    } catch (e) {
+      assertSkip('HTTP - BUG-3 multipart 总大小限制测试', e.message);
+    } finally {
+      await new Promise(r => serverB3.close(r));
+      await closeLoggerStream(appB3._logger);
+      await rmDirForce(path.join(__dirname, 'test_temp_upload_b3'));
+    }
+  }
+
+  // --- P1 配置一致性验证：顶层 maxFileSize/maxFieldSize/maxBodySize 对 multipart 生效 ---
+  // 修复前：bodyParser() 闭包默认值（128MB/1MB/128MB）掩盖用户通过 httpm({ maxFileSize })
+  //         设置的顶层限制，导致顶层配置不生效
+  // 修复后：bodyParserOptions 显式配置优先，否则回退 settings 顶层配置
+  {
+    const PORT_CFG = PORT + 31;
+    const appCfg = httpm({
+      svrPort: PORT_CFG,
+      logLevel: 'error',
+      maxFileSize: 50,
+      maxFieldSize: 50,
+      maxBodySize: 200,
+      tempDir: path.join(__dirname, 'test_temp_upload_cfg')
+    });
+    appCfg.post('/upload', (req, res) => res.json({ ok: true }));
+    const serverCfg = appCfg.listen(PORT_CFG);
+    await new Promise(r => setTimeout(r, 300));
+
+    // 辅助：multipart 请求，返回是否被阻断（safeNext 断开连接或 413）
+    const multipartTest = async (bodyBuf, boundary) => {
+      let blocked = false;
+      let sc = null;
+      try {
+        const res = await httpRequest({
+          hostname: 'localhost', port: PORT_CFG, path: '/upload', method: 'POST',
+          headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Content-Length': bodyBuf.length }
+        }, bodyBuf);
+        sc = res.statusCode;
+        await readBodyStr(res);
+      } catch (e) { blocked = true; }
+      return blocked || sc === 413;
+    };
+
+    try {
+      // 1) 顶层 maxFileSize=50：100 字节文件应被阻断
+      {
+        const boundary = 'CfgFile';
+        const bodyBuf = Buffer.concat([
+          Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="f"; filename="a.txt"\r\n\r\n`, 'utf8'),
+          Buffer.from(Buffer.alloc(100, 0x41).toString(), 'utf8'),
+          Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8')
+        ]);
+        assert(await multipartTest(bodyBuf, boundary) === true, 'HTTP - 顶层 maxFileSize 对 multipart 单文件生效');
+      }
+
+      // 2) 顶层 maxFieldSize=50：100 字节字段应被阻断
+      {
+        const boundary = 'CfgField';
+        const bodyBuf = Buffer.from(
+          `--${boundary}\r\nContent-Disposition: form-data; name="note"\r\n\r\n${'X'.repeat(100)}\r\n--${boundary}--\r\n`,
+          'utf8'
+        );
+        assert(await multipartTest(bodyBuf, boundary) === true, 'HTTP - 顶层 maxFieldSize 对 multipart 字段生效');
+      }
+
+      // 3) 顶层 maxBodySize=200：总 body > 200 应被阻断
+      {
+        const boundary = 'CfgBody';
+        const fileContent = Buffer.alloc(150, 0x41).toString();
+        const bodyBuf = Buffer.concat([
+          Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="f"; filename="a.txt"\r\n\r\n`, 'utf8'),
+          Buffer.from(fileContent, 'utf8'),
+          Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8')
+        ]);
+        // 总 body（含头部）> 200 字节
+        assert(await multipartTest(bodyBuf, boundary) === true, 'HTTP - 顶层 maxBodySize 对 multipart 总大小生效');
+      }
+
+      // 4) 对照组：限制内的小文件正常处理
+      {
+        const boundary = 'CfgOk';
+        const bodyBuf = Buffer.from(
+          `--${boundary}\r\nContent-Disposition: form-data; name="f"; filename="a.txt"\r\n\r\nSMALL\r\n--${boundary}--\r\n`,
+          'utf8'
+        );
+        const res = await httpRequest({
+          hostname: 'localhost', port: PORT_CFG, path: '/upload', method: 'POST',
+          headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Content-Length': bodyBuf.length }
+        }, bodyBuf);
+        await readBodyStr(res);
+        assert(res.statusCode === 200, 'HTTP - 顶层限制内 multipart 正常处理');
+      }
+    } catch (e) {
+      assertSkip('HTTP - 顶层 multipart 配置一致性测试', e.message);
+    } finally {
+      await new Promise(r => serverCfg.close(r));
+      await closeLoggerStream(appCfg._logger);
+      await rmDirForce(path.join(__dirname, 'test_temp_upload_cfg'));
     }
   }
 
